@@ -16,6 +16,17 @@
 #include "video_core/renderer_vulkan/vk_scheduler.h"
 
 // DejaVu Sans (Cyrillic), embedded (third_party/fonts, Bitstream Vera license).
+#ifdef _WIN32
+// PE/COFF assemblers have no .hidden/.previous: the compiler embeds the file (#embed, a GCC
+// extension in C++).
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wpedantic"
+alignas(16) static const unsigned char bb_font_ttf[] = {
+#embed BB_FONT_PATH
+};
+#pragma GCC diagnostic pop
+static const unsigned char* const bb_font_ttf_end = bb_font_ttf + sizeof(bb_font_ttf);
+#else
 asm(".section .rodata\n"
     ".balign 16\n"
     ".hidden bb_font_ttf\n"
@@ -28,6 +39,7 @@ asm(".section .rodata\n"
     ".previous\n");
 extern "C" const unsigned char bb_font_ttf[];
 extern "C" const unsigned char bb_font_ttf_end[];
+#endif
 
 extern "C" void runtime_restart(void); // bb-probe (probe.c)
 

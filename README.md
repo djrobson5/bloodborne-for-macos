@@ -195,6 +195,46 @@ with `BB_PRESENT_DUMP_COUNT=N` (dump N consecutive presented frames).
 More in [docs/](docs); recent changes: [docs/CHANGES_2026-10-02.md](docs/CHANGES_2026-10-02.md),
 [docs/CHANGES_2026-10-03.md](docs/CHANGES_2026-10-03.md).
 
+## Windows (experimental)
+
+The same port also builds natively for 64-bit Windows 10 (1803 or newer) and 11 with
+[MSYS2](https://www.msys2.org)'s CLANG64 toolchain (clang, libc++, lld). Tested: RTX 4090
+(NVIDIA 616.86), i9-13900K, Windows 11 24H2; it boots, creates and loads saves and plays with
+sound (input was tested through `BB_PAD_FILE`; gamepads and the keyboard go through SDL as on
+Linux), 110–120 FPS at 1080p in Iosefka's Clinic (~3,200 draws per frame, GPU command thread
+2.5 µs per draw). v1.09 dumps of other regions work as well (tested: CUSA00900).
+
+1. Install MSYS2 to `C:\msys64` (another folder: set `BB_MSYS2`) and, in an MSYS2 shell:
+
+   ```
+   pacman -S --needed git mingw-w64-clang-x86_64-{clang,lld,libc++,cmake,ninja,pkgconf,python,sdl3,boost,fmt,glslang,spirv-cross,spirv-headers,vulkan-headers,vulkan-loader,vulkan-memory-allocator,xxhash,zydis,robin-map,ffmpeg}
+   ```
+
+2. `git clone --recursive <this repository> bbport`, then from `cmd` or Explorer:
+
+   ```
+   run.bat --game-dir D:\Games\CUSA03173
+   ```
+
+   The first start builds the port (a few minutes; `build.sh` in the CLANG64 environment) into
+   `out\bb-probe.exe`. The game folder is remembered: afterwards `run.bat` alone starts the game.
+   `BB_PREBUILT=1` skips the build check. Settings, saves, mods and patches use the same files as
+   on Linux (`bbport.ini`, `user\`, `mods\`, `patches\`); the in-game menu (Insert or L3+R3)
+   changes the settings. `fullscreen=1` in `bbport.ini` (or F11 in the game) gives a
+   borderless window at the desktop size; with `output_res=3840x2160` and `preset=1` (FSR 3.1
+   Quality, scene 2560x1440) the RTX 4090 above stays at the 120 Hz display limit. The GTK
+   launcher and the AppImage are Linux-only.
+
+How it differs from Linux, all on the Win32 API directly (no POSIX layer): the guest address
+space is reserved at start as one placeholder and mapped with section views
+(`src/win32_memory.c`); the runtime's locks, condition variables, threads and clocks are SRW
+locks, Windows condition variables, CRT threads and QueryPerformanceCounter (`src/host_sync.h`,
+`src/runtime_host.c`), and libc++ maps the GPU library's `std::mutex`/`std::thread` to the same;
+GPU page tracking and crash reports run in a vectored exception handler; the guest's thread
+pointer lives in a TEB TLS slot (`patch_tls_reads` in `src/probe.c`); `src/win32_compat.c`
+covers file system and time zone details. With libc++ on Windows, `std::thread::get_id()` and
+`std::jthread::joinable()` ask the kernel (`GetThreadId`): hot paths keep their own flags.
+
 ## Repository layout
 
 | Path | Contents |

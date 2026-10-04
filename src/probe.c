@@ -12,6 +12,9 @@
 #endif
 #ifdef _WIN32
 #include <windows.h>
+#include <timeapi.h>
+#include <process.h>
+#include <psapi.h>
 #else
 #include <sys/mman.h>
 #include <malloc.h>
@@ -38,7 +41,7 @@ static int entered_game;
 static int gpu_enabled;
 int vulkan_smoke(void);
 
-static void fail(const char *message) { fprintf(stderr, "ERROR: %s\n", message); exit(1); }
+static __attribute__((noreturn)) void fail(const char *message) { fprintf(stderr, "ERROR: %s\n", message); exit(1); }
 static uint64_t read64(FILE *f) {
     unsigned char b[8];
     if (fread(b, 1, 8, f) != 8) fail("truncated boot file");
@@ -48,10 +51,8 @@ static uint64_t read64(FILE *f) {
 }
 static size_t round_page(size_t size) { return (size + page_size - 1) & ~(page_size - 1); }
 static void *allocate(size_t size) {
-#ifndef _WIN32
     void *low=runtime_low_map(size,PROT_READ|PROT_WRITE);
     if (low) return low;
-#endif
 #ifdef _WIN32
     void *p = VirtualAlloc(NULL, size, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
     if (!p) fail("VirtualAlloc failed");
@@ -142,6 +143,149 @@ static void fault(int sig, siginfo_t *info, void *context) {
     _exit(128 + sig);
 }
 #endif
+#ifdef _WIN32
+/* Windows: one vectored handler takes the roles of the SIGSEGV handler. GPU page tracking
+ * first, then the recovery point of a speculative guest memory read, then crash reports for
+ * faults in guest code (it has no unwind data, so frame-based handlers cannot see it). */
+static unsigned char *traps_base;
+static size_t traps_size, image_size;
+static void recover_jump(void) {
+    RuntimeRecoverBuf *recover = runtime_fault_recover;
+    runtime_fault_recover = NULL;
+    RUNTIME_RECOVER_JUMP(*recover);
+}
+static int guest_address(uintptr_t a) {
+    return (image && a - (uintptr_t)image < image_size) || (traps_base && a - (uintptr_t)traps_base < traps_size);
+}
+/* Module+offset without the loader lock (another thread may hold it while this one crashed). */
+static void describe(char *out, size_t size, uintptr_t a) {
+    MEMORY_BASIC_INFORMATION info;
+    char path[MAX_PATH];
+    if (image && a - (uintptr_t)image < image_size) snprintf(out, size, "guest+0x%llx", (unsigned long long)(a - (uintptr_t)image));
+    else if (VirtualQuery((void *)a, &info, sizeof(info)) && info.Type == MEM_IMAGE &&
+             GetMappedFileNameA(GetCurrentProcess(), (void *)a, path, sizeof(path))) {
+        const char *name = strrchr(path, '\\');
+        snprintf(out, size, "%s+0x%llx", name ? name + 1 : path, (unsigned long long)(a - (uintptr_t)info.AllocationBase));
+    } else snprintf(out, size, "0x%llx", (unsigned long long)a);
+}
+/* No DLL detach or CRT teardown: other threads may hold the locks those need. */
+static __attribute__((noreturn)) void terminate(unsigned code) {
+    fflush(NULL);
+    TerminateProcess(GetCurrentProcess(), code);
+    _exit((int)code);
+}
+static void report_exception(EXCEPTION_POINTERS *e) {
+    static volatile LONG reporting;
+    if (InterlockedExchange(&reporting, 1)) { Sleep(INFINITE); }
+    EXCEPTION_RECORD *r = e->ExceptionRecord;
+    CONTEXT *c = e->ContextRecord;
+    char where[512];
+    describe(where, sizeof(where), (uintptr_t)c->Rip);
+    fprintf(stderr, "%s fault 0x%08lx at %s", guest_address((uintptr_t)c->Rip) ? "Guest" : "Host", r->ExceptionCode, where);
+    if (r->ExceptionCode == EXCEPTION_ACCESS_VIOLATION && r->NumberParameters >= 2)
+        fprintf(stderr, ", %s address %p", r->ExceptionInformation[0] == 1 ? "writing" : r->ExceptionInformation[0] == 8 ? "executing" : "reading",
+                (void *)r->ExceptionInformation[1]);
+    PWSTR description = NULL;
+    char thread_name[64] = "";
+    if (SUCCEEDED(GetThreadDescription(GetCurrentThread(), &description)) && description) {
+        WideCharToMultiByte(CP_UTF8, 0, description, -1, thread_name, sizeof(thread_name), NULL, NULL);
+        LocalFree(description);
+    }
+    fprintf(stderr, " (thread %lu %s)\n", GetCurrentThreadId(), thread_name);
+    fprintf(stderr, "  rax=%016llx rbx=%016llx rcx=%016llx rdx=%016llx\n  rsi=%016llx rdi=%016llx rbp=%016llx rsp=%016llx\n",
+            c->Rax, c->Rbx, c->Rcx, c->Rdx, c->Rsi, c->Rdi, c->Rbp, c->Rsp);
+    /* rbp frame chain; ReadProcessMemory so a bad frame cannot fault again. */
+    uintptr_t rbp = c->Rbp;
+    for (int depth = 0; depth < 24 && rbp; ++depth) {
+        uintptr_t frame[2];
+        SIZE_T n = 0;
+        if (!ReadProcessMemory(GetCurrentProcess(), (void *)rbp, frame, sizeof(frame), &n) || n != sizeof(frame) || frame[0] <= rbp) break;
+        describe(where, sizeof(where), frame[1]);
+        fprintf(stderr, "  #%d %s\n", depth, where);
+        rbp = frame[0];
+    }
+    if (gpu_enabled && r->ExceptionCode == EXCEPTION_ACCESS_VIOLATION) bbgpu_dump_guest_writes(e);
+    fflush(NULL);
+}
+static int fatal(DWORD code) {
+    switch (code) {
+    case EXCEPTION_ACCESS_VIOLATION: case EXCEPTION_ILLEGAL_INSTRUCTION: case EXCEPTION_PRIV_INSTRUCTION:
+    case EXCEPTION_INT_DIVIDE_BY_ZERO: case EXCEPTION_INT_OVERFLOW: case EXCEPTION_STACK_OVERFLOW:
+    case EXCEPTION_IN_PAGE_ERROR: case EXCEPTION_DATATYPE_MISALIGNMENT: case EXCEPTION_BREAKPOINT:
+        return 1;
+    default:
+        return 0;
+    }
+}
+static LONG CALLBACK vectored_handler(EXCEPTION_POINTERS *e) {
+    EXCEPTION_RECORD *r = e->ExceptionRecord;
+    if (r->ExceptionCode == EXCEPTION_ACCESS_VIOLATION && r->NumberParameters >= 2) {
+        if (gpu_enabled && bbgpu_handle_fault(e, (void *)r->ExceptionInformation[1])) return EXCEPTION_CONTINUE_EXECUTION;
+        if (runtime_fault_recover) {
+            /* Resume in recover_jump as if called there, below the interrupted frame's red zone. */
+            CONTEXT *c = e->ContextRecord;
+            c->Rsp = ((c->Rsp - 512) & ~(DWORD64)15) - 8;
+            c->Rip = (DWORD64)(uintptr_t)recover_jump;
+            return EXCEPTION_CONTINUE_EXECUTION;
+        }
+    }
+    /* Host code may handle its own exceptions (drivers probe memory under __try). */
+    if (!fatal(r->ExceptionCode) || !guest_address((uintptr_t)e->ContextRecord->Rip)) return EXCEPTION_CONTINUE_SEARCH;
+    report_exception(e);
+    terminate(128 + 11);
+}
+static LONG WINAPI unhandled_filter(EXCEPTION_POINTERS *e) {
+    report_exception(e);
+    terminate(128 + 11);
+}
+/* link_modules.py rewrote the guest's `mov rax, fs:[0]` into `mov rax, gs:[0]`. GS is the TEB
+ * on Windows, and the thread's guest TCB is in a TLS slot (runtime_thread.c). A slot below 64
+ * is one load: the displacement becomes TEB.TlsSlots[slot]. A later slot (the DLLs loaded
+ * before main took the first 64) needs two loads, through TEB.TlsExpansionSlots: the site
+ * jumps to a stub of its own (no call: the guest may keep data below rsp) and back. */
+static uint64_t patch_tls_reads(const Segment *segments, uint64_t count) {
+    static const unsigned char gs_load[9] = {0x65, 0x48, 0x8b, 0x04, 0x25, 0, 0, 0, 0};
+    const uint32_t slot = runtime_win_tls_slot();
+    unsigned char **sites = NULL;
+    size_t found = 0, capacity = 0;
+    for (uint64_t i = 0; i < count; ++i) {
+        if (!(segments[i].flags & 1) || segments[i].size < sizeof(gs_load)) continue;
+        unsigned char *at = image + segments[i].address, *last = at + segments[i].size - sizeof(gs_load);
+        while (at <= last && (at = memchr(at, 0x65, (size_t)(last - at) + 1))) {
+            if (memcmp(at, gs_load, sizeof(gs_load))) { ++at; continue; }
+            if (found == capacity) {
+                capacity = capacity ? capacity * 2 : 4096;
+                if (!(sites = realloc(sites, capacity * sizeof(*sites)))) fail("allocation failed");
+            }
+            sites[found++] = at;
+            at += sizeof(gs_load);
+        }
+    }
+    if (slot < 64) {
+        uint32_t displacement = 0x1480 + slot * 8;
+        for (size_t i = 0; i < found; ++i) memcpy(sites[i] + 5, &displacement, 4);
+    } else if (found) {
+        enum { STUB = 21 };
+        static const unsigned char expansion[9] = {0x65, 0x48, 0x8b, 0x04, 0x25, 0x80, 0x17, 0, 0}; /* mov rax, gs:[0x1780] */
+        size_t bytes = round_page(found * STUB);
+        unsigned char *stubs = allocate(bytes);
+        uint32_t index = (slot - 64) * 8;
+        for (size_t i = 0; i < found; ++i) {
+            unsigned char *stub = stubs + i * STUB, *site = sites[i];
+            int64_t back = (site + 9) - (stub + STUB), there = stub - (site + 5);
+            if (back != (int32_t)back || there != (int32_t)there) fail("TLS stub out of jump range");
+            int32_t back32 = (int32_t)back, there32 = (int32_t)there;
+            memcpy(stub, expansion, 9);
+            stub[9] = 0x48; stub[10] = 0x8b; stub[11] = 0x80; memcpy(stub + 12, &index, 4); /* mov rax, [rax + index] */
+            stub[16] = 0xe9; memcpy(stub + 17, &back32, 4);                                 /* jmp site + 9 */
+            site[0] = 0xe9; memcpy(site + 1, &there32, 4); memset(site + 5, 0x90, 4);         /* jmp stub */
+        }
+        protect(stubs, bytes, 5);
+    }
+    free(sites);
+    return found;
+}
+#else
 /* Watchdog: dump RIP and the rbp frame chain of every thread (guest offsets
  * when inside the image). Reads use process_vm_readv so bad frames cannot fault. */
 static uintptr_t exe_base;
@@ -187,6 +331,7 @@ static void watchdog(int sig, siginfo_t *info, void *context) {
     usleep(100000);
     _exit(128 + sig);
 }
+#endif
 /* param.sfo lookup: string or integer value of key, 0 when absent. */
 static int sfo_value(const char *path, const char *key, char *text, size_t text_size, uint32_t *number) {
     FILE *f=fopen(path,"rb");
@@ -257,14 +402,56 @@ static void apply_patches(const char *path, Segment *segments, uint64_t ns, cons
  * released before the new process opens its own. */
 void runtime_restart(void) {
     fflush(NULL);
+#ifdef _WIN32
+    /* scripts/run_windows.py sets its own command line here; the new process prepares the
+     * patches again. Our GPU device goes away with this process. */
+    const char *command = getenv("BB_RESTART_COMMAND");
+    puts("Runtime: restarting through the launcher");
+    if (!command) { fputs("runtime_restart: BB_RESTART_COMMAND is not set\n", stderr); _exit(1); }
+    char line[32768];
+    snprintf(line, sizeof(line), "%s", command);
+    STARTUPINFOA startup = {.cb = sizeof(startup)};
+    PROCESS_INFORMATION process;
+    if (!CreateProcessA(NULL, line, NULL, NULL, FALSE, 0, NULL, NULL, &startup, &process)) {
+        fprintf(stderr, "runtime_restart: CreateProcess failed (%lu)\n", GetLastError());
+        _exit(1);
+    }
+    _exit(0);
+#else
     puts("Runtime: restarting through run.sh");
-#ifndef _WIN32
     syscall(SYS_close_range, 3u, ~0u, 0u);
     execlp("bash", "bash", "run.sh", (char *)NULL);
     perror("runtime_restart: exec");
     _exit(1);
 #endif
 }
+
+#ifdef _WIN32
+/* The guest main thread needs a large committed stack (PS4 code does not touch guard pages
+ * in order), so the loader runs on a thread of its own; the process main thread waits. */
+static int loader_main(int argc, char **argv);
+static int main_argc;
+static char **main_argv;
+static unsigned __stdcall loader_thread(void *unused) { (void)unused; return (unsigned)loader_main(main_argc, main_argv); }
+int main(int argc, char **argv) {
+    timeBeginPeriod(1); /* 1 ms waits for timed locks and sleeps outside runtime_sleep_ns */
+    /* No EcoQoS: Windows 11 otherwise moves the threads of an unfocused window to efficiency
+     * cores (hybrid CPUs), and the GPU command thread sets the frame rate. */
+    PROCESS_POWER_THROTTLING_STATE throttling = {PROCESS_POWER_THROTTLING_CURRENT_VERSION,
+                                                 PROCESS_POWER_THROTTLING_EXECUTION_SPEED, 0};
+    SetProcessInformation(GetCurrentProcess(), ProcessPowerThrottling, &throttling, sizeof(throttling));
+    AddVectoredExceptionHandler(1, vectored_handler);
+    SetUnhandledExceptionFilter(unhandled_filter);
+    main_argc = argc; main_argv = argv;
+    HANDLE thread = (HANDLE)_beginthreadex(NULL, 64u << 20, loader_thread, NULL, 0, NULL);
+    if (!thread) fail("cannot start the loader thread");
+    WaitForSingleObject(thread, INFINITE);
+    DWORD code = 1;
+    GetExitCodeThread(thread, &code);
+    return (int)code;
+}
+#define main loader_main
+#endif
 
 int main(int argc, char **argv) {
     setvbuf(stdout, NULL, _IONBF, 0);
@@ -315,6 +502,7 @@ int main(int argc, char **argv) {
     bbgpu_register_kernel();
 #ifdef _WIN32
     SYSTEM_INFO system_info; GetSystemInfo(&system_info); page_size = system_info.dwPageSize;
+    (void)timeout_seconds; /* no watchdog on Windows */
 #else
     page_size = (size_t)sysconf(_SC_PAGESIZE);
     struct sigaction sa = {0}; sa.sa_sigaction = fault; sa.sa_flags = SA_SIGINFO;
@@ -427,6 +615,9 @@ int main(int argc, char **argv) {
         }
     }
     image = allocate(round_page(size));
+#ifdef _WIN32
+    image_size = round_page(size);
+#endif
     if (fread(image, 1, size, f) != size || fgetc(f) != EOF) fail("incorrect memory image size");
     fclose(f);
     if (!cpu_only) {
@@ -444,6 +635,9 @@ int main(int argc, char **argv) {
         printf("GPU: window and Vulkan presenter ready; SDK 0x%08x, %u HLE symbols\n",(unsigned)sdk,bbgpu_symbol_count());
     }
     unsigned char *traps = allocate(round_page((import_count + 1) * 32));
+#ifdef _WIN32
+    traps_base = traps; traps_size = round_page((import_count + 1) * 32);
+#endif
     unsigned char *data_traps = allocate((import_count + 1) * page_size);
     protect(data_traps, (import_count + 1) * page_size, 0);
     for (uint64_t i = 0; i < import_count; ++i) {
@@ -472,6 +666,9 @@ int main(int argc, char **argv) {
         memcpy(image + relocs[i].target, &value, 8);
     }
     if (patch_file) apply_patches(patch_file, segments, ns, relocs, nr);
+#ifdef _WIN32
+    printf("Guest thread pointer reads: %" PRIu64 " use TEB TLS slot %u\n", patch_tls_reads(segments, ns), runtime_win_tls_slot());
+#endif
     protect(traps, round_page((import_count + 1) * 32), 5);
     protect(image, round_page(size), 0);
     int executable_entry = 0;
@@ -503,6 +700,10 @@ int main(int argc, char **argv) {
             if (result) fail("module initializer failed");
         }
     }
+#ifdef _WIN32
+    /* Libraries loaded since main (GPU driver, SDL) may have installed their own. */
+    SetUnhandledExceptionFilter(unhandled_filter);
+#endif
     printf("Entering original x86-64 code at guest offset 0x%" PRIx64 "\n", entry);
     entered_game=1;
     struct { uint64_t argc; const char *argv[2]; } params = {1, {"/app0/eboot.bin", NULL}};
