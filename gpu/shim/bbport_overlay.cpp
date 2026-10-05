@@ -272,6 +272,7 @@ void Menu() {
     ImGui::BeginDisabled(!s.sharpen);
     Slider("Sharpness", s.sharpness, 0.0f, 2.0f);
     Hint("Up to 1: the upscaler's own sharpening (RCAS). Above 1 another RCAS pass is added. "
+         "DLSS has no sharpening of its own: an RCAS pass does all of it. "
          "Ctrl+click the slider to type an exact value.");
     ImGui::EndDisabled();
     Checkbox("Sub-pixel jitter", s.jitter);
