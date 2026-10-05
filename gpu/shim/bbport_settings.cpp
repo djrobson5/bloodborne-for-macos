@@ -132,12 +132,17 @@ void Load() {
     v.startup_live_resolution = v.live_resolution;
 }
 
-void ConfigureUpscalerSupport(bool fsr4, bool fsr411) {
+void ConfigureUpscalerSupport(bool fsr4, bool fsr411, bool dlss) {
     auto& v = Get();
     v.fsr4_supported = fsr4;
     v.fsr411_supported = fsr4 && fsr411;
+    v.dlss_supported = dlss;
     const int requested = v.upscaler;
-    if ((requested == UpscalerFsr4 && !v.fsr4_supported) ||
+    if (requested == UpscalerDlss && !dlss) {
+        v.fsr4_problem = "DLSS needs an NVIDIA RTX GPU, its driver's NGX and nvngx_dlss; using FSR 3.1";
+        std::printf("Upscaler: dlss unavailable; falling back to FSR 3.1 before the first frame\n");
+        v.upscaler = UpscalerFsr3;
+    } else if ((requested == UpscalerFsr4 && !v.fsr4_supported) ||
         (requested == UpscalerFsr411 && !v.fsr411_supported)) {
         v.fsr4_problem = "GPU does not support the selected FSR 4 shaders; using FSR 3.1";
         std::printf("Upscaler: %s unsupported on this GPU; falling back to FSR 3.1 before the first frame\n",
@@ -208,7 +213,8 @@ const char* PresetName(int preset) {
 }
 
 const char* UpscalerName(int upscaler) {
-    static constexpr const char* names[UpscalerCount] = {"off", "fsr3", "fsr4", "fsr411", "taa"};
+    static constexpr const char* names[UpscalerCount] = {"off", "fsr3", "fsr4", "fsr411", "taa",
+                                                                  "dlss"};
     return names[std::clamp(upscaler, 0, UpscalerCount - 1)];
 }
 

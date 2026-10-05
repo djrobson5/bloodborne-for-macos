@@ -162,23 +162,24 @@ void Menu() {
                             ImGuiCond_Appearing);
     ImGui::SetNextWindowSize(ImVec2(620.0f * base_scale, 0.0f), ImGuiCond_Appearing);
     bool keep_open = true;
-    if (!ImGui::Begin("Bloodborne — настройки  (Insert / L3+R3)", &keep_open,
+    if (!ImGui::Begin("Bloodborne — settings  (Insert / L3+R3)", &keep_open,
                       ImGuiWindowFlags_NoCollapse)) {
         ImGui::End();
         return;
     }
-    ImGui::Text("%.0f FPS  (%.1f мс)", frame_ms_avg > 0.0f ? 1000.0f / frame_ms_avg : 0.0f,
+    ImGui::Text("%.0f FPS  (%.1f ms)", frame_ms_avg > 0.0f ? 1000.0f / frame_ms_avg : 0.0f,
                 frame_ms_avg);
 
-    ImGui::SeparatorText("Временной апскейлер");
-    static const char* upscalers[] = {"Выкл", "FSR 3.1", "FSR 4 (INT8)", "FSR 4.1.1 (INT8)",
-                                     "TAA (нативное сглаживание)"};
-    static const char* later[] = {"DLSS", "XeSS"};
+    ImGui::SeparatorText("Temporal upscaler");
+    static const char* upscalers[] = {"Off", "FSR 3.1", "FSR 4 (INT8)", "FSR 4.1.1 (INT8)",
+                                     "TAA (native anti-aliasing)", "DLSS (NVIDIA)"};
+    static const char* later[] = {"XeSS"};
     int upscaler = s.upscaler;
-    if (ImGui::BeginCombo("Апскейлер", upscalers[upscaler])) {
+    if (ImGui::BeginCombo("Upscaler", upscalers[upscaler])) {
         for (int i = 0; i < BbSettings::UpscalerCount; ++i) {
             const bool supported = i == BbSettings::UpscalerFsr4 ? s.fsr4_supported.load()
-                : i == BbSettings::UpscalerFsr411 ? s.fsr411_supported.load() : true;
+                : i == BbSettings::UpscalerFsr411 ? s.fsr411_supported.load()
+                : i == BbSettings::UpscalerDlss ? s.dlss_supported.load() : true;
             ImGui::BeginDisabled(!supported);
             if (ImGui::Selectable(upscalers[i], i == upscaler)) {
                 Store(s.upscaler, i, true);
@@ -412,6 +413,7 @@ void FpsCounter() {
                 : s.upscaler == BbSettings::UpscalerFsr4 ? "FSR 4"
                 : s.upscaler == BbSettings::UpscalerFsr411 ? "FSR 4.1.1"
                 : s.upscaler == BbSettings::UpscalerTaa ? "TAA"
+                : s.upscaler == BbSettings::UpscalerDlss ? "DLSS"
                                                          : "");
     ImGui::End();
 }

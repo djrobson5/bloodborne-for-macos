@@ -162,8 +162,12 @@ TemporalUpscaler::TemporalUpscaler(const Instance& instance_, Scheduler& schedul
     : instance{instance_}, scheduler{scheduler_}, texture_cache{texture_cache_},
       runtime{runtime_}, camera_motion{camera_motion_}, scene_targets{scene_targets_} {
     // Reject unsupported shaders before allocating resources or recording a frame.
+    if (instance.IsDlssCapable()) {
+        dlss = std::make_unique<DlssUpscaler>(instance, scheduler);
+    }
     BbSettings::ConfigureUpscalerSupport(instance.IsFsr4Int8Supported(),
-                                         instance.IsFsr411Supported());
+                                         instance.IsFsr411Supported(),
+                                         dlss && dlss->Available());
     fsr4 = std::make_unique<Fsr4Upscaler>(instance, scheduler);
     // Available unless BB_UPSCALER=none; on/off and the parameters are the menu's settings.
     const char* env = std::getenv("BB_UPSCALER");
@@ -223,7 +227,7 @@ bool TemporalUpscaler::Active() const {
     // Toggle 1 << 24 switches it off at run time (A/B); history restarts after.
     return enabled && !failed &&
            (BbSettings::Get().upscaler == BbSettings::UpscalerFsr3 ||
-            BbSettings::IsFsr4(BbSettings::Get().upscaler) ||
+            BbSettings::IsFrameUpscaler(BbSettings::Get().upscaler) ||
             BbSettings::Get().upscaler == BbSettings::UpscalerTaa) &&
            !BbToggle::Disabled(1u << 24);
 }
@@ -303,7 +307,7 @@ bool TemporalUpscaler::OnFrameStart() {
         // A failed provider keeps a fatal flag internally; a user retry gets a fresh context.
         scheduler.Finish();
         fsr4 = std::make_unique<Fsr4Upscaler>(instance, scheduler);
-        if (BbSettings::IsFsr4(upscaler)) BbSettings::Get().fsr4_problem = nullptr;
+        if (BbSettings::IsFrameUpscaler(upscaler)) BbSettings::Get().fsr4_problem = nullptr;
     }
     if (applied_upscaler != upscaler) fsr4_failed = false; // retry after a menu change
     // Dynamic scene resolution scaling (live preset switching) works on all GPUs.
@@ -1078,8 +1082,9 @@ void TemporalUpscaler::Run() {
         RecordTaa(cmdbuf, input_color_view, input_depth_view);
         dispatched = true;
     } else if (UseFsr4()) {
-        dispatched = RecordFsr4(cmdbuf, {input_color, input_color_view, w, h},
-                                {input_depth, input_depth_view, w, h}, w, h, ow, oh, frame_ms);
+        dispatched = RecordFsr4(cmdbuf, {input_color, input_color_view, w, h, color.info.pixel_format},
+                                {input_depth, input_depth_view, w, h, depth_format}, w, h, ow, oh,
+                                frame_ms);
     } else {
         FfxVkPortableUpscaleDispatchInfo info{};
         info.structSize = sizeof(info);
@@ -1608,9 +1613,11 @@ void TemporalUpscaler::RunScaled() {
         if (BbSettings::Get().upscaler == BbSettings::UpscalerTaa) {
             RecordTaa(cmdbuf, color_view, depth_view);
         } else {
-            ok4 = RecordFsr4(cmdbuf, {color_image, color_view, source_width, source_height},
-                            {depth_image, depth_view, source_width, source_height}, w, h, ow,
-                            oh, frame_ms);
+            ok4 = RecordFsr4(cmdbuf,
+                             {color_image, color_view, source_width, source_height,
+                              color.info.pixel_format},
+                             {depth_image, depth_view, source_width, source_height, depth_format},
+                             w, h, ow, oh, frame_ms);
         }
         if (ok4) {
             if (BbSettings::Get().upscaler != BbSettings::UpscalerTaa) {
@@ -1904,6 +1911,9 @@ namespace Vulkan {
 
 bool TemporalUpscaler::UseFsr4() const {
     const int selected = BbSettings::Get().upscaler;
+    if (selected == BbSettings::UpscalerDlss) {
+        return dlss && dlss->Available() && !fsr4_failed;
+    }
     const bool supported = selected == BbSettings::UpscalerFsr411
                                ? instance.IsFsr411Supported()
                                : instance.IsFsr4Int8Supported();
@@ -1917,12 +1927,14 @@ bool TemporalUpscaler::RecordFsr4(vk::CommandBuffer cmdbuf, Fsr4Upscaler::Image 
     // Same jitter convention as FSR 3; the menu (or toggle 1 << 26) flips it for tests.
     const float sign =
         BbToggle::Disabled(1u << 26) != settings.fsr4_invert_jitter.load() ? -1.0f : 1.0f;
-    const bool ok = fsr4->Record({
+    const bool use_dlss = settings.upscaler == BbSettings::UpscalerDlss && dlss;
+    const Fsr4Upscaler::Frame frame{
         .cmdbuf = cmdbuf,
         .color = color,
         .depth = depth,
-        .motion = {vk::Image(motion_image), *motion_view, w, h},
-        .output = {vk::Image(output_image), *output_view, ow, oh},
+        .motion = {vk::Image(motion_image), *motion_view, w, h, vk::Format::eR16G16Sfloat},
+        .output = {vk::Image(output_image), *output_view, ow, oh,
+                   vk::Format::eR16G16B16A16Sfloat},
         .render_width = w,
         .render_height = h,
         .preset = applied_preset,
@@ -1935,10 +1947,11 @@ bool TemporalUpscaler::RecordFsr4(vk::CommandBuffer cmdbuf, Fsr4Upscaler::Image 
         .sharpen = settings.sharpen,
         .reset = reset,
         .auto_exposure = settings.fsr4_auto_exposure,
-    });
+    };
+    const bool ok = use_dlss ? dlss->Record(frame) : fsr4->Record(frame);
     // The menu shows the reason; it outlives this frame (FSR 4 keeps its last message).
     static std::string shown;
-    const char* problem = fsr4->Problem();
+    const char* problem = use_dlss ? dlss->Problem() : fsr4->Problem();
     if (!problem) {
         BbSettings::Get().fsr4_problem = nullptr;
     } else if (shown != problem) {
@@ -1949,7 +1962,7 @@ bool TemporalUpscaler::RecordFsr4(vk::CommandBuffer cmdbuf, Fsr4Upscaler::Image 
         BbSettings::Get().fsr4_problem = kept[next].c_str();
         next = (next + 1) % kept.size();
     }
-    if (!ok && fsr4->Fatal()) {
+    if (!ok && (use_dlss ? dlss->Fatal() : fsr4->Fatal())) {
         std::printf("Upscaler: falling back to FSR 3.1\n");
         BbSettings::Get().upscaler = BbSettings::UpscalerFsr3;
         fsr4_failed = true; // EnsureResources creates the FSR 3 context next frame

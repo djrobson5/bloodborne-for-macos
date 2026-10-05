@@ -20,6 +20,7 @@
 
 #include "common/types.h"
 #include "video_core/renderer_vulkan/vk_common.h"
+#include "video_core/renderer_vulkan/vk_dlss.h"
 #include "video_core/renderer_vulkan/vk_fsr4.h"
 #include "video_core/texture_cache/image.h"
 
@@ -243,6 +244,7 @@ private:
     bool resources_fsr4 = false;  ///< made for FSR 4 (no FSR 3 context)
     bool resources_taa = false;
     std::unique_ptr<Fsr4Upscaler> fsr4;
+    std::unique_ptr<DlssUpscaler> dlss; ///< NVIDIA devices only; records the FSR 4 frame
     bool fsr4_failed = false;
     VideoCore::UniqueImage motion_image;
     VideoCore::UniqueImage output_image;
