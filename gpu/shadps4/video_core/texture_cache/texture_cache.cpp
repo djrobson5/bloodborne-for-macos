@@ -113,6 +113,53 @@ void TextureCache::DownloadImageMemory(ImageId image_id, bool sync) {
     }
 }
 
+void TextureCache::DumpImagesAt(VAddr address, const char* dir) {
+    boost::container::small_vector<ImageId, 4> ids;
+    {
+        std::scoped_lock lock{mutex};
+        ForEachImageInRegion(address, 1, [&](ImageId image_id, Image& image) {
+            if (image.info.guest_address == address) {
+                ids.push_back(image_id);
+            }
+        });
+    }
+    std::printf("Image dump %#llx: %zu images\n", static_cast<unsigned long long>(address),
+                ids.size());
+    u32 n = 0;
+    for (const ImageId image_id : ids) {
+        Image& image = slot_images[image_id];
+        const auto format = vk::to_string(image.info.pixel_format);
+        const u32 width = image.info.size.width, height = image.info.size.height;
+        std::printf("  image %u: %s %ux%u tile %u, flags %#x, layers %u, mips %u, %s\n",
+                    image_id.index, format.c_str(), width, height,
+                    static_cast<u32>(image.info.tile_mode), static_cast<u32>(image.flags),
+                    image.info.resources.layers, image.info.resources.levels,
+                    image.info.props.is_depth ? "depth" : "color");
+        if (image.info.props.is_block) {
+            continue;
+        }
+        const u32 bytes_per_pixel = image.info.props.is_depth ? 4 : image.info.num_bits / 8;
+        const u64 size = u64(width) * height * bytes_per_pixel;
+        const auto download = runtime.GetStagingPool().Request(size, MemoryType::HostCached, 16);
+        const vk::BufferImageCopy copy = {
+            .bufferOffset = download.offset,
+            .imageSubresource = {image.info.props.is_depth ? vk::ImageAspectFlagBits::eDepth
+                                                           : vk::ImageAspectFlagBits::eColor,
+                                 0, 0, 1},
+            .imageExtent = {width, height, 1},
+        };
+        runtime.DownloadImage(&image, download.buffer, std::span{&copy, 1});
+        scheduler.Finish();
+        download.Invalidate();
+        const std::string path = std::format("{}/img_{:x}_{}_{}x{}_{}.raw", dir, address, n++, width,
+                                             height, format);
+        if (FILE* f = std::fopen(path.c_str(), "wb")) {
+            std::fwrite(download.mapped, 1, size, f);
+            std::fclose(f);
+        }
+    }
+}
+
 /// bbport: the guest memory a MaybeCpuDirty check compares, the same at marking and at
 /// refresh (they hashed different ranges, the whole image and its first 8x8 pixels, so the
 /// first check never matched). Such an image lies within the faulting page: cheap to hash

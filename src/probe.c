@@ -15,6 +15,8 @@
 #include <timeapi.h>
 #include <process.h>
 #include <psapi.h>
+#include <tlhelp32.h>
+#include <wchar.h>
 #else
 #include <sys/mman.h>
 #include <malloc.h>
@@ -204,8 +206,167 @@ static void report_exception(EXCEPTION_POINTERS *e) {
         fprintf(stderr, "  #%d %s\n", depth, where);
         rbp = frame[0];
     }
+    /* The host call chain from unwind data (the rbp chain above often stops in host code). */
+    void *frames[48];
+    USHORT depth = RtlCaptureStackBackTrace(0, 48, frames, NULL);
+    for (USHORT i = 0; i < depth; ++i) {
+        describe(where, sizeof(where), (uintptr_t)frames[i]);
+        fprintf(stderr, "  host #%u %s\n", i, where);
+    }
     if (gpu_enabled && r->ExceptionCode == EXCEPTION_ACCESS_VIOLATION) bbgpu_dump_guest_writes(e);
     fflush(NULL);
+}
+/* Thread dump on request: SetEvent on "Local\bbport-dump-<pid>" prints every thread's call
+ * chain. Threads are suspended only to copy their registers (a suspended thread may hold the
+ * heap or loader lock); the stacks are walked afterwards with a fault recovery point. Host
+ * frames unwind by their unwind data, guest frames by the rbp chain. */
+enum { DUMP_THREADS = 512 };
+static struct { DWORD id; CONTEXT context; } dumped[DUMP_THREADS];
+static void dump_chain(CONTEXT c) {
+    char where[512];
+    for (int depth = 0; depth < 32 && c.Rip; ++depth) {
+        describe(where, sizeof(where), (uintptr_t)c.Rip);
+        fprintf(stderr, "  #%d %s\n", depth, where);
+        DWORD64 base = 0;
+        RUNTIME_FUNCTION *function = guest_address((uintptr_t)c.Rip) ? NULL : RtlLookupFunctionEntry(c.Rip, &base, NULL);
+        if (function) {
+            void *handler_data;
+            DWORD64 frame;
+            RtlVirtualUnwind(UNW_FLAG_NHANDLER, base, c.Rip, function, &c, &handler_data, &frame, NULL);
+        } else if (guest_address((uintptr_t)c.Rip) && c.Rbp > c.Rsp) {
+            uintptr_t *frame = (uintptr_t *)c.Rbp; /* [rbp] caller's rbp, [rbp+8] return address */
+            c.Rip = frame[1]; c.Rsp = c.Rbp + 16; c.Rbp = frame[0];
+        } else {
+            c.Rip = *(DWORD64 *)c.Rsp; c.Rsp += 8; /* leaf without unwind data (JIT code, thunks) */
+        }
+    }
+}
+static unsigned __stdcall dump_thread(void *event) {
+    for (;;) {
+        WaitForSingleObject(event, INFINITE);
+        DWORD self = GetCurrentThreadId(), pid = GetCurrentProcessId();
+        unsigned count = 0;
+        HANDLE snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0);
+        THREADENTRY32 entry = {.dwSize = sizeof(entry)};
+        for (BOOL more = Thread32First(snapshot, &entry); more && count < DUMP_THREADS; more = Thread32Next(snapshot, &entry)) {
+            if (entry.th32OwnerProcessID != pid || entry.th32ThreadID == self) continue;
+            HANDLE thread = OpenThread(THREAD_SUSPEND_RESUME | THREAD_GET_CONTEXT, FALSE, entry.th32ThreadID);
+            if (!thread) continue;
+            dumped[count].id = entry.th32ThreadID;
+            dumped[count].context.ContextFlags = CONTEXT_CONTROL | CONTEXT_INTEGER;
+            if (SuspendThread(thread) != (DWORD)-1) {
+                if (GetThreadContext(thread, &dumped[count].context)) ++count;
+                ResumeThread(thread);
+            }
+            CloseHandle(thread);
+        }
+        CloseHandle(snapshot);
+        fprintf(stderr, "Thread dump: %u threads\n", count);
+        for (unsigned i = 0; i < count; ++i) {
+            char name[64] = "";
+            HANDLE thread = OpenThread(THREAD_QUERY_LIMITED_INFORMATION, FALSE, dumped[i].id);
+            PWSTR description = NULL;
+            if (thread && SUCCEEDED(GetThreadDescription(thread, &description)) && description) {
+                WideCharToMultiByte(CP_UTF8, 0, description, -1, name, sizeof(name), NULL, NULL);
+                LocalFree(description);
+            }
+            if (thread) CloseHandle(thread);
+            CONTEXT *c = &dumped[i].context;
+            fprintf(stderr, "thread %lu %s: rcx=%llx rdx=%llx rdi=%llx rsi=%llx\n", dumped[i].id, name, c->Rcx, c->Rdx, c->Rdi, c->Rsi);
+            RuntimeRecoverBuf recover;
+            if (!RUNTIME_RECOVER_SET(recover)) {
+                runtime_fault_recover = &recover;
+                dump_chain(*c);
+            } else fprintf(stderr, "  (bad frame)\n");
+            runtime_fault_recover = NULL;
+        }
+        fprintf(stderr, "Thread dump end\n");
+        fflush(NULL);
+    }
+    return 0;
+}
+static void start_dump_thread(void) {
+    wchar_t name[64];
+    swprintf(name, 64, L"Local\\bbport-dump-%lu", GetCurrentProcessId());
+    HANDLE event = CreateEventW(NULL, FALSE, FALSE, name);
+    if (event) CloseHandle((HANDLE)_beginthreadex(NULL, 0, dump_thread, event, 0, NULL));
+}
+/* BB_HW_WATCH=<file holding a hex address, "r" first for reads too>: a hardware watchpoint (DR0, 4 bytes) on every
+ * thread. The file is re-read and the threads set again every 200 ms (new threads, new address);
+ * each distinct writing instruction is printed once per address. */
+static volatile uintptr_t hw_watch;
+static volatile char hw_mode = 'w';
+static const char *hw_watch_file;
+static volatile LONG hw_hits;
+static uintptr_t hw_rips[64];
+static void hw_watch_hit(CONTEXT *c) {
+    uintptr_t rip = (uintptr_t)c->Rip;
+    LONG n = hw_hits < 64 ? hw_hits : 64;
+    for (LONG i = 0; i < n; ++i) if (hw_rips[i] == rip) return;
+    LONG slot = InterlockedIncrement(&hw_hits) - 1;
+    if (slot >= 64) return;
+    hw_rips[slot] = rip;
+    char where[512];
+    describe(where, sizeof(where), rip);
+    fprintf(stderr, "HW watch: write to %#llx by %s (after the store), now %08x, thread %lu\n"
+            "  rax=%llx rbx=%llx rcx=%llx rdx=%llx rsi=%llx rdi=%llx r8=%llx r12=%llx r13=%llx r14=%llx r15=%llx\n",
+            (unsigned long long)hw_watch, where, *(volatile unsigned *)hw_watch, GetCurrentThreadId(),
+            c->Rax, c->Rbx, c->Rcx, c->Rdx, c->Rsi, c->Rdi, c->R8, c->R12, c->R13, c->R14, c->R15);
+    uintptr_t rbp = c->Rbp;
+    for (int depth = 0; depth < 6 && rbp > c->Rsp; ++depth) {
+        uintptr_t frame[2];
+        SIZE_T got = 0;
+        if (!ReadProcessMemory(GetCurrentProcess(), (void *)rbp, frame, sizeof(frame), &got) || got != sizeof(frame) || frame[0] <= rbp) break;
+        describe(where, sizeof(where), frame[1]);
+        fprintf(stderr, "  #%d %s\n", depth, where);
+        rbp = frame[0];
+    }
+    fflush(stderr);
+}
+static unsigned __stdcall hw_watch_thread(void *unused) {
+    (void)unused;
+    for (;;) {
+        unsigned long long address = 0;
+        char mode = 'w';
+        FILE *f = fopen(hw_watch_file, "r");
+        if (f) {
+            int c = fgetc(f);
+            if (c == 'r' || c == 'x') mode = (char)c; else if (c != EOF) ungetc(c, f);
+            if (fscanf(f, "%llx", &address) != 1) address = 0;
+            fclose(f);
+        }
+        if (address != hw_watch || mode != hw_mode) {
+            hw_hits = 0; hw_mode = mode; hw_watch = (uintptr_t)address;
+            fprintf(stderr, "HW watch: %#llx (%s)\n", address, mode == 'r' ? "reads and writes" : "writes");
+        }
+        DWORD self = GetCurrentThreadId(), pid = GetCurrentProcessId();
+        HANDLE snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0);
+        THREADENTRY32 entry = {.dwSize = sizeof(entry)};
+        for (BOOL more = Thread32First(snapshot, &entry); more; more = Thread32Next(snapshot, &entry)) {
+            if (entry.th32OwnerProcessID != pid || entry.th32ThreadID == self) continue;
+            HANDLE thread = OpenThread(THREAD_SUSPEND_RESUME | THREAD_GET_CONTEXT | THREAD_SET_CONTEXT, FALSE, entry.th32ThreadID);
+            if (!thread) continue;
+            if (SuspendThread(thread) != (DWORD)-1) {
+                CONTEXT c = {.ContextFlags = CONTEXT_DEBUG_REGISTERS};
+                /* L0; execute (RW=00, LEN=00), write (01) or read/write (11) of 4 bytes */
+                DWORD64 dr7 = !hw_watch ? 0 : hw_mode == 'x' ? 1 : 1 | ((hw_mode == 'r' ? 3u : 1u) << 16) | (3u << 18);
+                if (GetThreadContext(thread, &c) && (c.Dr0 != hw_watch || (c.Dr7 & 0xf0003) != dr7)) {
+                    c.Dr0 = hw_watch;
+                    c.Dr7 = (c.Dr7 & ~(DWORD64)0xf0003) | dr7;
+                    SetThreadContext(thread, &c);
+                }
+                ResumeThread(thread);
+            }
+            CloseHandle(thread);
+        }
+        CloseHandle(snapshot);
+        Sleep(200);
+    }
+    return 0;
+}
+static void start_hw_watch(void) {
+    if (!(hw_watch_file = getenv("BB_HW_WATCH"))) return;
+    CloseHandle((HANDLE)_beginthreadex(NULL, 0, hw_watch_thread, NULL, 0, NULL));
 }
 static int fatal(DWORD code) {
     switch (code) {
@@ -219,6 +380,16 @@ static int fatal(DWORD code) {
 }
 static LONG CALLBACK vectored_handler(EXCEPTION_POINTERS *e) {
     EXCEPTION_RECORD *r = e->ExceptionRecord;
+    if (r->ExceptionCode == EXCEPTION_SINGLE_STEP && hw_watch_file && (e->ContextRecord->Dr6 & 1)) {
+        /* A thread may still hold the previous address (or a cleared watch) until the watch
+         * thread updates it: report only hits on the current address. */
+        if (hw_watch && e->ContextRecord->Dr0 == hw_watch) hw_watch_hit(e->ContextRecord);
+        e->ContextRecord->Dr6 = 0;
+        /* An execute breakpoint (this thread's DR0 RW bits 00) fires before the instruction: RF
+         * lets it run. Decided per thread, which may still hold an older mode. */
+        if (!(e->ContextRecord->Dr7 & (3u << 16))) e->ContextRecord->EFlags |= 0x10000;
+        return EXCEPTION_CONTINUE_EXECUTION;
+    }
     if (r->ExceptionCode == EXCEPTION_ACCESS_VIOLATION && r->NumberParameters >= 2) {
         if (gpu_enabled && bbgpu_handle_fault(e, (void *)r->ExceptionInformation[1])) return EXCEPTION_CONTINUE_EXECUTION;
         if (runtime_fault_recover) {
@@ -442,6 +613,8 @@ int main(int argc, char **argv) {
     SetProcessInformation(GetCurrentProcess(), ProcessPowerThrottling, &throttling, sizeof(throttling));
     AddVectoredExceptionHandler(1, vectored_handler);
     SetUnhandledExceptionFilter(unhandled_filter);
+    start_dump_thread();
+    start_hw_watch();
     main_argc = argc; main_argv = argv;
     HANDLE thread = (HANDLE)_beginthreadex(NULL, 64u << 20, loader_thread, NULL, 0, NULL);
     if (!thread) fail("cannot start the loader thread");

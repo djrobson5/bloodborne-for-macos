@@ -116,6 +116,10 @@ public:
     /// Schedules a copy of pending images for download back to CPU memory.
     void ProcessDownloadImages();
 
+    /// bbport debugging: writes mip 0 / layer 0 of every image registered at `address` to
+    /// <dir>/img_<address>_<n>_<w>x<h>_<format>.raw and prints what was found.
+    void DumpImagesAt(VAddr address, const char* dir);
+
     /// Retrieves the image handle of the image with the provided attributes.
     [[nodiscard]] ImageId FindImage(ImageDesc& desc, bool exact_fmt = false);
 
