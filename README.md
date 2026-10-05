@@ -204,6 +204,16 @@ sound (input was tested through `BB_PAD_FILE`; gamepads and the keyboard go thro
 Linux), 110–120 FPS at 1080p in Iosefka's Clinic (~3,200 draws per frame, GPU command thread
 2.5 µs per draw). v1.09 dumps of other regions work as well (tested: CUSA00900).
 
+**Setup program:** `setup.bat` opens a window to choose the game folder and the settings
+(output resolution, frame rate, upscaler and preset, effects, game language, optional DLSS and
+FSR 4 model downloads, shortcuts). Install / Update then installs MSYS2 to `C:\msys64` when it
+is missing (another folder: set `BB_MSYS2`), the packages below and the submodules, builds the
+port, and writes `bbport.ini`, `Bloodborne.cmd` (the launcher: frame rate, game language and
+present mode, then `run.bat`) and Desktop and Start menu shortcuts with the game's icon. Run it
+again to change the settings; Save settings writes them without building. It needs nothing but
+Windows: `setup.bat` compiles `tools\setup\BbportSetup.cs` with the C# compiler of .NET Framework
+4 into `out\bbport-setup.exe`. The steps below do the same by hand.
+
 1. Install MSYS2 to `C:\msys64` (another folder: set `BB_MSYS2`) and, in an MSYS2 shell:
 
    ```
