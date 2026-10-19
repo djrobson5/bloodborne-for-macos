@@ -1,7 +1,8 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 // 0.4's optional Linux dma-buf / SIGTRAP experiments cannot run on section-backed Windows
 // memory. The established Windows renderer and vectored fault reports remain active.
-#ifdef _WIN32
+// macOS has neither dma-buf nor these hooks either and uses the same stubs.
+#if defined(_WIN32) || defined(__APPLE__)
 #include <cstdio>
 #include <cstdlib>
 #include "bbport_guest_memory.h"

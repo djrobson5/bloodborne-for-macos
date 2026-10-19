@@ -27,7 +27,11 @@
 #include "bbport_platform.h"
 #ifndef _WIN32
 #include <dlfcn.h>
+#ifdef __APPLE__
+#include <signal.h> // ucontext_t
+#else
 #include <ucontext.h>
+#endif
 #include <unistd.h>
 #endif
 #include <string>
@@ -137,6 +141,9 @@ void NoteFaultSite(void* context, VAddr address) {
 #ifdef _WIN32
     const auto* registers = static_cast<const EXCEPTION_POINTERS*>(context)->ContextRecord;
     const u64 rip = registers->Rip, rbp = registers->Rbp, rsp = registers->Rsp;
+#elif defined(__APPLE__)
+    const auto& s = static_cast<const ucontext_t*>(context)->uc_mcontext->__ss;
+    const u64 rip = s.__rip, rbp = s.__rbp, rsp = s.__rsp;
 #else
     const auto* g = static_cast<const ucontext_t*>(context)->uc_mcontext.gregs;
     const u64 rip = u64(g[REG_RIP]), rbp = u64(g[REG_RBP]), rsp = u64(g[REG_RSP]);

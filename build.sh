@@ -11,6 +11,22 @@ if [[ -z ${CC:-} ]]; then
     fi
 fi
 if [[ -z ${CC:-} ]]; then echo 'Install GCC/Clang or set CC.' >&2; exit 1; fi
+# macOS (Apple Silicon): everything is built for x86-64 and runs under Rosetta 2, the game's
+# code included. The x86-64 dependencies (Vulkan loader, MoltenVK, SDL3, FFmpeg, ...) come from a
+# prefix of their own, set up by deps/env.sh (BB_DEPS_ENV names another).
+macos=
+cc=("$CC")
+cmake_platform=()
+if [[ $(uname -s) == Darwin ]]; then
+    macos=1
+    deps_env=${BB_DEPS_ENV:-../deps/env.sh}
+    if [[ ! -f $deps_env ]]; then echo "macOS: x86-64 dependencies not found ($deps_env)" >&2; exit 1; fi
+    # shellcheck disable=SC1090
+    source "$deps_env"
+    cc=("${cc[@]}" -arch x86_64 -mmacosx-version-min=14.0)
+    cmake_platform=(-DCMAKE_OSX_ARCHITECTURES=x86_64 -DCMAKE_OSX_DEPLOYMENT_TARGET=14.0
+                    -DCMAKE_IGNORE_PREFIX_PATH=/opt/homebrew -DCMAKE_FIND_FRAMEWORK=LAST)
+fi
 # Dependencies come from pkg-config (Vulkan loader/headers, SDL3). On NixOS the
 # environment is provided by shell.nix; re-enter it automatically if needed.
 if ! { command -v pkg-config >/dev/null && pkg-config --exists vulkan sdl3 && command -v cmake >/dev/null && command -v ninja >/dev/null; }; then
@@ -76,10 +92,11 @@ if [[ -e gpu/third_party/fsr-vulkan/.git ]]; then
 fi
 # Line tables only (not full debug info): crash offsets still resolve to function and
 # file:line with llvm-symbolizer, and compiling and linking take much less time.
+if [[ -n $macos ]]; then BB_LTO=${BB_LTO:-OFF}; fi
 gpu_config=(-G Ninja -DCMAKE_BUILD_TYPE=RelWithDebInfo -DBB_PGO="$pgo" -DBB_LTO="${BB_LTO:-ON}"
             -DBB_PGO_DIR="$PWD/pgo" -DBB_MARCH="${BB_MARCH:-}"
             "-DCMAKE_C_FLAGS_RELWITHDEBINFO=-O2 -gline-tables-only -DNDEBUG"
-            "-DCMAKE_CXX_FLAGS_RELWITHDEBINFO=-O2 -gline-tables-only -DNDEBUG")
+            "-DCMAKE_CXX_FLAGS_RELWITHDEBINFO=-O2 -gline-tables-only -DNDEBUG" "${cmake_platform[@]}")
 # Configured once per set of options (ninja itself reruns CMake when a CMakeLists.txt changes).
 if [[ ! -f out/gpu/build.ninja || $(cat out/gpu/bb-configure.txt 2>/dev/null) != "${gpu_config[*]}" ]]; then
     cmake -S gpu -B out/gpu "${gpu_config[@]}" >/dev/null
@@ -107,12 +124,19 @@ if [[ -n $windows ]]; then
     link=(-Wl,--disable-dynamicbase,--disable-high-entropy-va -lwinmm -lws2_32 -lpsapi -flto=thin
           -Wl,--thinlto-cache-dir="$PWD/out/thinlto-cache" -Wl,--thinlto-jobs="${BB_JOBS:-all}"
           -Wl,--thinlto-cache-policy=cache_size_bytes=6g:prune_after=1209600s)
+elif [[ -n $macos ]]; then
+    # As on Windows: the static GPU library and its dependencies (bash 3.2 has no mapfile).
+    gpu=()
+    while IFS= read -r item; do [[ -n $item ]] && gpu+=("$item"); done < out/gpu/bbgpu_link.txt
+    runtime+=(src/mac_*.c)
+    # Room to point the dylib references at a packaged copy later (install_name_tool).
+    link=(-Wl,-headerpad_max_install_names)
 fi
 # Third-party decoders: compiled once, without this project's -Werror policy.
 atrac9=(third_party/LibAtrac9/C/src/*.c)
 if [[ ! -f out/libatrac9.a || -n $(find third_party/LibAtrac9/C/src -newer out/libatrac9.a -name '*.c') ]]; then
     rm -rf out/atrac9 && mkdir -p out/atrac9
-    for source in "${atrac9[@]}"; do "$CC" -std=c99 -O2 -g -w -c "$source" -o "out/atrac9/$(basename "${source%.c}").o"; done
+    for source in "${atrac9[@]}"; do "${cc[@]}" -std=c99 -O2 -g -w -c "$source" -o "out/atrac9/$(basename "${source%.c}").o"; done
     ar rcs out/libatrac9.a out/atrac9/*.o
 fi
 # Windows: the link includes the GPU library's link-time optimization (a minute or more), and
@@ -129,20 +153,20 @@ if [[ -n $windows && -f out/bb-probe.exe && -f out/bb-gpu-capabilities.exe &&
                tools/gpu_capabilities.c -newer out/bb-probe.exe -print -quit) ]]; then
     echo "Up to date: $PWD/out/bb-probe.exe"
 else
-"$CC" "${cstd[@]}" -O2 -g -Wall -Wextra -Werror "${threads[@]}" "${includes[@]}" -I. -Isrc src/probe.c "${runtime[@]}" src/vulkan_smoke.c out/libatrac9.a -lm "${gpu[@]}" "${libraries[@]}" "${link[@]}" -o out/bb-probe
+"${cc[@]}" "${cstd[@]}" -O2 -g -Wall -Wextra -Werror "${threads[@]}" "${includes[@]}" -I. -Isrc src/probe.c "${runtime[@]}" src/vulkan_smoke.c out/libatrac9.a -lm "${gpu[@]}" "${libraries[@]}" "${link[@]}" -o out/bb-probe
 echo "Built $PWD/out/bb-probe"
 # GPU and controller inventory; keep the Windows C dialect and include SDL headers.
-"$CC" "${cstd[@]}" -O2 -Wall -Wextra -Werror "${includes[@]}" tools/gpu_capabilities.c "${libraries[@]}" -o out/bb-gpu-capabilities
+"${cc[@]}" "${cstd[@]}" -O2 -Wall -Wextra -Werror "${includes[@]}" tools/gpu_capabilities.c "${libraries[@]}" -o out/bb-gpu-capabilities
 fi
 if [[ ${1:-} == --test ]]; then
-    "$CC" -std=c11 -O2 -g -Wall -Wextra -Werror -pthread "${includes[@]}" -I. -Isrc tests/test_pad.c "${libraries[@]}" -o out/pad-test
+    "${cc[@]}" -std=c11 -O2 -g -Wall -Wextra -Werror -pthread "${includes[@]}" -I. -Isrc tests/test_pad.c "${libraries[@]}" -o out/pad-test
     out/pad-test
-    "$CC" -std=c11 -O2 -g -Wall -Wextra -Werror -pthread -I. -Isrc tests/test_runtime.c "${runtime[@]}" out/libatrac9.a -lm "${gpu[@]}" "${libraries[@]}" -o out/runtime-test
+    "${cc[@]}" -std=c11 -O2 -g -Wall -Wextra -Werror -pthread -I. -Isrc tests/test_runtime.c "${runtime[@]}" out/libatrac9.a -lm "${gpu[@]}" "${libraries[@]}" -o out/runtime-test
     out/runtime-test
-    "$CC" -std=c11 -O2 -g -Wall -Wextra -Werror -pthread -Isrc tests/test_file_mods.c -o out/file-mods-test
+    "${cc[@]}" -std=c11 -O2 -g -Wall -Wextra -Werror -pthread -Isrc tests/test_file_mods.c -o out/file-mods-test
     out/file-mods-test
-    "$CC" -std=c11 -O2 -g -Wall -Wextra -Werror -pthread -I. -Isrc tests/test_sema.c "${runtime[@]}" out/libatrac9.a -lm "${gpu[@]}" "${libraries[@]}" -o out/sema-test
+    "${cc[@]}" -std=c11 -O2 -g -Wall -Wextra -Werror -pthread -I. -Isrc tests/test_sema.c "${runtime[@]}" out/libatrac9.a -lm "${gpu[@]}" "${libraries[@]}" -o out/sema-test
     out/sema-test
-    "$CC" -std=c11 -D_GNU_SOURCE -O2 -g -Wall -Wextra -Werror -I. -Isrc tests/test_content.c src/runtime_content.c -o out/content-test
+    "${cc[@]}" -std=c11 -D_GNU_SOURCE -O2 -g -Wall -Wextra -Werror -I. -Isrc tests/test_content.c src/runtime_content.c -o out/content-test
     out/content-test
 fi

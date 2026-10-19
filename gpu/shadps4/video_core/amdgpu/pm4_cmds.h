@@ -3,6 +3,8 @@
 
 #pragma once
 
+#include <type_traits>
+
 #include <cstring>
 #include "common/assert.h"
 #include "common/bit_field.h"
@@ -13,6 +15,18 @@
 #include "video_core/amdgpu/pm4_opcodes.h"
 
 namespace AmdGpu {
+
+/// A packet's 64-bit address as T: pointers are reinterpreted, integers converted. VAddr
+/// (uintptr_t) and u64 are the same type on Linux but not on macOS (unsigned long and unsigned
+/// long long), where reinterpret_cast between them does not compile.
+template <typename T>
+T AddressAs(u64 address) {
+    if constexpr (std::is_integral_v<T>) {
+        return static_cast<T>(address);
+    } else {
+        return reinterpret_cast<T>(address);
+    }
+}
 
 enum class PM4ShaderType : u32 {
     ShaderGraphics = 0,
@@ -276,13 +290,13 @@ struct PM4CmdStrmoutBufferUpdate {
     template <typename T = u64>
     T DstAddress() const {
         ASSERT(update_memory.Value() == 1);
-        return reinterpret_cast<T>(dst_address_lo.Value() | u64(dst_address_hi & 0xFFFF) << 32);
+        return AddressAs<T>(dst_address_lo.Value() | u64(dst_address_hi & 0xFFFF) << 32);
     }
 
     template <typename T = u64>
     T SrcAddress() const {
         ASSERT(source_select.Value() == SourceSelect::SrcAddress);
-        return reinterpret_cast<T>(src_address_lo.Value() | u64(src_address_hi & 0xFFFF) << 32);
+        return AddressAs<T>(src_address_lo.Value() | u64(src_address_hi & 0xFFFF) << 32);
     }
 };
 
@@ -761,7 +775,7 @@ struct PM4CmdWriteData {
 
     template <typename T>
     T Address() const {
-        return reinterpret_cast<T>(addr64);
+        return AddressAs<T>(addr64);
     }
 };
 
@@ -792,7 +806,7 @@ struct PM4CmdEventWriteEos {
 
     template <typename T = u32*>
     T Address() const {
-        return reinterpret_cast<T>(address_lo | u64(address_hi) << 32);
+        return AddressAs<T>(address_lo | u64(address_hi) << 32);
     }
 
     u32 DataDWord() const {
@@ -851,7 +865,7 @@ struct PM4DumpConstRam {
 
     template <typename T>
     T Address() const {
-        return reinterpret_cast<T>((u64(addr_hi) << 32u) | addr_lo);
+        return AddressAs<T>((u64(addr_hi) << 32u) | addr_lo);
     }
 
     [[nodiscard]] u32 Offset() const {
@@ -1017,7 +1031,7 @@ struct PM4CmdSetBase {
     T Address() const {
         ASSERT(base_index == BaseIndex::DisplayListPatchTable ||
                base_index == BaseIndex::DrawIndexIndirPatchTable);
-        return reinterpret_cast<T>(address0 | (u64(address1 & 0xffff) << 32u));
+        return AddressAs<T>(address0 | (u64(address1 & 0xffff) << 32u));
     }
 };
 

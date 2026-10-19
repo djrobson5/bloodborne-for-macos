@@ -17,7 +17,7 @@
 
 // The free camera ran in this camera update: the stick's step or its fast
 // turn. The hooks' asm stubs set it too (engine/mouse_camera.cpp).
-extern "C" std::uint8_t bb_mouse_camera_free_now;
+extern "C" std::uint8_t bb_mouse_camera_free_now __asm__("bb_mouse_camera_free_now");
 
 namespace mouse_camera {
 

@@ -16,9 +16,10 @@
 
 // Roboto Medium (third_party/imgui/misc/fonts, Apache License 2.0), embedded as the overlay embeds
 // its font (bbport_overlay.cpp).
-#ifdef _WIN32
+#if defined(_WIN32) || defined(__APPLE__)
 #pragma GCC diagnostic push
 #pragma GCC diagnostic ignored "-Wpedantic"
+#pragma GCC diagnostic ignored "-Wc23-extensions"
 alignas(16) static const unsigned char bb_keycap_font[] = {
 #embed BB_KEYCAP_FONT_PATH
 };

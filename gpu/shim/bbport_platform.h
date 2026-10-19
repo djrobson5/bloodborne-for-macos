@@ -1,7 +1,8 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 // bbport: the few OS facilities the statistics and diagnostics use (thread ids, CPU time and
-// resource usage), for Linux and Windows. Windows versions live in bbport_platform.cpp so that
-// <windows.h> and its macros (near, MemoryBarrier, ...) stay out of the renderer's headers.
+// resource usage), for Linux, Windows and macOS. Windows and macOS versions live in
+// bbport_platform.cpp so that <windows.h> and its macros (near, MemoryBarrier, ...) and the Mach
+// headers stay out of the renderer's headers.
 
 #pragma once
 
@@ -28,7 +29,7 @@ struct Usage {
     std::uint64_t user_us = 0, sys_us = 0, invol_switches = 0, vol_switches = 0, minor_faults = 0;
 };
 
-#ifdef _WIN32
+#if defined(_WIN32) || defined(__APPLE__)
 /// CPU time and scheduling counters of the calling thread (thread = true) or of the process.
 /// Windows has no per-thread context switch or fault counters: those stay 0 for threads.
 bool GetUsage(bool thread, Usage& out);
@@ -36,7 +37,7 @@ bool GetMemory(Memory& out);
 /// OS id of the calling thread.
 std::uint32_t CurrentThreadId();
 /// A CPU clock of the calling thread that other threads can read (-1: unavailable): a
-/// duplicated thread handle (handles fit in 32 bits).
+/// duplicated thread handle (handles fit in 32 bits); on macOS the thread's Mach port.
 int ThreadCpuClock();
 /// CPU time in nanoseconds of the thread behind a ThreadCpuClock() value.
 std::uint64_t ReadThreadCpuClockNs(int clock);

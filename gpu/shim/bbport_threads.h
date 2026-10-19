@@ -7,7 +7,10 @@
 
 #include <algorithm>
 #include <thread>
-#ifndef _WIN32
+#ifdef __APPLE__
+#include <pthread.h>
+#include <pthread/qos.h>
+#elif !defined(_WIN32)
 #include <sched.h>
 #include <sys/resource.h>
 #include <unistd.h>
@@ -28,6 +31,13 @@ void MakeCritical(bool bulk = false);
 /// An idle spin of a raised thread before it sleeps, in microseconds: `wanted`, at most 50
 /// with fewer than 16 hardware threads (a raised thread spinning keeps a game thread waiting).
 unsigned CapSpinUs(unsigned wanted);
+#elif defined(__APPLE__)
+/// macOS: quality-of-service classes. The render chain asks for performance cores
+/// (BB_GPU_THREAD_PRIORITY=0: left at the default); speculative helpers run as utility work.
+inline unsigned Available() { return std::max(1u, std::thread::hardware_concurrency()); }
+inline void MakeBackground() { pthread_set_qos_class_self_np(QOS_CLASS_UTILITY, 0); }
+void MakeCritical(bool bulk = false);
+inline unsigned CapSpinUs(unsigned wanted) { return wanted; }
 #else
 /// Linux: unchanged (normal priority; raising it needs privileges).
 inline void MakeCritical(bool = false) {}

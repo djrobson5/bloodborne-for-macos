@@ -145,7 +145,7 @@ void Liverpool::Process(std::stop_token stoken) {
     gpu_id = std::this_thread::get_id();
 #ifdef __linux__
     gpu_tid = gettid();
-#elif defined(_WIN32)
+#elif defined(_WIN32) || defined(__APPLE__)
     gpu_tid = BbPlatform::CurrentThreadId();
 #endif
 

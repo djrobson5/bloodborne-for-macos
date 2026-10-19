@@ -22,11 +22,12 @@
 
 // DejaVu Sans (Latin with Latin Extended, Greek, Cyrillic), embedded (third_party/fonts, Bitstream
 // Vera license).
-#ifdef _WIN32
-// PE/COFF assemblers have no .hidden/.previous: the compiler embeds the file (#embed, a GCC
-// extension in C++).
+#if defined(_WIN32) || defined(__APPLE__)
+// PE/COFF and Mach-O assemblers have no .hidden/.previous: the compiler embeds the file (#embed,
+// a GCC and Clang extension in C++).
 #pragma GCC diagnostic push
 #pragma GCC diagnostic ignored "-Wpedantic"
+#pragma GCC diagnostic ignored "-Wc23-extensions"
 alignas(16) static const unsigned char bb_font_ttf[] = {
 #embed BB_FONT_PATH
 };

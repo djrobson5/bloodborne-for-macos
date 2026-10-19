@@ -107,7 +107,11 @@ if (WIN32)
 else()
     find_package(magic_enum REQUIRED)
     find_package(VulkanMemoryAllocator CONFIG REQUIRED)
-    pkg_check_modules(X11 REQUIRED IMPORTED_TARGET x11)
+    if (APPLE)
+        find_package(xbyak REQUIRED)
+    else()
+        pkg_check_modules(X11 REQUIRED IMPORTED_TARGET x11)
+    endif()
     find_package(miniz REQUIRED)
 endif()
 find_program(GLSLANG_COMPILER NAMES glslang glslangValidator REQUIRED)
@@ -196,9 +200,11 @@ set(COMMON
 file(GLOB AVPLAYER CONFIGURE_DEPENDS shadps4/core/libraries/avplayer/*.cpp)
 pkg_check_modules(FFMPEG REQUIRED IMPORTED_TARGET libavformat libavcodec libavutil libswscale libswresample)
 file(GLOB SHIM_SOURCES CONFIGURE_DEPENDS shim/*.cpp shim/*/*.cpp)
-if (WIN32)
+if (WIN32 OR APPLE)
     # These optional experiments use Linux dma-buf mappings and SIGTRAP hooks. Keep the
     # section-backed Win32 memory and its vectored crash diagnostics; do not emulate dma-buf.
+    # macOS (x86-64 under Rosetta 2) has neither either: the same stubs, and the same static
+    # library linked into bb-probe (a dylib cannot leave the runtime_* symbols undefined).
     list(FILTER SHIM_SOURCES EXCLUDE REGEX "/bbport_(guest_memory|guest_hooks|gnm_hooks|free_check|heap_sites)\\.cpp$")
     set(BBGPU_LIBRARY_TYPE STATIC)
 else()
@@ -210,7 +216,18 @@ add_library(bbgpu ${BBGPU_LIBRARY_TYPE} ${VIDEO_CORE} ${RECOMPILER} ${COMMON} ${
     shadps4/core/libraries/kernel/equeue.cpp ${AVPLAYER}
     shadps4/core/libraries/videodec/video_utils.cpp)
 add_dependencies(bbgpu host_shaders)
-add_subdirectory(bbnet)
+# Online play (bbnet: protobuf, OpenSSL, nlohmann_json). Off on macOS for now: the three entry
+# points bbgpu calls are stubs there (bbnet/bbnet_stub.cpp).
+if (APPLE)
+    option(BB_ONLINE "Online play (bbnet)" OFF)
+else()
+    option(BB_ONLINE "Online play (bbnet)" ON)
+endif()
+if (BB_ONLINE)
+    add_subdirectory(bbnet)
+else()
+    add_library(bbnet STATIC bbnet/bbnet_stub.cpp)
+endif()
 target_link_libraries(bbgpu PUBLIC bbnet)
 # In-game settings menu: Dear ImGui (third_party/imgui, MIT) with its Vulkan backend, and an
 # embedded Cyrillic font (third_party/fonts).
@@ -229,15 +246,19 @@ set_source_files_properties(shim/engine/keycap_art.cpp PROPERTIES
 target_include_directories(bbgpu PRIVATE shim shadps4 ${SHADER_INCLUDE} third_party/gcn/include third_party/half/include)
 target_compile_definitions(bbgpu PRIVATE BOOST_ASIO_STANDALONE NDEBUG)
 target_compile_options(bbgpu PRIVATE -Wno-deprecated-declarations -Wno-missing-field-initializers)
-# The Linux shared library is loaded at process startup; Windows links it statically.
-if(NOT WIN32)
+# The Linux shared library is loaded at process startup; Windows and macOS link it statically.
+if(NOT WIN32 AND NOT APPLE)
     target_compile_options(bbgpu PRIVATE -ftls-model=initial-exec)
     target_link_options(bbgpu PRIVATE -Wl,--allow-shlib-undefined)
 endif()
 target_link_libraries(bbgpu PRIVATE ffx-vulkan::portable ffx-vulkan::fsr4-v07-vulkan)
 target_link_libraries(bbgpu PUBLIC Vulkan::Headers fmt::fmt Boost::headers magic_enum::magic_enum
     tsl::robin_map GPUOpen::VulkanMemoryAllocator PkgConfig::XXHASH PkgConfig::SDL3 PkgConfig::FFMPEG miniz::miniz Zydis::Zydis sirit)
-if (WIN32)
+if (APPLE)
+    target_link_libraries(bbgpu PUBLIC xbyak::xbyak)
+    include(cmake/LinkClosure.cmake)
+    bb_write_link_closure(bbgpu ${CMAKE_CURRENT_BINARY_DIR}/bbgpu_link.txt)
+elseif (WIN32)
     # Windows headers: no min/max macros, no winsock 1 clash; Windows 10+ APIs (SetThreadDescription).
     target_compile_definitions(bbgpu PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN _WIN32_WINNT=0x0A00)
     target_link_libraries(bbgpu PUBLIC xbyak::xbyak)
