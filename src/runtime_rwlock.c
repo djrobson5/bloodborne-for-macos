@@ -39,10 +39,23 @@ static int native_init(NativeRwlock *l) { return pthread_rwlock_init(l,NULL); }
 static int native_destroy(NativeRwlock *l) { return pthread_rwlock_destroy(l); }
 static int native_try(NativeRwlock *l, int writer) { return writer ? pthread_rwlock_trywrlock(l) : pthread_rwlock_tryrdlock(l); }
 static int native_lock(NativeRwlock *l, int writer) { return writer ? pthread_rwlock_wrlock(l) : pthread_rwlock_rdlock(l); }
+#ifdef __APPLE__
+/* No timed rwlock acquire: retry until the realtime deadline. */
+static int native_timedlock(NativeRwlock *l, int writer, const GuestTime *time) {
+    uint64_t deadline=(uint64_t)time->seconds*1000000000+(uint64_t)time->nanoseconds;
+    for (unsigned attempt=0;;++attempt) {
+        int e=native_try(l,writer);
+        if (e!=EBUSY) return e;
+        if (host_realtime_ns()>=deadline) return ETIMEDOUT;
+        if (attempt<128) sched_yield(); else host_sleep_ns(1000000);
+    }
+}
+#else
 static int native_timedlock(NativeRwlock *l, int writer, const GuestTime *time) {
     struct timespec deadline={.tv_sec=(time_t)time->seconds,.tv_nsec=(long)time->nanoseconds};
     return writer ? pthread_rwlock_timedwrlock(l,&deadline) : pthread_rwlock_timedrdlock(l,&deadline);
 }
+#endif
 static int native_unlock(NativeRwlock *l, int writer) { (void)writer; return pthread_rwlock_unlock(l); }
 #endif
 typedef struct Holder {

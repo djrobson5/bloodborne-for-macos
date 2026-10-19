@@ -6,6 +6,9 @@
 #ifdef _WIN32
 #include "win32_compat.h"
 #endif
+#ifdef __APPLE__
+#include "mac_compat.h"
+#endif
 #include "host_sync.h"
 #ifdef _WIN32
 /* runtime_setjmp/runtime_longjmp (runtime_host.c): every Win64 callee-saved register, and no

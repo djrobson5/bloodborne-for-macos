@@ -168,6 +168,11 @@ void host_sleep_ns(uint64_t ns) {
 }
 void host_sleep_until_ns(uint64_t deadline) {
     struct timespec t = {(time_t)(deadline / 1000000000u), (long)(deadline % 1000000000u)};
+#ifdef __APPLE__
+    (void)t; /* no clock_nanosleep: relative sleeps until the deadline */
+    for (uint64_t now = host_monotonic_ns(); now < deadline; now = host_monotonic_ns()) host_sleep_ns(deadline - now);
+#else
     while (clock_nanosleep(CLOCK_MONOTONIC, TIMER_ABSTIME, &t, NULL)) {}
+#endif
 }
 #endif

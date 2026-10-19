@@ -2,7 +2,8 @@
  * (variant II: static TLS below the TCB). The loader rewrites the eboot's
  * `mov rax, fs:[0]` into `mov rax, gs:[0]`, so GS base = guest TCB while glibc
  * keeps FS. On Windows GS is the TEB: the loader points the instruction at a TEB
- * TLS slot that holds the guest TCB instead.
+ * TLS slot that holds the guest TCB instead. On macOS GS is the thread's TSD array: the
+ * loader points it at the slot of a pthread key that holds the guest TCB.
  * Priorities/affinity are recorded, not enforced by a PS4 scheduler; only the audio range of
  * priorities raises the host thread's priority (apply_priority). */
 #define _GNU_SOURCE
@@ -19,9 +20,11 @@
 #define EXIT_SET(buf) RUNTIME_RECOVER_SET(buf)
 #define EXIT_JUMP(buf) RUNTIME_RECOVER_JUMP(buf)
 #else
-#include <sys/syscall.h>
 #include <sys/mman.h>
+#ifndef __APPLE__
+#include <sys/syscall.h>
 #include <asm/prctl.h>
+#endif
 #define EXIT_SET(buf) setjmp(buf)
 #define EXIT_JUMP(buf) longjmp(buf,1)
 #endif
@@ -73,6 +76,8 @@ static uint64_t tls_offset(void) { return (tls_memsz+tls_align-1)&~(tls_align-1)
 static void set_gs(void *base) {
 #ifdef _WIN32
     runtime_win_set_tcb(base);
+#elif defined(__APPLE__)
+    runtime_mac_set_tcb(base);
 #else
     if (syscall(SYS_arch_prctl,ARCH_SET_GS,(unsigned long)base)) { perror("STOP: arch_prctl(ARCH_SET_GS)"); exit(21); }
 #endif
@@ -243,6 +248,8 @@ static void set_host_name(const char *name) {
     memcpy(host,name,strnlen(name,sizeof(host)-1));
 #ifdef _WIN32
     runtime_win_set_thread_name(host);
+#elif defined(__APPLE__)
+    pthread_setname_np(host); /* the calling thread only */
 #else
     pthread_setname_np(pthread_self(),host);
 #endif

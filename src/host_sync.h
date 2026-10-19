@@ -84,7 +84,11 @@ static inline int host_trylock(HostMutex *m) { return pthread_mutex_trylock(m) =
 static inline void host_unlock(HostMutex *m) { pthread_mutex_unlock(m); }
 
 typedef pthread_mutex_t HostRecursiveMutex;
+#ifdef __APPLE__
+#define HOST_RECURSIVE_MUTEX_INIT PTHREAD_RECURSIVE_MUTEX_INITIALIZER
+#else
 #define HOST_RECURSIVE_MUTEX_INIT PTHREAD_RECURSIVE_MUTEX_INITIALIZER_NP
+#endif
 static inline void host_recursive_lock(HostRecursiveMutex *m) { pthread_mutex_lock(m); }
 static inline void host_recursive_unlock(HostRecursiveMutex *m) { pthread_mutex_unlock(m); }
 

@@ -14,7 +14,9 @@
 #include <sys/syscall.h>
 #include <dlfcn.h>
 #include <dirent.h>
+#ifndef __APPLE__
 #include <ucontext.h>
+#endif
 #include <signal.h>
 #include <sys/uio.h>
 #include <sys/random.h>
@@ -66,7 +68,11 @@ static int host_clock(uint32_t id,HostClock *out) {
     switch (id) {
     case 0: case 9: case 10: *out=HOST_CLOCK(CLOCK_REALTIME,REALTIME); return 1;  /* REALTIME(_PRECISE/_FAST) */
     case 4: case 11: case 12: case 5: case 7: case 8: *out=HOST_CLOCK(CLOCK_MONOTONIC,MONOTONIC); return 1; /* MONOTONIC/UPTIME */
+#ifdef __APPLE__
+    case 13: *out=CLOCK_REALTIME; return 1;                                         /* SECOND */
+#else
     case 13: *out=HOST_CLOCK(CLOCK_REALTIME_COARSE,REALTIME); return 1;          /* SECOND */
+#endif
     case 14: *out=HOST_CLOCK(CLOCK_THREAD_CPUTIME_ID,THREAD_CPU); return 1;
     case 2: case 15: *out=HOST_CLOCK(CLOCK_PROCESS_CPUTIME_ID,PROCESS_CPU); return 1; /* PROF/PROCTIME */
     case 16: case 17: case 18: case 19: *out=HOST_CLOCK(CLOCK_MONOTONIC,MONOTONIC); return 1; /* PS4 network clocks */
@@ -226,7 +232,11 @@ static ABI int32_t guest_getrusage(int who,GuestRusage *out) {
     out->stime=(GuestTimeval){system/1000000,system%1000000};
 #else
     struct rusage r;
+#ifdef __APPLE__
+    getrusage(RUSAGE_SELF,&r); /* no per-thread usage */
+#else
     getrusage(who==0 ? RUSAGE_SELF : RUSAGE_THREAD,&r);
+#endif
     out->utime=(GuestTimeval){r.ru_utime.tv_sec,r.ru_utime.tv_usec};
     out->stime=(GuestTimeval){r.ru_stime.tv_sec,r.ru_stime.tv_usec};
 #endif
@@ -239,6 +249,8 @@ static ABI int32_t guest_sysctl(const int32_t *name,uint32_t namelen,void *old,u
         if (!old || !oldlen) return fail_posix(EINVAL);
 #ifdef _WIN32
         if (runtime_random(old,(size_t)*oldlen)<0) return fail_posix(errno);
+#elif defined(__APPLE__)
+        arc4random_buf(old,(size_t)*oldlen);
 #else
         if (getrandom(old,(size_t)*oldlen,0)<0) return fail_posix(errno);
 #endif
@@ -346,7 +358,7 @@ static const RuntimeExport exports[]={
     {"pthread_setspecific",posix_key_set}, {"pthread_getspecific",key_get},
 };
 uintptr_t runtime_kernel_resolve(const char *name) { return RUNTIME_LOOKUP(exports,name); }
-#ifndef _WIN32
+#if !defined(_WIN32) && !defined(__APPLE__)
 static void sample_start(void);
 static void sample_report(void);
 

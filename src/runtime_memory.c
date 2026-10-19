@@ -18,8 +18,12 @@
 #else
 #include <fcntl.h>
 #include <sys/mman.h>
-#include <ucontext.h>
 #include <unistd.h>
+#ifdef __APPLE__
+#include <signal.h> /* ucontext_t */
+#else
+#include <ucontext.h>
+#endif
 #endif
 /* sceKernelGetDirectMemorySize on retail PS4: 5056 MiB. BB_DMEM_MB raises it (the resolution
  * patches above 1080p need about 4 GiB more; run.sh sets it). */
@@ -36,7 +40,12 @@ static uint64_t pool_size_bytes(void) {
 #define POOL_SIZE pool_size_bytes()
 #define FLEXIBLE_SIZE (UINT64_C(448) * 1024 * 1024)
 #define PAGE UINT64_C(16384)
+#ifdef __APPLE__
+/* Apple Silicon: [64 GiB, 448 GiB) is the kernel's GPU carveout (mac_compat.h). */
+#define USER_MIN BB_MAC_USER_MIN
+#else
 #define USER_MIN UINT64_C(0x1000000000)
+#endif
 #define USER_MAX UINT64_C(0xfc00000000)
 #define LIMIT 4096
 #define INVALID ((int32_t)UINT32_C(0x80020016))
@@ -149,6 +158,19 @@ static int pool(void) {
     if (space() || win_mem_section(POOL_SIZE+FLEX_SPAN,&view)) return -1;
     backing_base=view; pool_fd=0; /* the section exists */
     return 0;
+#elif defined(__APPLE__)
+    /* No memfd: an unlinked POSIX shared memory object, sparse until touched. No GPU-visible
+     * chunks (dma-buf) either: chunk_fds stays NULL and everything maps from the object. */
+    char name[64];
+    snprintf(name,sizeof(name),"/bb-guest-%d",(int)getpid());
+    pool_fd=shm_open(name,O_RDWR|O_CREAT|O_EXCL,0600);
+    if (pool_fd<0) return -1;
+    shm_unlink(name);
+    if (ftruncate(pool_fd,(off_t)(POOL_SIZE+FLEX_SPAN))) { close(pool_fd); pool_fd=-1; return -1; }
+    void *view=mmap(NULL,POOL_SIZE+FLEX_SPAN,PROT_READ|PROT_WRITE,MAP_SHARED,pool_fd,0);
+    if (view==MAP_FAILED) { close(pool_fd); pool_fd=-1; return -1; }
+    backing_base=view;
+    return 0;
 #else
     pool_fd=memfd_create("bb-guest-memory", MFD_CLOEXEC);
     if (pool_fd<0 || ftruncate(pool_fd,(off_t)(POOL_SIZE+FLEX_SPAN))) return -1;
@@ -163,7 +185,7 @@ static int pool(void) {
 }
 /* Released physical pages read as zero when they are reused. */
 static void punch(uint64_t phys, uint64_t size) {
-#ifdef _WIN32
+#if defined(_WIN32) || defined(__APPLE__)
     memset(backing_base+phys,0,size);
 #else
     fallocate(pool_fd,FALLOC_FL_PUNCH_HOLE|FALLOC_FL_KEEP_SIZE,(off_t)phys,(off_t)size);
@@ -247,7 +269,7 @@ static void zero_phys(uint64_t phys, uint64_t size) {
     for (uint64_t done=0;done<size;) {
         const uint64_t at=phys+done;
         if (!chunk_fds || at>=POOL_SIZE) {
-            fallocate(pool_fd,FALLOC_FL_PUNCH_HOLE|FALLOC_FL_KEEP_SIZE,(off_t)at,(off_t)(size-done));
+            punch(at,size-done);
             return;
         }
         if (whole_chunks) {
@@ -255,13 +277,13 @@ static void zero_phys(uint64_t phys, uint64_t size) {
             const Region *r=region_at(at,&next);
             const uint64_t room=r ? r->phys+r->size-at : next-at, n=size-done<room ? size-done : room;
             if (r && r->fd>=0) memset(backing_base+at,0,n);
-            else fallocate(pool_fd,FALLOC_FL_PUNCH_HOLE|FALLOC_FL_KEEP_SIZE,(off_t)at,(off_t)n);
+            else punch(at,n);
             done+=n;
             continue;
         }
         const uint64_t c=at/CHUNK, room=c*CHUNK+chunk_size(c)-at, n=size-done<room ? size-done : room;
         if (chunk_fds[c]>=0) memset(backing_base+at,0,n);
-        else fallocate(pool_fd,FALLOC_FL_PUNCH_HOLE|FALLOC_FL_KEEP_SIZE,(off_t)at,(off_t)n);
+        else punch(at,n);
         done+=n;
     }
 }
@@ -516,7 +538,12 @@ static int32_t unmap_locked(uintptr_t start, uint64_t size) {
 #else
     for (size_t i=vma_index(start); i<vma_count && vmas[i].start<end; ++i) {
         uintptr_t a=vmas[i].start>start ? vmas[i].start : start, b=vmas[i].end<end ? vmas[i].end : end;
+#ifdef __APPLE__
+        /* The range stays reserved: host allocations grow bottom-up into free address space. */
+        if (mmap((void *)a,b-a,PROT_NONE,MAP_PRIVATE|MAP_ANONYMOUS|MAP_FIXED,-1,0)==MAP_FAILED) return INVALID;
+#else
         if (munmap((void *)a,b-a)) return INVALID;
+#endif
     }
 #endif
     drop_range(start,end);
@@ -740,6 +767,11 @@ uintptr_t runtime_memory_resolve(const char *name) {
 #ifndef LOW_MIN
 #define LOW_MIN UINT64_C(0x0800000000)
 #endif
+#ifdef __APPLE__
+#define LOW_END BB_MAC_LOW_END
+#else
+#define LOW_END USER_MIN
+#endif
 static uintptr_t low_next=LOW_MIN;
 void *runtime_low_map(size_t size, int prot) {
     size=align_up(size,PAGE);
@@ -757,8 +789,13 @@ void *runtime_low_map(size_t size, int prot) {
     return p;
 #else
     void *p=MAP_FAILED;
-    while (low_next+size<=USER_MIN) {
+    while (low_next+size<=LOW_END) {
+#ifdef __APPLE__
+        /* [LOW_MIN, LOW_END) is reserved for this at startup (mac_compat.c): placed over it. */
+        p=mmap((void *)low_next,size,prot,MAP_PRIVATE|MAP_ANONYMOUS|MAP_FIXED,-1,0);
+#else
         p=mmap((void *)low_next,size,prot,MAP_PRIVATE|MAP_ANONYMOUS|MAP_FIXED_NOREPLACE,-1,0);
+#endif
         low_next+=size+PAGE; /* unmapped gap catches overruns */
         if (p!=MAP_FAILED) break;
     }
@@ -1047,6 +1084,10 @@ int runtime_memory_restore_access(void *context, uintptr_t address, int repeated
     const ULONG_PTR kind=((EXCEPTION_POINTERS *)context)->ExceptionRecord->ExceptionInformation[0];
     if (kind==8) return 0; /* execution: never a tracking fault */
     is_write=kind==1;
+#elif defined(__APPLE__)
+    const uint32_t error=BB_UC_ERR((ucontext_t *)context);
+    if (error & 0x10) return 0; /* instruction fetch */
+    is_write=(error & 2)!=0;
 #else
     const greg_t error=((ucontext_t *)context)->uc_mcontext.gregs[REG_ERR];
     if (error & 0x10) return 0; /* instruction fetch */
