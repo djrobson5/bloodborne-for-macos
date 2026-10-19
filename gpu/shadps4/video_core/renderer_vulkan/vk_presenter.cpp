@@ -13,6 +13,7 @@
 #include "video_core/renderdoc.h"
 #include "video_core/renderer_vulkan/vk_platform.h"
 #include "bbport_overlay.h"
+#include "bbport_settings.h"
 #include "bbport_timeline.h"
 #include "video_core/renderer_vulkan/vk_temporal_upscaler.h"
 #include "video_core/renderer_vulkan/vk_presenter.h"
@@ -154,6 +155,12 @@ Presenter::Presenter(Frontend::WindowSDL& window_, AmdGpu::Liverpool* liverpool_
     fsr_pass.Create(device, instance.GetAllocator(), num_images);
     pp_pass.Create(device, swapchain.GetSurfaceFormat().format);
     BbOverlay::Init(instance, swapchain.GetSurfaceFormat().format, num_images);
+    // bbport: HDR output (hdr in bbport.ini): frames, passes and the menu stay SDR; the encode
+    // pass writes the HDR swapchain format chosen at start.
+    if (const vk::Format hdr_format = swapchain.GetHdrFormat().format;
+        hdr_format != vk::Format::eUndefined) {
+        hdr_pass.Create(device, hdr_format);
+    }
 
 }
 
@@ -172,6 +179,273 @@ Presenter::~Presenter() {
         device.destroyImageView(frame.image_view);
         device.destroyFence(frame.present_done);
     }
+    DestroyHdrTarget(hdr_game);
+    DestroyHdrTarget(hdr_overlay);
+}
+
+void Presenter::CreateHdrTarget(HdrTarget& target, vk::Extent2D extent, const char* name) {
+    const vk::Device device = instance.GetDevice();
+    // The SDR format: the blit's and the menu pipeline's (BbOverlay::Init); sRGB encoded values,
+    // decoded by the encode pass. Format support is checked by Swapchain::FindPresentFormat.
+    const vk::ImageCreateInfo image_info = {
+        .imageType = vk::ImageType::e2D,
+        .format = swapchain.GetSurfaceFormat().format,
+        .extent = {extent.width, extent.height, 1},
+        .mipLevels = 1,
+        .arrayLayers = 1,
+        .samples = vk::SampleCountFlagBits::e1,
+        .tiling = vk::ImageTiling::eOptimal,
+        .usage = vk::ImageUsageFlagBits::eColorAttachment | vk::ImageUsageFlagBits::eTransferDst |
+                 vk::ImageUsageFlagBits::eSampled,
+        .initialLayout = vk::ImageLayout::eUndefined,
+    };
+    const VmaAllocationCreateInfo alloc_info = {
+        .usage = VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE,
+    };
+    VkImage image{};
+    const VkImageCreateInfo unsafe_image_info = static_cast<VkImageCreateInfo>(image_info);
+    const VkResult result = vmaCreateImage(instance.GetAllocator(), &unsafe_image_info,
+                                           &alloc_info, &image, &target.allocation, nullptr);
+    if (result != VK_SUCCESS) [[unlikely]] {
+        LOG_CRITICAL(Render_Vulkan, "Failed allocating the HDR output image with error {}",
+                     vk::to_string(vk::Result{result}));
+        UNREACHABLE();
+    }
+    target.image = vk::Image{image};
+    SetObjectName(device, target.image, "HDR output {}", name);
+    target.view = Check<"create HDR output image view">(device.createImageView({
+        .image = target.image,
+        .viewType = vk::ImageViewType::e2D,
+        .format = image_info.format,
+        .subresourceRange = {vk::ImageAspectFlagBits::eColor, 0, 1, 0, 1},
+    }));
+}
+
+void Presenter::DestroyHdrTarget(const HdrTarget& target) {
+    if (target.view) {
+        instance.GetDevice().destroyImageView(target.view);
+    }
+    if (target.image) {
+        vmaDestroyImage(instance.GetAllocator(), target.image, target.allocation);
+    }
+}
+
+void Presenter::EnsureHdrTargets(vk::Extent2D extent) {
+    if (hdr_game.image && hdr_extent == extent) {
+        return;
+    }
+    if (hdr_game.image) {
+        // Presents still in flight may read the old size's images: they go once the GPU has
+        // finished this present's submission (later than every earlier one, same queue).
+        present_scheduler.DeferOperation(
+            [this, game = hdr_game, overlay = hdr_overlay] {
+                DestroyHdrTarget(game);
+                DestroyHdrTarget(overlay);
+            });
+    }
+    CreateHdrTarget(hdr_game, extent, "composite");
+    CreateHdrTarget(hdr_overlay, extent, "menu layer");
+    hdr_extent = extent;
+}
+
+void Presenter::PresentHdr(vk::CommandBuffer cmdbuf, Frame* frame, vk::Extent2D extent) {
+    EnsureHdrTargets(extent);
+    const vk::Image swapchain_image = swapchain.Image();
+    const bool overlay = BbOverlay::Visible();
+    const vk::ImageSubresourceRange color_range{vk::ImageAspectFlagBits::eColor, 0, 1, 0, 1};
+    const auto barrier = [&](vk::Image image, vk::ImageLayout old_layout,
+                             vk::ImageLayout new_layout, vk::PipelineStageFlags2 src_stage,
+                             vk::AccessFlags2 src_access, vk::PipelineStageFlags2 dst_stage,
+                             vk::AccessFlags2 dst_access) {
+        return vk::ImageMemoryBarrier2{
+            .srcStageMask = src_stage,
+            .srcAccessMask = src_access,
+            .dstStageMask = dst_stage,
+            .dstAccessMask = dst_access,
+            .oldLayout = old_layout,
+            .newLayout = new_layout,
+            .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+            .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+            .image = image,
+            .subresourceRange = color_range,
+        };
+    };
+    const auto barriers = [&](std::span<const vk::ImageMemoryBarrier2> image_barriers) {
+        cmdbuf.pipelineBarrier2(vk::DependencyInfo{
+            .imageMemoryBarrierCount = static_cast<u32>(image_barriers.size()),
+            .pImageMemoryBarriers = image_barriers.data(),
+        });
+    };
+    using Stage = vk::PipelineStageFlagBits2;
+    using Access = vk::AccessFlagBits2;
+    using Layout = vk::ImageLayout;
+
+    // The composite and the menu layer are rewritten whole: their old contents (read by the
+    // previous present's encode, same queue: the all-commands source scope orders it) go.
+    // The frame as in the SDR path: General -> transfer source -> General.
+    std::array<vk::ImageMemoryBarrier2, 3> pre{
+        barrier(hdr_game.image, Layout::eUndefined, Layout::eTransferDstOptimal,
+                Stage::eAllCommands, Access::eNone, Stage::eTransfer, Access::eTransferWrite),
+        barrier(frame->image, Layout::eGeneral, Layout::eTransferSrcOptimal, Stage::eAllCommands,
+                Access::eColorAttachmentWrite, Stage::eTransfer, Access::eTransferRead),
+        barrier(hdr_overlay.image, Layout::eUndefined, Layout::eTransferDstOptimal,
+                Stage::eAllCommands, Access::eNone, Stage::eTransfer, Access::eTransferWrite),
+    };
+    barriers(std::span{pre.data(), overlay ? 3u : 2u});
+    const vk::ClearColorValue black{std::array<float, 4>{0.0f, 0.0f, 0.0f, 1.0f}};
+    cmdbuf.clearColorImage(hdr_game.image, Layout::eTransferDstOptimal, black, color_range);
+    if (overlay) {
+        const vk::ClearColorValue transparent{std::array<float, 4>{0.0f, 0.0f, 0.0f, 0.0f}};
+        cmdbuf.clearColorImage(hdr_overlay.image, Layout::eTransferDstOptimal, transparent,
+                               color_range);
+    }
+    const vk::MemoryBarrier2 clear_done{
+        .srcStageMask = Stage::eTransfer,
+        .srcAccessMask = Access::eTransferWrite,
+        .dstStageMask = Stage::eTransfer,
+        .dstAccessMask = Access::eTransferWrite,
+    };
+    cmdbuf.pipelineBarrier2(vk::DependencyInfo{
+        .memoryBarrierCount = 1,
+        .pMemoryBarriers = &clear_done,
+    });
+    cmdbuf.blitImage(frame->image, Layout::eTransferSrcOptimal, hdr_game.image,
+                     Layout::eTransferDstOptimal,
+                     MakeImageBlitFit(frame->width, frame->height, extent.width, extent.height),
+                     vk::Filter::eLinear);
+
+    std::array<vk::ImageMemoryBarrier2, 4> post{
+        barrier(hdr_game.image, Layout::eTransferDstOptimal, Layout::eShaderReadOnlyOptimal,
+                Stage::eTransfer, Access::eTransferWrite, Stage::eFragmentShader,
+                Access::eShaderSampledRead),
+        barrier(frame->image, Layout::eTransferSrcOptimal, Layout::eGeneral, Stage::eTransfer,
+                Access::eTransferRead, Stage::eAllCommands, Access::eColorAttachmentWrite),
+        // The acquire semaphore is waited on at all commands: this transition comes after it.
+        barrier(swapchain_image, Layout::eUndefined, Layout::eColorAttachmentOptimal,
+                Stage::eColorAttachmentOutput, Access::eNone, Stage::eColorAttachmentOutput,
+                Access::eColorAttachmentWrite),
+        barrier(hdr_overlay.image, Layout::eTransferDstOptimal, Layout::eColorAttachmentOptimal,
+                Stage::eTransfer, Access::eTransferWrite, Stage::eColorAttachmentOutput,
+                Access::eColorAttachmentRead | Access::eColorAttachmentWrite),
+    };
+    barriers(std::span{post.data(), overlay ? 4u : 3u});
+
+    // bbport: the settings menu / FPS counter, at display resolution, into its own layer: the
+    // encode shows it at paper white over the (possibly expanded) frame.
+    if (overlay) {
+        BbOverlay::Render(cmdbuf, hdr_overlay.view, extent);
+        const std::array menu_done{
+            barrier(hdr_overlay.image, Layout::eColorAttachmentOptimal,
+                    Layout::eShaderReadOnlyOptimal, Stage::eColorAttachmentOutput,
+                    Access::eColorAttachmentWrite, Stage::eFragmentShader,
+                    Access::eShaderSampledRead),
+        };
+        barriers(menu_done);
+    }
+
+    const auto& settings = BbSettings::Get();
+    const bool scrgb =
+        swapchain.GetHdrFormat().colorSpace == vk::ColorSpaceKHR::eExtendedSrgbLinearEXT;
+    // bbport: native mode (hdr_mode, live): the frame's gain map when it has one (made for the
+    // frame this display buffer holds, vk_hdr_native.h), else plain SDR at paper white for this
+    // frame (title, menus, loading, movies: nothing in them is meant to be brighter).
+    const int mode = std::clamp(settings.hdr_mode.load(), 0, BbSettings::HdrModeCount - 1);
+    const bool native = mode == BbSettings::HdrModeNative && frame->hdr_native && frame->hdr_gain;
+    LogHdrState(scrgb, mode, native);
+    // BB_HDR_DEBUG=1: the gain as a heat map over a grey picture (hdr_output.frag).
+    static const bool debug = [] {
+        const char* env = std::getenv("BB_HDR_DEBUG");
+        return env && env[0] == '1';
+    }();
+    // The gain map covers the frame, which the blit above letterboxed into this rectangle.
+    const vk::Rect2D fit = FitImage(s32(frame->width), s32(frame->height), s32(extent.width),
+                                    s32(extent.height));
+    const HostPasses::HdrOutputPass::Settings hdr{
+        .paper_white = std::clamp(settings.hdr_paper_white.load(), BbSettings::HdrPaperWhiteMin,
+                                  BbSettings::HdrPaperWhiteMax),
+        .peak = std::clamp(settings.hdr_peak.load(), BbSettings::HdrPeakMin,
+                           BbSettings::HdrPeakMax),
+        .boost = mode == BbSettings::HdrModeNative && !native
+                     ? 0.0f
+                     : std::clamp(settings.hdr_boost.load(), 0.0f, 1.0f),
+        .flags = (scrgb ? HostPasses::HdrOutputPass::FlagScRgb : 0u) |
+                 (overlay ? HostPasses::HdrOutputPass::FlagOverlay : 0u) |
+                 (native ? HostPasses::HdrOutputPass::FlagNative : 0u) |
+                 (debug ? HostPasses::HdrOutputPass::FlagDebug : 0u) |
+                 (mode == BbSettings::HdrModeNative && !native ? HostPasses::HdrOutputPass::FlagUiFrame : 0u),
+        .gain_offset = {float(fit.offset.x), float(fit.offset.y)},
+        .gain_scale = {1.0f / float(std::max(fit.extent.width, 1u)),
+                       1.0f / float(std::max(fit.extent.height, 1u))},
+        .ui_white = mode == BbSettings::HdrModeNative
+                        ? std::clamp(settings.hdr_ui_brightness.load(), BbSettings::HdrUiBrightnessMin,
+                                     BbSettings::HdrUiBrightnessMax)
+                        : 1.0f,
+        .ui_vivid = mode == BbSettings::HdrModeNative ? std::clamp(settings.hdr_ui_color.load(), 0.0f, 1.0f) : 0.0f,
+    };
+    // bbport: MaxCLL, the brightest the content gets: native mode's highlights reach the peak;
+    // expand mode's SDR white goes to boost's share of it. It changes with the settings, not
+    // per frame: a display re-mapping its tone curve on every fallback would pump.
+    const float expand_white =
+        std::max(1.0f + (hdr.peak / hdr.paper_white - 1.0f) * hdr.boost, 1.0f);
+    const float content_peak = mode == BbSettings::HdrModeNative
+                                   ? hdr.peak
+                                   : std::min(hdr.peak, hdr.paper_white * expand_white);
+    swapchain.SetHdrMetadata(hdr.peak, content_peak, hdr.paper_white);
+    if (native) {
+        // Written on the draw scheduler's queue before this submission's wait (Present).
+        const std::array gain_ready{
+            barrier(vk::Image(frame->hdr_gain->image), Layout::eGeneral, Layout::eGeneral,
+                    Stage::eAllCommands, Access::eMemoryWrite, Stage::eFragmentShader,
+                    Access::eShaderSampledRead),
+        };
+        barriers(gain_ready);
+    }
+    hdr_pass.Render(cmdbuf, hdr_game.view, overlay ? hdr_overlay.view : hdr_game.view,
+                    native ? *frame->hdr_gain->view : hdr_game.view,
+                    native ? Layout::eGeneral : Layout::eShaderReadOnlyOptimal,
+                    swapchain.ImageView(), extent, hdr);
+
+    const std::array to_present{
+        barrier(swapchain_image, Layout::eColorAttachmentOptimal, Layout::ePresentSrcKHR,
+                Stage::eColorAttachmentOutput, Access::eColorAttachmentWrite,
+                Stage::eBottomOfPipe, Access::eNone),
+    };
+    barriers(to_present);
+}
+
+void Presenter::LogHdrState(bool scrgb, int mode, bool native_frame) {
+    if (mode != hdr_logged_mode) {
+        hdr_logged_mode = mode;
+        hdr_native_state = hdr_logged_native = -1;
+        std::printf("HDR output: %s, mode %s (%s)\n",
+                    scrgb ? "scRGB (FP16)" : "HDR10 (PQ, BT.2020)", BbSettings::HdrModeNames[mode],
+                    mode == BbSettings::HdrModeNative
+                        ? "highlights from the game's HDR scene, plain SDR where a frame has none"
+                        : "highlights expanded from the SDR picture");
+    }
+    if (mode != BbSettings::HdrModeNative) {
+        return;
+    }
+    // Menus, loading screens and movies have no scene: frames come and go without a gain map.
+    const int state = native_frame ? 1 : 0;
+    if (state != hdr_native_state) {
+        hdr_native_state = state;
+        ++hdr_native_switches;
+    }
+    const auto now = std::chrono::steady_clock::now();
+    if (hdr_native_state == hdr_logged_native || now < hdr_next_log) {
+        return;
+    }
+    std::printf("HDR native: %s",
+                state ? "gain maps from the game's scene"
+                      : "no gain map (no scene: title, menu, loading, movie), SDR");
+    if (hdr_native_switches > 1) {
+        std::printf(" (%u switches since the last line)", hdr_native_switches);
+    }
+    std::printf("\n");
+    hdr_logged_native = state;
+    hdr_native_switches = 0;
+    hdr_next_log = now + std::chrono::seconds(5);
 }
 
 bool Presenter::IsVideoOutSurface(const AmdGpu::ColorBuffer& color_buffer) const {
@@ -331,6 +605,10 @@ Frame* Presenter::PrepareFrame(const Libraries::VideoOut::BufferAttributeGroup& 
     }
 
     Frame* frame = GetRenderFrame();
+    // bbport: native HDR output: the gain map made at this display buffer's display pass (for
+    // the frame it holds, a frame earlier in the command stream) goes with the frame to the
+    // present thread; the frame's old one, presented (its fence was waited above), goes back.
+    frame->hdr_native = rasterizer->GetHdrNative().TakeGainMap(cpu_address, frame->hdr_gain);
 
     const auto frame_subresources = vk::ImageSubresourceRange{
         .aspectMask = vk::ImageAspectFlagBits::eColor,
@@ -475,6 +753,7 @@ Frame* Presenter::PrepareFrame(const Libraries::VideoOut::BufferAttributeGroup& 
 Frame* Presenter::PrepareBlankFrame(bool present_thread) {
     // Request a free presentation frame.
     Frame* frame = GetRenderFrame();
+    frame->hdr_native = false; // bbport: no game frame, no gain map
 
     auto& scheduler = present_thread ? present_scheduler : draw_scheduler;
     scheduler.EndRendering();
@@ -601,7 +880,19 @@ void Presenter::Present(Frame* frame, bool is_reusing_frame, bool is_game_frame)
         });
     }
 
-    {
+    // bbport: HDR output (hdr in bbport.ini) while the swapchain has the HDR format.
+    const bool hdr_output = swapchain.IsHdrOutput() && hdr_pass.IsCreated();
+    BbSettings::Get().hdr_output.store(
+        !hdr_output ? BbSettings::HdrOutputOff
+        : swapchain.GetHdrFormat().colorSpace == vk::ColorSpaceKHR::eExtendedSrgbLinearEXT
+            ? BbSettings::HdrOutputScRgb
+            : BbSettings::HdrOutputHdr10,
+        std::memory_order_relaxed);
+    if (hdr_output) {
+        const vk::Extent2D extent = swapchain.GetExtent();
+        SetExpectedGameSize(s32(extent.width), s32(extent.height));
+        PresentHdr(cmdbuf, frame, extent);
+    } else {
         const vk::Extent2D extent = swapchain.GetExtent();
         SetExpectedGameSize(s32(extent.width), s32(extent.height));
         const vk::ImageSubresourceRange color_range{
@@ -714,11 +1005,14 @@ void Presenter::Present(Frame* frame, bool is_reusing_frame, bool is_game_frame)
     scheduler.Flush(info);
 
     // Present to swapchain.
+    bool presented;
     {
         std::scoped_lock submit_lock{Scheduler::submit_mutex};
-        if (!swapchain.Present()) {
-            swapchain.Recreate(window.GetWidth(), window.GetHeight());
-        }
+        presented = swapchain.Present();
+    }
+    // bbport: recreated after the lock: its device wait takes it (Swapchain::WaitIdle).
+    if (!presented) {
+        swapchain.Recreate(window.GetWidth(), window.GetHeight());
     }
 
     free_frame();

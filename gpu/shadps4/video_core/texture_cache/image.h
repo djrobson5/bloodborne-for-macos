@@ -162,6 +162,8 @@ public:
     /// bbport: gc tick of the last LRU touch; skips the LRU list (a cache miss) when current.
     mutable u64 lru_touched_tick = ~0ULL;
     u64 tick_accessed_last{};
+    /// bbport (image write-back GC): gc tick before which a failed write-back is not retried.
+    u64 writeback_retry_tick = 0;
     ImageId depth_id{};
     u64 depth_uid{};
     u64 image_uid{};
@@ -190,6 +192,10 @@ public:
     };
     std::deque<BackingImage> backing_images;
     boost::container::static_vector<u64, 16> mip_hashes{};
+    /// bbport: mip_hashes still describe guest memory. Set when RefreshImage has hashed every mip;
+    /// cleared by whatever may write that memory unseen afterwards (an invalidation over its pages,
+    /// untracking, a store of image data into it).
+    bool mip_hashes_current = false;
     u64 lru_id{};
     u64 hash{};
 

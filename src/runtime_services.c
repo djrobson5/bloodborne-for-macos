@@ -87,7 +87,9 @@ static ABI int32_t system_param(int32_t id,int32_t *value) {
     case 5: *value=0; break;                    /* summer time */
     case 7: *value=0; break;                    /* parental level off */
     case 1000: *value=1; break;                 /* enter button = cross */
-    default: fprintf(stderr,"STOP: unsupported system parameter %d\n",id); exit(21);
+    default: /* bbport: the parameter error instead of ending the game (exit 21) */
+        fprintf(stderr,"Runtime: unsupported system parameter %d\n",id);
+        return SYSTEM_PARAMETER;
     }
     return 0;
 }
@@ -262,10 +264,13 @@ static ABI int32_t ime_init(const ImeParam *param, const void *extended) {
     utf16_to_utf8(param->title,128,prompt,sizeof(prompt));
     const char *preset=getenv("BB_IME_TEXT");
     if (preset) { ime_complete(0,preset); return 0; }
-    if (!bbgpu_text_input_begin(initial,prompt[0] ? prompt : "Text")) {
-        const char *name=getenv("BB_USER_NAME");
+    /* An empty field starts with the player name (launcher) or "Hunter", so a controller alone
+     * can accept it: there is no on-screen keyboard (Supermedo/bloodborne_pc 1d34202). */
+    const char *name=getenv("BB_USER_NAME");
+    const char *start=initial[0] ? initial : name && *name ? name : "Hunter";
+    if (!bbgpu_text_input_begin(start,prompt[0] ? prompt : "Text")) {
         ime_complete(0,name ? name : initial[0] ? initial : "Hunter");
-    } else printf("Runtime: ImeDialog opened: type in the game window, Enter to confirm, Esc to cancel\n");
+    } else printf("Runtime: ImeDialog opened: type in the game window; Enter or Cross accepts, Esc or Circle cancels\n");
     return 0;
 }
 static ABI int32_t ime_status(void) {

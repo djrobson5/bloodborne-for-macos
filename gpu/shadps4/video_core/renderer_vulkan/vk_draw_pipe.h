@@ -88,6 +88,11 @@ public:
             wake.fetch_add(1, std::memory_order_seq_cst);
             wake.notify_one();
         }
+        // bbport: the lookahead thread (BB_DRAWREC_WORKERS) sleeps the same way (WaitForCommit).
+        if (ahead_sleeping.load(std::memory_order_seq_cst)) {
+            ahead_wake.fetch_add(1, std::memory_order_seq_cst);
+            ahead_wake.notify_one();
+        }
     }
 
     /// Why stage A drained (statistics): a PM4 opcode, or one of these.
@@ -112,16 +117,21 @@ public:
         const u32 slot = reason < NumReasons ? reason : ReasonRasterizer;
         ++drains_by_reason[slot];
         const u64 start = __rdtsc();
-        for (u32 spins = 0; consumed.load(std::memory_order_acquire) != head; ++spins) {
-            if (spins < 4096) {
-                __builtin_ia32_pause();
-            } else {
-                std::this_thread::yield();
-            }
-        }
+        WaitUntil([this] { return consumed.load(std::memory_order_acquire) == head; },
+                  [this] { return packets; });
         const u64 waited = __rdtsc() - start;
         drain_cycles += waited;
         cycles_by_reason[slot] += waited;
+    }
+
+    /// bbport: whether stage A's waits sleep once they outlast a spin (BB_DRAIN_SLEEP=0: they
+    /// spin and yield to the end, as before), and how long they spin first (BB_DRAIN_SPIN_US).
+    static bool SleepEnabled() {
+        static const bool enabled = [] {
+            const char* env = std::getenv("BB_DRAIN_SLEEP");
+            return !(env && env[0] == '0');
+        }();
+        return enabled;
     }
 
     /// Stage A: the number the next committed packet gets (packets are numbered from 1), and
@@ -141,13 +151,7 @@ public:
         const u32 slot = reason < NumReasons ? reason : ReasonRasterizer;
         ++drains_by_reason[slot];
         const u64 start = __rdtsc();
-        for (u32 spins = 0; !ReachedPacket(number); ++spins) {
-            if (spins < 4096) {
-                __builtin_ia32_pause();
-            } else {
-                std::this_thread::yield();
-            }
-        }
+        WaitUntil([this, number] { return ReachedPacket(number); }, [number] { return number; });
         const u64 waited = __rdtsc() - start;
         drain_cycles += waited;
         cycles_by_reason[slot] += waited;
@@ -168,14 +172,75 @@ public:
     [[nodiscard]] u64 Consumed() const noexcept {
         return consumed.load(std::memory_order_acquire);
     }
+    /// Stage B, inside the handler: the payload of the packet after the one running when stage A
+    /// has committed it already (it runs next), else null.
+    [[nodiscard]] const u8* PeekNext() const noexcept {
+        const u64 next = running_end;
+        if (published.load(std::memory_order_acquire) <= next) {
+            return nullptr;
+        }
+        const auto* header = reinterpret_cast<const Header*>(ring.get() + next % Capacity);
+        return header->size != 0 ? reinterpret_cast<const u8*>(header + 1) : nullptr;
+    }
     /// Stage B: bytes of packets committed and not run yet (the work queued for this thread).
     [[nodiscard]] u64 Backlog() const noexcept {
         return published.load(std::memory_order_acquire) - consumed.load(std::memory_order_relaxed);
     }
 
+    // bbport BB_DRAWREC_WORKERS: the lookahead thread (Rasterizer::LookaheadLoop) reads committed
+    // packets between Consumed() and Published(). Stage A never writes there: it waits for room
+    // below `consumed + Capacity` (WaitForSpace), so a packet at or past `consumed` is intact.
+    /// The end of the committed packets.
+    [[nodiscard]] u64 Published() const noexcept {
+        return published.load(std::memory_order_acquire);
+    }
+    /// Packets stage B has run (the number of the packet at Consumed(), counted from 0).
+    [[nodiscard]] u64 ConsumedPackets() const noexcept {
+        return consumed_packets.load(std::memory_order_acquire);
+    }
+    /// The packet at `position` (Consumed() <= position < Published()): its payload and size,
+    /// and the position after it. A wrap marker gives no payload and the ring's next lap.
+    [[nodiscard]] const u8* PacketAt(u64 position, u32& payload, u64& next) const noexcept {
+        const auto* header = reinterpret_cast<const Header*>(ring.get() + position % Capacity);
+        if (header->size == 0) {
+            next = position + (Capacity - position % Capacity);
+            payload = 0;
+            return nullptr;
+        }
+        next = position + header->size;
+        payload = header->payload;
+        return reinterpret_cast<const u8*>(header + 1);
+    }
+    /// The lookahead thread: returns once a packet is committed past `position`, or on `stop`.
+    /// A short spin, then it sleeps until Commit() wakes it (the announce-then-check order of
+    /// stage B's own sleep: either this thread sees the packet or stage A sees it sleeping).
+    void WaitForCommit(u64 position, std::stop_token& stop) {
+        static const auto spin_time = std::chrono::microseconds(20);
+        const auto spin_until = std::chrono::steady_clock::now() + spin_time;
+        for (u32 spins = 1;; ++spins) {
+            if (published.load(std::memory_order_acquire) > position || stop.stop_requested()) {
+                return;
+            }
+            __builtin_ia32_pause();
+            if (!(spins & 255) && std::chrono::steady_clock::now() >= spin_until) {
+                break;
+            }
+        }
+        const u32 seen = ahead_wake.load(std::memory_order_seq_cst);
+        ahead_sleeping.store(true, std::memory_order_seq_cst);
+        if (published.load(std::memory_order_seq_cst) <= position && !stop.stop_requested()) {
+            std::stop_callback on_stop{stop, [this] {
+                ahead_wake.fetch_add(1, std::memory_order_seq_cst);
+                ahead_wake.notify_all();
+            }};
+            ahead_wake.wait(seen, std::memory_order_seq_cst);
+        }
+        ahead_sleeping.store(false, std::memory_order_relaxed);
+    }
+
     /// Statistics (stage A): packets, drains that had to wait, cycles waited, cycles stage B
-    /// spent running packets.
-    u64 packets = 0, drains = 0, drain_cycles = 0;
+    /// spent running packets, waits that went to sleep.
+    u64 packets = 0, drains = 0, drain_cycles = 0, sleeps = 0;
     std::atomic<u64> busy_cycles{0};
 
 private:
@@ -184,19 +249,76 @@ private:
         u32 payload; ///< bytes written by the producer
     };
     static constexpr u64 Capacity = 16ull << 20;
+    static constexpr u64 NoWaiter = ~u64{0};
 
     static constexpr u32 Align(u32 size) {
         return (size + 63) & ~63u;
     }
 
     void WaitForSpace(u64 at, u64 size) {
-        while (at + size - consumed.load(std::memory_order_acquire) > Capacity) {
+        if (at + size - consumed.load(std::memory_order_acquire) <= Capacity) {
+            return;
+        }
+        WaitUntil(
+            [this, at, size] {
+                return at + size - consumed.load(std::memory_order_acquire) <= Capacity;
+            },
+            [this] { return consumed_packets.load(std::memory_order_relaxed) + 1; });
+    }
+
+    /// Stage A: waits until `done()`. bbport: spins (most waits end within microseconds),
+    /// yields for up to BB_DRAIN_SPIN_US (500), then sleeps until stage B has run packet
+    /// `target()` (it wakes this thread, Run). A long packet (an image created or uploaded with
+    /// memory short, a pipeline compile) kept this thread in SwitchToThread for all of it: ~200
+    /// ms of kernel time in a 330 ms stall, a core taken from the threads doing the work.
+    template <typename Done, typename Target>
+    void WaitUntil(Done&& done, Target&& target) {
+        for (u32 spins = 0; spins < 4096; ++spins) {
+            if (done()) {
+                return;
+            }
             __builtin_ia32_pause();
+        }
+        static const auto spin_time = std::chrono::microseconds([] {
+            const char* env = std::getenv("BB_DRAIN_SPIN_US");
+            return env && env[0] ? std::max(0, std::atoi(env)) : 500;
+        }());
+        const auto sleep_after = std::chrono::steady_clock::now() + spin_time;
+        while (!done()) {
+            if (!SleepEnabled() || std::chrono::steady_clock::now() < sleep_after) {
+                std::this_thread::yield();
+                continue;
+            }
+            // Announced before the check, which stage B's count update and announcement check
+            // mirror (sequentially consistent both): either this check sees the packet run, or
+            // stage B sees the target and wakes this thread.
+            const u64 wait_for = target();
+            const u32 seen = drained.load(std::memory_order_seq_cst);
+            wake_at.store(wait_for, std::memory_order_seq_cst);
+            const bool asleep =
+                consumed_packets.load(std::memory_order_seq_cst) < wait_for && !done();
+            if (asleep) {
+                ++sleeps;
+                drained.wait(seen, std::memory_order_seq_cst);
+            }
+            wake_at.store(NoWaiter, std::memory_order_relaxed);
+            if (!asleep) {
+                std::this_thread::yield(); // the packet ran, the position follows at once
+            }
+        }
+    }
+
+    /// Stage B: stage A sleeps until the packet just run (WaitUntil).
+    void WakeStageA() {
+        if (wake_at.exchange(NoWaiter, std::memory_order_seq_cst) != NoWaiter) {
+            drained.fetch_add(1, std::memory_order_seq_cst);
+            drained.notify_all();
         }
     }
 
     void Run(std::stop_token stop) {
         Common::SetCurrentThreadName("bb:DrawRec");
+        BbThreads::MakeCritical();
         on_stage_b = true;
         BbSections::recording_thread = true;
         stage_b_tid.store(BbPlatform::CurrentThreadId(), std::memory_order_release);
@@ -212,7 +334,7 @@ private:
                     if (const char* env = std::getenv("BB_PIPE_SPIN_US")) {
                         return std::max(0, std::atoi(env));
                     }
-                    return BbThreads::Available() >= 12 ? 200 : 50;
+                    return int(BbThreads::CapSpinUs(BbThreads::Available() >= 12 ? 200 : 50));
                 }());
                 const auto spin_until = std::chrono::steady_clock::now() + spin_time;
                 for (u32 spins = 1; available == at; ++spins) {
@@ -239,11 +361,18 @@ private:
                 continue;
             }
             const u64 start = __rdtsc();
+            running_end = at + header->size;
             handler(context, reinterpret_cast<const u8*>(header + 1), header->payload);
             busy_cycles.fetch_add(__rdtsc() - start, std::memory_order_relaxed);
             at += header->size;
-            consumed_packets.fetch_add(1, std::memory_order_release);
+            // bbport: the position first, then the count stage A's sleeping waits look at (it
+            // finds the position past the packet once the count says so), then whether one of
+            // them waits for this packet: a load and a branch per packet.
             consumed.store(at, std::memory_order_release);
+            const u64 run = consumed_packets.fetch_add(1, std::memory_order_seq_cst) + 1;
+            if (run >= wake_at.load(std::memory_order_seq_cst)) [[unlikely]] {
+                WakeStageA();
+            }
         }
     }
 
@@ -256,9 +385,18 @@ private:
     alignas(64) std::atomic<u64> published{0};
     alignas(64) std::atomic<u64> consumed{0};
     std::atomic<u64> consumed_packets{0}; ///< packets stage B has run (NextPacket numbers)
+    u64 running_end = 0; ///< stage B: the end of the packet it runs (PeekNext; its cache line)
     alignas(64) std::atomic<u32> wake{0};
     std::atomic<bool> sleeping{false};
     std::atomic<u32> stage_b_tid{0};
+    /// bbport: the lookahead thread's sleep (WaitForCommit), woken by Commit like stage B.
+    std::atomic<bool> ahead_sleeping{false};
+    std::atomic<u32> ahead_wake{0};
+    /// bbport: the packet a sleeping wait of stage A needs run (NoWaiter: none), read by stage B
+    /// after every packet (its own line: written only when stage A goes to sleep), and the word
+    /// stage A sleeps on (WaitUntil, WakeStageA).
+    alignas(64) std::atomic<u64> wake_at{NoWaiter};
+    alignas(64) std::atomic<u32> drained{0};
     std::jthread thread;
 };
 

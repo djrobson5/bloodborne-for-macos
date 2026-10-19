@@ -120,6 +120,12 @@ public:
         ++packet_epoch;
     }
 
+    /// bbport (BB_FRAME_STATS): ObtainBuffer calls made for the copy shader HLE (set around
+    /// them on the draw recording thread), counted by path: [read, written] x [in place, stream
+    /// copy, VRAM], with their bytes.
+    static inline bool hle_obtain = false;
+    static inline std::array<u64, 6> hle_path_calls{}, hle_path_bytes{};
+
     /// Finds a buffer for the specified region.
     [[nodiscard]] std::pair<const Buffer*, u64> ObtainBuffer(VAddr device_addr, u32 size,
                                                              bool is_written,
@@ -127,6 +133,11 @@ public:
 
     /// Attempts to obtain a buffer without modifying the cache contents.
     [[nodiscard]] std::pair<const Buffer*, u64> ObtainBufferForImage(VAddr device_addr, u32 size);
+
+    /// bbport (BB_DRAWREC_WORKERS, the lookahead thread): asks the cache for what ObtainBuffer
+    /// reads first for this range (the arena table entry, the page tracking words); nothing is
+    /// changed or read through. Returns the cache lines requested.
+    u32 PrefetchBinding(VAddr device_addr, u32 size) const noexcept;
 
     /// bbport BB_GUEST_IN_PLACE: where a command processor write (WRITE_DATA) the GPU performs in
     /// stream order lands: the arena over the game's memory, if the range is bound there in place.
@@ -300,10 +311,18 @@ private:
     /// bbport: idle VRAM blocks (see group_use).
     void NoteUse(VAddr address, u64 size);
     void ProcessIdleBlocks();
+    /// bbport: vram_level from the driver's usage and budget (BB_VRAM_PRESSURE_PERCENT, 85).
+    void UpdateVramLevel(u32 now);
     /// A VRAM slot of a block that left it: reused by the next move to VRAM.
     void ReleaseResidencySlot(vk::DeviceMemory memory, u64 offset);
     /// Unbinds a VRAM block of memory the game unmapped (uploaded again if mapped and used).
     void EvictVramBlock(u64 block);
+    /// bbport: without the PC memory model, while VRAM is tight (vram_level): VRAM copies of the
+    /// game's data unused for 30 s (10 s when full) leave VRAM; their slots take the next blocks
+    /// instead of new VRAM, and they are uploaded again from the game's memory when bound.
+    void EvictIdleCopies(u32 now);
+    /// Residency chunks without blocks for 5 s, the rebinds away from them done: back to the driver.
+    void FreeEmptyChunks(u32 now);
     [[nodiscard]] static u32 VramIdleSeconds();
     /// BB_CHUNK_TEXTURES: texture data read by the GPU straight from the guest memory chunk it is
     /// in (no CPU copy, no VRAM buffer copy), when the range is contiguous there.
@@ -412,6 +431,11 @@ private:
     std::array<std::unique_ptr<Buffer>, 256> chunk_buffers{}; ///< per guest memory chunk (Chunk::index)
 
     u32 arena_memory_type_index{};
+    /// bbport: a memory type the arena takes outside the card's own heaps (discrete GPUs): new
+    /// blocks of the game's data go there while VRAM is tight or full (AllocateResidency).
+    std::optional<u32> system_memory_type_index;
+    u64 system_residency_bytes = 0;
+    u32 system_residency_reports = 0;
     vk::DeviceMemory residency_memory{}; ///< bbport: the 64 MiB block arena residency comes from
     u64 residency_size = 0, residency_used = 0;
     std::future<vk::DeviceMemory> spare_residency; ///< the next block, allocated in the background
@@ -436,6 +460,21 @@ private:
     std::unordered_map<VkDeviceMemory, ResidencyChunk> residency_chunks;
     u32 idle_scan_second = 0;
     u32 last_evacuation = 0; ///< ProcessIdleBlocks: when a chunk was last emptied
+    /// bbport: how full VRAM is against the driver's budget, once a second (UpdateVramLevel):
+    /// 0 room, 1 tight (idle VRAM copies go back sooner), 2 full (no new ones either).
+    std::atomic<int> vram_level{0};
+    u32 vram_full_until = 0; ///< a failed VRAM allocation counts as full until then
+    u32 vram_level_reports = 0;
+    /// bbport: the second a shader last read the game's memory through the page table
+    /// (SynchronizeDmaBuffers). Those reads do not mark blocks as used, so nothing leaves VRAM
+    /// while such shaders run (EvictIdleCopies).
+    std::atomic<u32> dma_second{0};
+    u64 evicted_bytes = 0;
+    /// Blocks EvictIdleCopies took out of VRAM: they come back with their whole 2 MiB group.
+    TrackedIntervalList<> evicted_blocks;
+    u32 evict_reports = 0, dma_kept_reports = 0, dma_kept_second = 0;
+    /// The seconds a VRAM copy may go unused before it goes back in place, at this level.
+    u32 idle_seconds_now = 60;
     u32 block_size{};
     u32 block_shift{};
     u32 blocks_per_arena_page{};

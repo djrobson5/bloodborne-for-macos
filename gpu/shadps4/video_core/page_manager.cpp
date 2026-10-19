@@ -2,6 +2,8 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <boost/container/small_vector.hpp>
+#include "bbport_sections.h"
+#include "bbport_threads.h"
 #include "bbport_toggles.h"
 #include "common/assert.h"
 #include "common/debug.h"
@@ -9,13 +11,19 @@
 #include "common/error.h"
 #include "common/range_lock.h"
 #include "common/signal_context.h"
+#include "common/thread.h"
 #include "core/emulator_settings.h"
 #include "core/memory.h"
 #include "video_core/buffer_cache/buffer.h"
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <chrono>
 #include <cstdio>
+#include <cstdlib>
+#include <mutex>
+#include <thread>
+#include <vector>
 #include "bbport_platform.h"
 #ifndef _WIN32
 #include <dlfcn.h>
@@ -99,6 +107,19 @@ std::string SiteName(u64 key) {
 
 /// The write fault this thread is handling (guest offsets; 0: none).
 thread_local u64 current_fault_rip = 0, current_fault_caller = 0;
+
+/// bbport (BB_FRAME_STATS): what the protection changes this thread makes are for
+/// (BbStats::ProtectKind), set by PageManager's entry points.
+thread_local u32 protect_kind = BbStats::ProtectOther;
+struct ProtectKindScope {
+    explicit ProtectKindScope(u32 kind) : saved{protect_kind} {
+        protect_kind = kind;
+    }
+    ~ProtectKindScope() {
+        protect_kind = saved;
+    }
+    u32 saved;
+};
 
 /// Guest code that wrote image (texture) memory: keyed by instruction and image.
 struct ImageFaultSite {
@@ -234,12 +255,25 @@ void PageManager::ReportFaultSites() {
     std::printf("\n");
 }
 
+/// bbport: a watcher count that would leave its range, reported (a few times) instead of the
+/// assertion that ended the game (exit 23), or the 7-bit count wrapping to 0 with the page still
+/// protected.
+static void NoteWatcherCount(u64 page, const char* what) {
+    static std::atomic<u32> notes{0};
+    if (notes.fetch_add(1, std::memory_order_relaxed) < 8) {
+        std::printf("GPU: page tracking: %s at page %#llx; tracking goes on\n", what,
+                    static_cast<unsigned long long>(page << 12));
+    }
+}
+
 struct PageManager::Impl {
     struct PageState {
         u8 num_write_watchers : 7;
         // At the moment only buffer cache can request read watchers.
         // And buffers cannot overlap, thus only 1 can exist per page.
         u8 num_read_watchers : 1;
+
+        static constexpr u8 MaxWriteWatchers = 127;
 
         Core::MemoryPermission WritePerm() const noexcept {
             return num_write_watchers == 0 ? Core::MemoryPermission::Write
@@ -255,22 +289,46 @@ struct PageManager::Impl {
             return ReadPerm() | WritePerm();
         }
 
+        /// bbport: `page` (its number) for the counts past the bit fields (SpillWatcher). Called
+        /// with the page's lock held.
         template <s32 delta, bool is_read>
-        u8 AddDelta() {
+        u8 AddDelta(u64 page) {
             if constexpr (is_read) {
                 if constexpr (delta == 1) {
+                    if (num_read_watchers == 1) [[unlikely]] {
+                        NoteWatcherCount(page, "a second read watcher");
+                        return num_read_watchers;
+                    }
                     return ++num_read_watchers;
                 } else if (delta == -1) {
-                    ASSERT_MSG(num_read_watchers > 0, "Not enough watchers");
+                    if (num_read_watchers == 0) [[unlikely]] {
+                        NoteWatcherCount(page, "not enough read watchers");
+                        return 0;
+                    }
                     return --num_read_watchers;
                 } else {
                     return num_read_watchers;
                 }
             } else {
                 if constexpr (delta == 1) {
+                    // 128 or more watchers (images piling up on one page): the count stays at
+                    // its maximum, the page protected, and the excess is kept aside.
+                    if (num_write_watchers == MaxWriteWatchers) [[unlikely]] {
+                        if (!SpillWatcher(page, 1)) {
+                            NoteWatcherCount(page, "write watchers beyond the overflow table");
+                        }
+                        return num_write_watchers;
+                    }
                     return ++num_write_watchers;
                 } else if (delta == -1) {
-                    ASSERT_MSG(num_write_watchers > 0, "Not enough watchers");
+                    if (num_write_watchers == MaxWriteWatchers && SpillWatcher(page, -1))
+                        [[unlikely]] {
+                        return num_write_watchers;
+                    }
+                    if (num_write_watchers == 0) [[unlikely]] {
+                        NoteWatcherCount(page, "not enough write watchers");
+                        return 0;
+                    }
                     return --num_write_watchers;
                 } else {
                     return num_write_watchers;
@@ -279,13 +337,50 @@ struct PageManager::Impl {
         }
     };
 
+    /// bbport: write watchers past a page's 7-bit count. +1 keeps one more (false: the table is
+    /// full, the watcher is lost and the page may be unprotected early); -1 takes one back
+    /// (false: none kept for the page). Nests inside the page locks; nothing else takes it.
+    struct SpilledWatchers {
+        u64 page;
+        u32 extra;
+    };
+    inline static std::array<SpilledWatchers, 256> spilled_watchers{};
+    inline static std::atomic_flag spill_lock{};
+
+    static bool SpillWatcher(u64 page, s32 delta) {
+        while (spill_lock.test_and_set(std::memory_order_acquire)) {
+        }
+        bool done = false;
+        SpilledWatchers* free_entry = nullptr;
+        for (auto& entry : spilled_watchers) {
+            if (entry.extra != 0 && entry.page == page) {
+                entry.extra += delta;
+                done = true;
+                break;
+            }
+            if (entry.extra == 0 && !free_entry) {
+                free_entry = &entry;
+            }
+        }
+        if (!done && delta > 0 && free_entry) {
+            *free_entry = {page, 1};
+            done = true;
+        }
+        spill_lock.clear(std::memory_order_release);
+        return done;
+    }
+
     static constexpr size_t ADDRESS_BITS = 40;
     static constexpr size_t NUM_ADDRESS_PAGES = 1ULL << (40 - PM_PAGE_BITS);
     static constexpr size_t NUM_ADDRESS_LOCKS = NUM_ADDRESS_PAGES / PAGES_PER_LOCK;
     inline static Vulkan::Rasterizer* rasterizer;
 
     Impl() = default;
-    virtual ~Impl() = default;
+    virtual ~Impl() {
+        for (auto& d : deferred) {
+            delete d.load(std::memory_order_relaxed);
+        }
+    }
 
     virtual void OnMap(VAddr address, size_t size) {
         // No-op
@@ -296,6 +391,316 @@ struct PageManager::Impl {
     }
 
     virtual void Protect(VAddr address, size_t size, Core::MemoryPermission perms) = 0;
+
+    /// bbport BB_DEFER_PROTECT (see below): per lock region, pages whose write protection is
+    /// deferred, and whether the region is listed for bb:Protect. Guarded by locks[region].
+    struct Deferred {
+        RegionBits pages{};
+        bool listed = false;
+    };
+    struct ProtectRun {
+        VAddr address;
+        u64 size;
+        Core::MemoryPermission perms;
+    };
+    using ProtectRuns = boost::container::small_vector<ProtectRun, 16>;
+
+    /// bbport: Protect, counted by thread and purpose (BB_FRAME_STATS) and timed on the draw
+    /// recording thread (BB_SECTIONS "protect").
+    void ApplyProtect(VAddr address, size_t size, Core::MemoryPermission perms) {
+        BbSections::Scope scope{BbSections::Protect};
+        if (!BbStats::enabled) {
+            Protect(address, size, perms);
+            return;
+        }
+        const auto start = std::chrono::steady_clock::now();
+        Protect(address, size, perms);
+        const u64 ns = static_cast<u64>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                            std::chrono::steady_clock::now() - start)
+                                            .count());
+        if (protect_kind == BbStats::ProtectDeferred) {
+            BbStats::deferred_protect_calls.fetch_add(1, std::memory_order_relaxed);
+            BbStats::deferred_protect_ns.fetch_add(ns, std::memory_order_relaxed);
+        } else if (Vulkan::DrawPipe::OnStageB()) {
+            BbStats::stage_b_protect_calls[protect_kind].fetch_add(1, std::memory_order_relaxed);
+            BbStats::stage_b_protect_ns[protect_kind].fetch_add(ns, std::memory_order_relaxed);
+        } else {
+            BbStats::other_protect_calls.fetch_add(1, std::memory_order_relaxed);
+            BbStats::other_protect_ns.fetch_add(ns, std::memory_order_relaxed);
+        }
+    }
+
+    // bbport BB_DEFER_PROTECT (on by default; =0 off, or experiment bit 4 of BB_TOGGLE_FILE while
+    // the game runs): pages the buffer cache uploaded are watched for writes again
+    // (UpdateProtection after ForEachModifiedRange<CPU, true>) by a count change on the calling
+    // thread, the draw recording thread; the system call that write-protects them is made by
+    // bb:Protect, or by the first upload copy that runs before it did (FlushDeferredProtects).
+    // Until then such a page is still writable: a write to it does not fault, and the copy
+    // queued for the upload, which reads the page only after the protection is in place, takes
+    // it along. Writes after that fault as before.
+    //
+    // Every path that reads guest memory for the GPU, and how it is covered:
+    // - BufferCache::UploadCopies (the VRAM path of ObtainBuffer, SynchronizeMemory): small
+    //   uploads via SmallGuestCopy -> RunGuestCopy (Scheduler::RecordHostCopy on a recording
+    //   thread, BbCopy::QueueCopy batches, or run inline in direct mode), larger ones as
+    //   BbCopy::Async groups, and the synchronous path (toggle DeferredUploads): each flushes
+    //   before it copies.
+    // - ObtainBufferForImage staging (texture sources): RunGuestCopy / BbCopy::Async running it /
+    //   the synchronous path: flushed; its arena path is SynchronizeMemory (above).
+    // - ObtainBuffer's stream path (RunGuestCopy, flushed anyway) and stage A's constant ring
+    //   (CopySparseMemory, not flushed): snapshots taken when they run, which rely on no page
+    //   protection.
+    // - Texture hashes and other direct reads of image memory (RefreshImage, KeyPromptData):
+    //   images watch their pages through the immediate path, which applies the deferred pages of
+    //   its range first (ApplyDeferred).
+    // - CPU stores of the command processor (WriteData, DMA, constant RAM dumps) into a page still
+    //   writable: no fault, but the copy queued for that page has not read it yet (it flushes
+    //   before it reads), so it takes the stored bytes along, as it took a store that faulted.
+    //   WriteData and DMA wait for copies reading their range first (WaitHostCopiesFor).
+    // - Not deferred: BB_GUEST_IN_PLACE (the GPU reads guest memory chunks itself:
+    //   CopyFromGuestChunk), BB_GPU_WRITE_TWINS (copies of kept parts are dropped), precise
+    //   readbacks (read watchers): BufferCache allows deferral only without them.
+    //
+    // A set bit in `deferred` means: the count says watched, the page is still writable. Only
+    // write revocations are deferred, so such a page has a count of at least one. The immediate
+    // paths reconcile the pages of their range under the page locks: when they add watchers they
+    // first apply the deferred pages (a texture then relies on the protection), when they drop a
+    // page's last watcher its deferred bit is dropped too (it is writable already). Physical
+    // changes of a region are made in order: protect_locks[] (taken before locks[]) is held across
+    // the system call by everyone except the deferral itself, which changes no protection, so the
+    // draw recording thread never waits for bb:Protect's system calls.
+
+    /// Whether uploads defer their write protection now (BB_DEFER_PROTECT=1, experiment bit 4).
+    [[nodiscard]] bool Deferring() const {
+        return deferral_allowed && (DeferEnv() || (deferral_possible && BbToggle::Experiment(4)));
+    }
+
+    static bool DeferEnv() {
+        static const bool on = [] {
+            // bbport: off unless BB_DEFER_PROTECT=1. On by default in 0.9.21-0.9.23, it left
+            // distant Cathedral Ward textures half-written for good (a write in the deferral
+            // window went unnoticed; the path is not found yet).
+            const char* env = std::getenv("BB_DEFER_PROTECT");
+            return env && env[0] == '1';
+        }();
+        return on;
+    }
+
+    /// Set by the buffer cache: deferral allowed in this memory model; starts bb:Protect when it
+    /// may be used (BB_DEFER_PROTECT=1, or BB_TOGGLE_FILE for experiment bit 4).
+    void AllowDeferral(bool allowed) {
+        deferral_allowed = allowed;
+        deferral_possible = DeferEnv() || std::getenv("BB_TOGGLE_FILE") != nullptr;
+        if (!allowed || !deferral_possible || protector.joinable()) {
+            return;
+        }
+        deferring_instance = this;
+        protector = std::jthread([this](std::stop_token stop) { ProtectorLoop(stop); });
+        std::printf("Page tracking: write protection after uploads applied by bb:Protect (%s)\n",
+                    DeferEnv() ? "BB_DEFER_PROTECT=1" : "experiment bit 4 of BB_TOGGLE_FILE");
+    }
+
+    void StopProtector() {
+        if (!protector.joinable()) {
+            return;
+        }
+        protector.request_stop();
+        protector_wake.fetch_add(1, std::memory_order_seq_cst);
+        protector_wake.notify_all();
+        protector.join();
+        FlushDeferred(false);
+        deferring_instance = nullptr;
+    }
+
+    void ProtectorLoop(std::stop_token stop) {
+        Common::SetCurrentThreadName("bb:Protect");
+        BbThreads::MakeCritical();
+        // Uploads come in bursts within a frame: spin a while after each flush, then sleep.
+        static const auto spin_time = std::chrono::microseconds([] {
+            if (const char* env = std::getenv("BB_PROTECT_SPIN_US")) {
+                return std::max(0, std::atoi(env));
+            }
+            return int(BbThreads::CapSpinUs(BbThreads::Available() >= 12 ? 100 : 20));
+        }());
+        while (!stop.stop_requested()) {
+            const auto spin_until = std::chrono::steady_clock::now() + spin_time;
+            for (u32 spins = 1; num_listed.load(std::memory_order_acquire) == 0; ++spins) {
+                if (stop.stop_requested()) {
+                    return;
+                }
+                __builtin_ia32_pause();
+                if (!(spins & 255) && std::chrono::steady_clock::now() >= spin_until) {
+                    // Announced before the check, which DeferPageWatchersForRegion's count update
+                    // and announcement check mirror (both sequentially consistent).
+                    const u32 seen = protector_wake.load(std::memory_order_seq_cst);
+                    protector_sleeping.store(true, std::memory_order_seq_cst);
+                    if (num_listed.load(std::memory_order_seq_cst) == 0 &&
+                        !stop.stop_requested()) {
+                        protector_wake.wait(seen, std::memory_order_seq_cst);
+                    }
+                    protector_sleeping.store(false, std::memory_order_relaxed);
+                }
+            }
+            FlushDeferred(false);
+        }
+    }
+
+    Deferred& DeferredFor(size_t region) {
+        Deferred* d = deferred[region].load(std::memory_order_relaxed);
+        if (!d) {
+            d = new Deferred{};
+            deferred[region].store(d, std::memory_order_release);
+        }
+        return *d;
+    }
+
+    /// The deferral itself: counts change now, the pages that become watched are only marked.
+    void DeferPageWatchersForRegion(VAddr base_addr, RegionBits& mask) {
+        RENDERER_TRACE;
+        const size_t base_page = base_addr >> PM_PAGE_BITS;
+        ASSERT(base_page % PAGES_PER_LOCK == 0);
+        const size_t region = base_page / PAGES_PER_LOCK;
+        u64 pages = 0;
+        bool wake = false;
+        {
+            std::scoped_lock lk(locks[region]);
+            Deferred& d = DeferredFor(region);
+            deferral_used.store(true, std::memory_order_relaxed);
+            for (const auto& [start, end] : mask) {
+                for (size_t page = start; page < end; ++page) {
+                    PageState& state = cached_pages[base_page + page];
+                    const auto old_perms = state.Perms();
+                    state.AddDelta<1, false>(base_page + page);
+                    if (state.Perms() != old_perms) {
+                        d.pages.Set(page); // never set before: such a page counts one at least
+                        ++pages;
+                    }
+                }
+            }
+            if (pages != 0 && !d.listed) {
+                d.listed = true;
+                num_listed.fetch_add(1, std::memory_order_seq_cst);
+                std::scoped_lock list{list_mutex};
+                listed.push_back(static_cast<u32>(region));
+                wake = true;
+            }
+        }
+        if (BbStats::enabled && pages != 0) {
+            BbStats::deferred_protect_pages.fetch_add(pages, std::memory_order_relaxed);
+        }
+        if (wake && protector_sleeping.load(std::memory_order_seq_cst)) {
+            protector_wake.fetch_add(1, std::memory_order_seq_cst);
+            protector_wake.notify_one();
+        }
+    }
+
+    /// Applies every deferred page listed so far. Any thread, no page lock held. `by_copy`: a
+    /// copy about to read guest memory found some (bb:Protect was behind). A flush that finds
+    /// nothing listed after waiting for another one: that one applied them.
+    void FlushDeferred(bool by_copy) {
+        if (num_listed.load(std::memory_order_acquire) == 0) {
+            return;
+        }
+        std::scoped_lock flush{flush_mutex};
+        std::vector<u32> regions;
+        {
+            std::scoped_lock list{list_mutex};
+            regions.swap(listed);
+        }
+        if (regions.empty()) {
+            return;
+        }
+        if (by_copy && BbStats::enabled) {
+            BbStats::copy_flushes.fetch_add(1, std::memory_order_relaxed);
+        }
+        const u32 kind = protect_kind;
+        protect_kind = BbStats::ProtectDeferred;
+        for (const u32 region : regions) {
+            // The system calls are made with the counts unlocked (the draw recording thread may
+            // defer more meanwhile; it only adds watchers), in order with every other protection
+            // change of the region (protect_locks).
+            std::scoped_lock plk(protect_locks[region]);
+            ProtectRuns runs;
+            {
+                std::scoped_lock lk(locks[region]);
+                TakeDeferredRuns(region, 0, PAGES_PER_LOCK, runs);
+                deferred[region].load(std::memory_order_relaxed)->listed = false;
+            }
+            for (const auto& run : runs) {
+                ApplyProtect(run.address, run.size, run.perms);
+            }
+        }
+        protect_kind = kind;
+        // Only now: a copy that saw them listed waits for this flush (flush_mutex) or finds none.
+        num_listed.fetch_sub(static_cast<u32>(regions.size()), std::memory_order_release);
+    }
+
+    /// The deferred pages of region `region` within [first, end) (page offsets in the region) as
+    /// runs of equal permissions (as their counts say); cleared. Locks of the region held.
+    void TakeDeferredRuns(size_t region, size_t first, size_t end, ProtectRuns& runs) {
+        Deferred* d = deferred[region].load(std::memory_order_relaxed);
+        if (!d || first >= end || !d->pages.AnyInRange(first, end)) {
+            return;
+        }
+        const size_t base_page = region * PAGES_PER_LOCK;
+        const RegionBits pages(d->pages, first, end);
+        for (const auto& [start, stop] : pages) {
+            size_t run = start;
+            auto perms = cached_pages[base_page + start].Perms();
+            for (size_t page = start + 1; page <= stop; ++page) {
+                if (page == stop || cached_pages[base_page + page].Perms() != perms) {
+                    runs.push_back({(base_page + run) << PM_PAGE_BITS,
+                                    (page - run) << PM_PAGE_BITS, perms});
+                    if (page != stop) {
+                        run = page;
+                        perms = cached_pages[base_page + page].Perms();
+                    }
+                }
+            }
+            d->pages.UnsetRange(start, stop);
+        }
+    }
+
+    /// Immediate path adding watchers (or read watchers) to [page, page_end): the deferred pages
+    /// there are protected first. protect_locks and locks of the range held.
+    void ApplyDeferred(u64 page, u64 page_end) {
+        if (!deferral_used.load(std::memory_order_relaxed)) {
+            return;
+        }
+        ProtectRuns runs;
+        for (u64 region = page / PAGES_PER_LOCK;
+             region < Common::DivCeil(page_end, PAGES_PER_LOCK); ++region) {
+            const u64 base = region * PAGES_PER_LOCK;
+            TakeDeferredRuns(region, std::max(page, base) - base,
+                             std::min<u64>(page_end, base + PAGES_PER_LOCK) - base, runs);
+        }
+        for (const auto& run : runs) {
+            ApplyProtect(run.address, run.size, run.perms);
+        }
+    }
+
+    /// Immediate path: `page` lost its last write watcher; a deferred protection of it is moot
+    /// (it is writable already). Its page lock held.
+    void CancelDeferred(u64 page) {
+        if (!deferral_used.load(std::memory_order_relaxed)) {
+            return;
+        }
+        Deferred* d = deferred[page / PAGES_PER_LOCK].load(std::memory_order_relaxed);
+        const size_t bit = page % PAGES_PER_LOCK;
+        if (d && d->pages.Get(bit)) {
+            d->pages.Unset(bit);
+            if (BbStats::enabled) {
+                BbStats::deferred_cancelled_pages.fetch_add(1, std::memory_order_relaxed);
+            }
+        }
+    }
+
+    /// Switched off while pages are still deferred: applied before the immediate paths go on.
+    void FlushIfSwitchedOff() {
+        if (num_listed.load(std::memory_order_acquire) != 0 && !Deferring()) {
+            FlushDeferred(false);
+        }
+    }
 
     static bool GuestFaultSignalHandler(void* context, void* fault_address) {
         const auto addr = reinterpret_cast<VAddr>(fault_address);
@@ -315,7 +720,9 @@ struct PageManager::Impl {
         } else {
             BbStats::read_faults.fetch_add(1, std::memory_order_relaxed);
             BbStats::Timer timer{BbStats::t_read_faults};
-            return rasterizer->ReadMemory(addr, 8, is_gpu_thread);
+            // bbport: within the faulting page (see Rasterizer::OnWriteFault).
+            return rasterizer->ReadMemory(addr, std::min<u64>(8, GetNextPageAddr(addr) - addr),
+                                          is_gpu_thread);
         }
         return false;
     }
@@ -327,10 +734,16 @@ struct PageManager::Impl {
         size_t page = addr >> PM_PAGE_BITS;
         const u64 page_end = Common::DivCeil(addr + size, PM_PAGE_SIZE);
 
-        // Acquire locks for the range of pages
-        const auto lock_start = locks.begin() + (page / PAGES_PER_LOCK);
-        const auto lock_end = locks.begin() + Common::DivCeil(page_end, PAGES_PER_LOCK);
-        Common::RangeLockGuard lk(lock_start, lock_end);
+        // Acquire locks for the range of pages. bbport: protect_locks first (protection changes
+        // of a region in order with bb:Protect's, BB_DEFER_PROTECT).
+        const size_t first_lock = page / PAGES_PER_LOCK;
+        const size_t last_lock = Common::DivCeil(page_end, PAGES_PER_LOCK);
+        Common::RangeLockGuard plk(protect_locks.begin() + first_lock,
+                                   protect_locks.begin() + last_lock);
+        Common::RangeLockGuard lk(locks.begin() + first_lock, locks.begin() + last_lock);
+        if constexpr (track || is_read) {
+            ApplyDeferred(page, page_end);
+        }
 
         auto perms = cached_pages[page].Perms();
         u64 range_begin = 0;
@@ -341,16 +754,23 @@ struct PageManager::Impl {
             if (range_bytes > 0) {
                 RENDERER_TRACE;
                 // Perform pending (un)protect action
-                Protect(range_begin << PM_PAGE_BITS, range_bytes, perms);
+                ApplyProtect(range_begin << PM_PAGE_BITS, range_bytes, perms);
                 range_bytes = 0;
                 potential_range_bytes = 0;
             }
         };
 
         // Iterate requested pages
+        // bbport (BB_TRACK_MAPPED_CHECK=1 restores it): the check behind this warning asked the
+        // rasterizer's mapped ranges (a shared lock and an interval lookup) on every protection
+        // change; a range that is not mapped is skipped by the protection change anyway.
+        static const bool check_mapped = [] {
+            const char* env = std::getenv("BB_TRACK_MAPPED_CHECK");
+            return env && env[0] == '1';
+        }();
         const u64 aligned_addr = page << PM_PAGE_BITS;
         const u64 aligned_end = page_end << PM_PAGE_BITS;
-        if (!rasterizer->IsMapped(aligned_addr, aligned_end - aligned_addr)) {
+        if (check_mapped && !rasterizer->IsMapped(aligned_addr, aligned_end - aligned_addr)) {
             LOG_WARNING(Render,
                         "Tracking memory region {:#x} - {:#x} which is not fully GPU mapped.",
                         aligned_addr, aligned_end);
@@ -360,7 +780,12 @@ struct PageManager::Impl {
             PageState& state = cached_pages[page];
 
             // Apply the change to the page state
-            const u8 new_count = state.AddDelta<track ? 1 : -1, is_read>();
+            const u8 new_count = state.AddDelta<track ? 1 : -1, is_read>(page);
+            if constexpr (!track && !is_read) {
+                if (new_count == 0) {
+                    CancelDeferred(page);
+                }
+            }
 
             if (auto new_perms = state.Perms(); new_perms != perms) [[unlikely]] {
                 // If the protection changed add pending (un)protect action
@@ -402,7 +827,12 @@ struct PageManager::Impl {
 
         size_t base_page = (base_addr >> PM_PAGE_BITS);
         ASSERT(base_page % PAGES_PER_LOCK == 0);
+        // bbport: protect_locks first, as UpdatePageWatchers.
+        std::scoped_lock plk(protect_locks[base_page / PAGES_PER_LOCK]);
         std::scoped_lock lk(locks[base_page / PAGES_PER_LOCK]);
+        if constexpr (track || is_read) {
+            ApplyDeferred(base_page + start_range.first, base_page + end_range.second);
+        }
         auto perms = cached_pages[base_page + start_range.first].Perms();
         u64 range_begin = 0;
         u64 range_bytes = 0;
@@ -412,7 +842,7 @@ struct PageManager::Impl {
             if (range_bytes > 0) {
                 RENDERER_TRACE;
                 // Perform pending (un)protect action
-                Protect((range_begin << PM_PAGE_BITS), range_bytes, perms);
+                ApplyProtect((range_begin << PM_PAGE_BITS), range_bytes, perms);
                 range_bytes = 0;
                 potential_range_bytes = 0;
             }
@@ -425,7 +855,13 @@ struct PageManager::Impl {
 
             // Apply the change to the page state
             const u8 new_count =
-                update ? state.AddDelta<track ? 1 : -1, is_read>() : state.AddDelta<0, is_read>();
+                update ? state.AddDelta<track ? 1 : -1, is_read>(base_page + page)
+                       : state.AddDelta<0, is_read>(base_page + page);
+            if constexpr (!track && !is_read) {
+                if (update && new_count == 0) {
+                    CancelDeferred(base_page + page);
+                }
+            }
 
             if (auto new_perms = state.Perms(); new_perms != perms) [[unlikely]] {
                 // If the protection changed add pending (un)protect action
@@ -464,6 +900,22 @@ struct PageManager::Impl {
     using LockType = Common::SpinLock;
 #endif
     std::array<LockType, NUM_ADDRESS_LOCKS> locks{};
+
+    // bbport BB_DEFER_PROTECT (see Deferring): deferred pages per lock region (allocated on first
+    // use), the lock serializing a region's protection changes, the regions listed for bb:Protect.
+    std::array<std::atomic<Deferred*>, NUM_ADDRESS_LOCKS> deferred{};
+    std::array<LockType, NUM_ADDRESS_LOCKS> protect_locks{};
+    std::mutex list_mutex;
+    std::vector<u32> listed;              ///< guarded by list_mutex
+    std::mutex flush_mutex;               ///< one flush at a time
+    inline static std::atomic<u32> num_listed{0}; ///< lowered only once the pages are protected
+    inline static Impl* deferring_instance = nullptr;
+    std::atomic<bool> deferral_used{false}; ///< some page was deferred once
+    bool deferral_allowed = false;
+    bool deferral_possible = false;
+    std::atomic<u32> protector_wake{0};
+    std::atomic<bool> protector_sleeping{false};
+    std::jthread protector;
 };
 
 #ifdef __linux__
@@ -635,8 +1087,11 @@ struct SignalImpl : public PageManager::Impl {
         }
         auto* memory = Core::Memory::Instance();
         auto& impl = memory->GetAddressSpace();
-        ASSERT_MSG(perms != Core::MemoryPermission::Write,
-                   "Attempted to protect region as write-only which is not a valid permission");
+        // bbport: write-only (a read watcher on a page without write watchers, BB_READBACKS=2)
+        // cannot be expressed; reads must fault, so writes do too (the assertion ended the game).
+        if (perms == Core::MemoryPermission::Write) {
+            perms = Core::MemoryPermission::None;
+        }
         impl.Protect(address, size, perms);
     }
 
@@ -664,7 +1119,10 @@ PageManager::PageManager(Vulkan::Rasterizer* rasterizer_) {
     impl = std::make_unique<SignalImpl>(rasterizer_);
 }
 
-PageManager::~PageManager() = default;
+PageManager::~PageManager() {
+    // bbport: bb:Protect calls Protect, which is the derived implementation's.
+    impl->StopProtector();
+}
 
 void PageManager::OnGpuMap(VAddr address, size_t size) {
     impl->OnMap(address, size);
@@ -676,12 +1134,36 @@ void PageManager::OnGpuUnmap(VAddr address, size_t size) {
 
 template <bool track>
 void PageManager::UpdatePageWatchers(VAddr addr, u64 size) const {
+    impl->FlushIfSwitchedOff();
+    ProtectKindScope kind{BbStats::ProtectTexture};
     impl->UpdatePageWatchers<track, false>(addr, size);
 }
 
 template <bool track, bool is_read>
 void PageManager::UpdatePageWatchersForRegion(VAddr base_addr, RegionBits& mask) const {
+    impl->FlushIfSwitchedOff();
+    ProtectKindScope kind{track && !is_read ? BbStats::ProtectUpload : BbStats::ProtectOther};
     impl->UpdatePageWatchersForRegion<track, is_read>(base_addr, mask);
+}
+
+bool PageManager::DeferringProtects() const {
+    return impl->Deferring();
+}
+
+void PageManager::DeferPageWatchersForRegion(VAddr base_addr, RegionBits& mask) const {
+    impl->DeferPageWatchersForRegion(base_addr, mask);
+}
+
+void PageManager::FlushDeferredProtects() {
+    if (Impl::num_listed.load(std::memory_order_acquire) != 0) {
+        if (Impl* impl = Impl::deferring_instance) {
+            impl->FlushDeferred(true);
+        }
+    }
+}
+
+void PageManager::AllowDeferredProtects(bool allowed) {
+    impl->AllowDeferral(allowed);
 }
 
 template void PageManager::UpdatePageWatchers<true>(VAddr addr, u64 size) const;

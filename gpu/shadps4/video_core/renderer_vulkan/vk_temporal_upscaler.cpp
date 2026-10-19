@@ -10,10 +10,12 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <filesystem>
 #include <string>
 
 #include <vk_mem_alloc.h>
 
+#include "bbport_sections.h"
 #include "bbport_settings.h"
 #include "bbport_toggles.h"
 #include "ffx_vk_portable.h"
@@ -28,6 +30,7 @@
 #include "video_core/renderer_vulkan/vk_shader_util.h"
 #include "video_core/renderer_vulkan/vk_camera_motion.h"
 #include "video_core/renderer_vulkan/vk_frame_capture.h"
+#include "video_core/renderer_vulkan/vk_hdr_native.h"
 #include "video_core/renderer_vulkan/vk_instance.h"
 #include "video_core/renderer_vulkan/vk_runtime.h"
 #include "video_core/renderer_vulkan/vk_scheduler.h"
@@ -173,15 +176,25 @@ void DumpFinalFrameIfDue(const Instance& instance, Scheduler& scheduler, vk::Com
 
 TemporalUpscaler::TemporalUpscaler(const Instance& instance_, Scheduler& scheduler_,
                                    VideoCore::TextureCache& texture_cache_, Runtime& runtime_,
-                                   CameraMotion& camera_motion_, SceneTargets& scene_targets_)
+                                   CameraMotion& camera_motion_, SceneTargets& scene_targets_,
+                                   HdrNative& hdr_native_)
     : instance{instance_}, scheduler{scheduler_}, texture_cache{texture_cache_},
-      runtime{runtime_}, camera_motion{camera_motion_}, scene_targets{scene_targets_} {
+      runtime{runtime_}, camera_motion{camera_motion_}, scene_targets{scene_targets_},
+      hdr_native{hdr_native_} {
     // Reject unsupported shaders before allocating resources or recording a frame.
     if (instance.IsDlssCapable()) {
         dlss = std::make_unique<DlssUpscaler>(instance, scheduler);
     }
+    // bbport: FSR 4.1.1 runs through fsr4vk (shipped in the package, vk_fsr4vk.cpp), or by the
+    // replay of an fsr4_411 set built from the player's own AMD DLL: with neither, as on a GPU
+    // without its shaders, FSR 4 instead (#22).
+    const char* fsr411_dir = std::getenv("BB_FSR411_DIR");
+    std::error_code fsr411_error;
+    const bool fsr411_assets = std::filesystem::is_directory(
+        fsr411_dir && fsr411_dir[0] ? fsr411_dir : "fsr4_411", fsr411_error);
     BbSettings::ConfigureUpscalerSupport(instance.IsFsr4Int8Supported(),
-                                         instance.IsFsr411Supported(),
+                                         (instance.IsFsr411Supported() && fsr411_assets) ||
+                                             instance.IsFsr4VkSupported(),
                                          dlss && dlss->Available());
     fsr4 = std::make_unique<Fsr4Upscaler>(instance, scheduler);
     // Available unless BB_UPSCALER=none; on/off and the parameters are the menu's settings.
@@ -211,6 +224,11 @@ TemporalUpscaler::TemporalUpscaler(const Instance& instance_, Scheduler& schedul
             render_width = w;
             render_height = h;
         }
+    }
+    // FSR 4's model, built in the background from the start (its first build compiles for
+    // tens of seconds on some drivers), so it is usually ready when the game's first frame is.
+    if (enabled && BbSettings::Get().upscaler == BbSettings::UpscalerFsr4) {
+        fsr4->Prewarm(BbSettings::RenderPreset(), target_width, target_height);
     }
     // Scene depth copied into the output-size UI depth by a blit (depth aspect).
     const auto features = instance.GetPhysicalDevice()
@@ -352,8 +370,8 @@ bool TemporalUpscaler::OnFrameStart() {
     const int output = settings.output_res.load();
     const bool output_changed = !scaled_session && applied_output != output;
     if (output_changed) {
-        target_width = BbSettings::OutputWidths[output];
-        target_height = BbSettings::OutputHeights[output];
+        target_width = BbSettings::OutputWidth(output);
+        target_height = BbSettings::OutputHeight(output);
         std::printf("Output resolution: %ux%u (live)\n", target_width, target_height);
         failed = false;
         fsr4_failed = false;
@@ -367,10 +385,28 @@ bool TemporalUpscaler::OnFrameStart() {
         if (BbSettings::IsFrameUpscaler(upscaler)) BbSettings::Get().fsr4_problem = nullptr;
     }
     if (applied_upscaler != upscaler) fsr4_failed = false; // retry after a menu change
+    if (applied_upscaler != upscaler) fsr4_building = false; // a new provider object
+    if (fsr4_building && !fsr4->Preparing()) {
+        fsr4_building = false;
+        reset = true;
+        std::printf("Upscaler: switching from FSR 3.1 to FSR 4\n");
+    }
     // Dynamic scene resolution scaling (live preset switching) works on all GPUs.
     // On GPUs without D32S8 blit support, UI depth is cleared instead of copied from scene.
     if (!scaled_session) {
-        scene_targets.SetSize(SceneResolution::ForPreset(active ? preset : 0,
+        // bbport: live scene sizes reduce the game's 1920x1080 targets only. A third-party
+        // resolution patch (3440x1440 with a 1080p output) left none to reduce, and a preset
+        // change in the menu crashed the driver (nvoglv64, DLSS): such a scene stays native.
+        const auto game_size = camera_motion.RenderSize();
+        const bool game_1080p =
+            game_size[0] == 0 || (game_size[0] == 1920 && game_size[1] == 1080);
+        static bool told = false;
+        if (!game_1080p && preset != 0 && !told) {
+            told = true;
+            std::printf("Upscaler: the game renders %ux%u (a resolution patch): presets stay native; "
+                        "set Output resolution in the launcher instead\n", game_size[0], game_size[1]);
+        }
+        scene_targets.SetSize(SceneResolution::ForPreset(active && game_1080p ? preset : 0,
                                                         {target_width, target_height}));
         render_width = scene_targets.Size().width;
         render_height = scene_targets.Size().height;
@@ -411,15 +447,23 @@ bool TemporalUpscaler::OnFrameStart() {
 }
 
 void TemporalUpscaler::OnDispatch(u64 cs_hash) {
-    if (cs_hash != trigger_hash || done_this_frame || failed || Scaled()) {
+    if (cs_hash != trigger_hash) {
         return;
     }
-    done_this_frame = true;
-    if (!scene_color || !camera_motion.Ready() || !Active()) {
-        reset = true;
-        return;
+    if (!done_this_frame && !failed && !Scaled()) {
+        done_this_frame = true;
+        if (!scene_color || !camera_motion.Ready() || !Active()) {
+            reset = true;
+        } else {
+            Run();
+        }
     }
-    Run();
+    // bbport: native HDR output: the scene color the post-processing starts from, upscaled by
+    // now at 1080p output; a reduced scene (scaled presets) is resolved into it, as the game's
+    // own compute passes reading it would.
+    if (scene_color && HdrNative::Wanted()) {
+        hdr_native.OnSceneColor(scene_color);
+    }
 }
 
 bool TemporalUpscaler::EnsureResources(u32 w, u32 h, u32 ow, u32 oh, bool hdr) {
@@ -1106,6 +1150,7 @@ bool TemporalUpscaler::RecordReactive(vk::ImageView color_view) {
 }
 
 void TemporalUpscaler::Run() {
+    BB_SECTION(Upscaler);
     if (auto* profiler = GpuProfiler::Get()) {
         const char* label = BbSettings::Get().upscaler == BbSettings::UpscalerTaa
             ? "upscaler Run (TAA)" : "upscaler Run (FSR)";
@@ -1195,6 +1240,7 @@ void TemporalUpscaler::Run() {
     last_frame = now;
 
     bool dispatched = false;
+    BbSections::Scope eval_scope{BbSections::UpscalerEval};
     if (BbSettings::Get().upscaler == BbSettings::UpscalerTaa) {
         RecordTaa(cmdbuf, input_color_view, input_depth_view);
         dispatched = true;
@@ -1274,6 +1320,7 @@ void TemporalUpscaler::Run() {
             dispatched = true;
         }
     }
+    eval_scope.End();
     if (dispatched) {
         reset = false;
         dispatched_last_frame = true;
@@ -1413,7 +1460,16 @@ float TemporalUpscaler::SceneMipBias() const {
     if (!Active() || BbSettings::Get().upscaler == BbSettings::UpscalerTaa) return 0.0f;
     const float render = float(BbSettings::Get().active_render_width.load());
     const float output = float(Scaled() ? target_width : 1920u);
-    return render > 0.0f && render < output ? std::log2(render / output) : 0.0f;
+    const float scale_bias = render > 0.0f && render < output ? std::log2(render / output) : 0.0f;
+    // DLSS (DLAA too) wants one more mip level of texture detail than the render/output ratio
+    // (NVIDIA's DLSS programming guide). From AwesomeObserver/bloodborne_pc b3164c1
+    // (Evgeniy Doronin). BB_DLSS_MIP_BIAS=0: the ratio only, as before.
+    static const bool dlss_extra = [] {
+        const char* env = std::getenv("BB_DLSS_MIP_BIAS");
+        return !env || env[0] != '0';
+    }();
+    const bool dlss_on = BbSettings::Get().upscaler == BbSettings::UpscalerDlss && UseFsr4();
+    return scale_bias - (dlss_extra && dlss_on ? 1.0f : 0.0f);
 }
 
 bool TemporalUpscaler::Scaled() const {
@@ -1436,6 +1492,20 @@ void TemporalUpscaler::OnColorTarget(VideoCore::ImageId color) {
 void TemporalUpscaler::OnDraw(u64 vs_hash, VideoCore::ImageId color,
                               VideoCore::ImageId depth, bool native_viewport) {
     if (!Scaled() && vs_hash == ui_trigger_vs) done_this_frame = true;
+    // bbport: native HDR output: the game's tonemapped frame before the first UI pixel (the
+    // first Scaleform draw of any kind). A stencil-only first pass binds no colour: the last
+    // frame-size RGBA8 target then. (WantsUiStart first: two flags, false unless native HDR saw
+    // this frame's scene and no UI yet.)
+    if (hdr_native.WantsUiStart() && !Scaled() &&
+        (vs_hash == ui_trigger_vs || UiComposition::MovieShader(vs_hash)) &&
+        HdrNative::Wanted()) {
+        hdr_ui_target = LdrFrame(color)        ? color
+                        : LdrFrame(ldr_target) ? ldr_target
+                                               : VideoCore::ImageId{};
+        hdr_native.OnUiStart(hdr_ui_target
+                                 ? hdr_native.Guest(hdr_ui_target, vk::Format::eR8G8B8A8Unorm)
+                                 : HdrNative::Source{});
+    }
     if (!Scaled()) {
         return;
     }
@@ -1469,14 +1539,66 @@ void TemporalUpscaler::OnDraw(u64 vs_hash, VideoCore::ImageId color,
     case UiComposition::Background::Temporal:
         RunScaled();
         if (ui_phase) {
-            return;
+            break;
         }
         // A failed FSR dispatch must not force UI text back to the scene resolution.
         [[fallthrough]];
     case UiComposition::Background::Copy:
         RunUiOnly(color, depth);
-        return;
+        break;
     }
+    // bbport: native HDR output: the output-size frame the UI is about to be drawn into.
+    if (ui_phase && hdr_native.WantsUiStart() && HdrNative::Wanted()) {
+        hdr_native.OnUiStart(HdrUiImage());
+    }
+}
+
+bool TemporalUpscaler::LdrFrame(VideoCore::ImageId id) const {
+    if (!id) {
+        return false;
+    }
+    const auto& image = texture_cache.GetImage(id);
+    return (image.info.pixel_format == vk::Format::eR8G8B8A8Unorm ||
+            image.info.pixel_format == vk::Format::eR8G8B8A8Srgb) &&
+           RenderTarget(image.info.size.width, image.info.size.height) &&
+           !FrameCapture::IsDisplayBuffer(image.info.guest_address);
+}
+
+HdrNative::Source TemporalUpscaler::HdrUiImage() {
+    // The upscaler's own image, in General layout (written by FSR or the background copy, then
+    // the UI draws): the native passes' barriers order their reads against both.
+    return {vk::Image(ui_image),
+            Mirror(vk::Image(ui_image), ui_views, vk::Format::eR8G8B8A8Unorm, {}), ui_width,
+            ui_height};
+}
+
+void TemporalUpscaler::OnDisplayPass(VAddr address, VideoCore::ImageId frame) {
+    // bbport: a frame with no UI draw at all (the HUD hidden in the game's options, #23) reaches
+    // its display pass without the upscale its first UI draw would start: run it here, so the
+    // display pass reads the upscaled frame instead of the render-size one.
+    if (Scaled() && !ui_phase && ldr_target && camera_motion.Ready() && Active() && !failed) {
+        RunScaled();
+        if (ui_phase && hdr_native.WantsUiStart() && HdrNative::Wanted()) {
+            hdr_native.OnUiStart(HdrUiImage());
+        }
+    }
+    HdrNative::Source source{};
+    if (HdrNative::Wanted()) {
+        if (ui_phase) {
+            // The scaled presets: the display pass is redirected to the output-size UI image.
+            source = HdrUiImage();
+        } else if (!Scaled()) {
+            // The game's UI target: the one the UI-free copy came from, else (no UI pass) the
+            // previous draw's target. Another frame-size RGBA8 target there (the display pass
+            // could read either) is a mismatch: no gain map for this frame.
+            const VideoCore::ImageId id = hdr_ui_target ? hdr_ui_target : frame;
+            if (LdrFrame(id) && (!LdrFrame(frame) || frame == id)) {
+                source = hdr_native.Guest(id, vk::Format::eR8G8B8A8Unorm);
+            }
+        }
+    }
+    hdr_native.OnDisplayPass(address, source);
+    hdr_ui_target = {};
 }
 
 void TemporalUpscaler::EnsureUiResources(u32 w, u32 h, vk::Format color, vk::Format depth) {
@@ -1632,15 +1754,28 @@ void TemporalUpscaler::RunUiOnly(VideoCore::ImageId color_id, VideoCore::ImageId
                         vk::PipelineStageFlagBits2::eTransfer, vk::AccessFlagBits2::eTransferRead);
         runtime.FlushBarriers();
     }
+    // bbport: with Widescreen on another screen shape (BB_UI_SIZE), a frame without the 3D world
+    // (title, loading and item screens) is the game's 16:9 stage in the middle; what lies beside it
+    // in the game's target is not drawn and showed as grey bars (#18). Black there instead: only
+    // the stage is copied, over a cleared image. UI the game draws past the stage still shows.
+    s32 x0 = 0, y0 = 0, x1 = s32(ui_width), y1 = s32(ui_height);
+    if (const auto ui = UiComposition::UiSize(); ui[0] != 1920.0f || ui[1] != 1080.0f) {
+        const auto fit = UiComposition::Fit(ui_width, ui_height, ui);
+        x0 = std::clamp(s32(std::lround(fit.offset[0] + fit.scale[0] * (ui[0] - 1920.0f) / 2)), 0, s32(ui_width));
+        y0 = std::clamp(s32(std::lround(fit.offset[1] + fit.scale[1] * (ui[1] - 1080.0f) / 2)), 0, s32(ui_height));
+        x1 = std::clamp(s32(std::lround(x0 + fit.scale[0] * 1920.0f)), x0, s32(ui_width));
+        y1 = std::clamp(s32(std::lround(y0 + fit.scale[1] * 1080.0f)), y0, s32(ui_height));
+    }
+    const bool bars = x0 > 0 || y0 > 0 || x1 < s32(ui_width) || y1 < s32(ui_height);
+    const auto from = [&](s32 v, u32 dst, u32 src) { return s32(std::lround(double(v) * src / dst)); };
     const vk::ImageBlit region{
         .srcSubresource = {vk::ImageAspectFlagBits::eColor, 0, 0, 1},
-        .srcOffsets = std::array{vk::Offset3D{0, 0, 0},
-            vk::Offset3D{s32(source_width), s32(source_height), 1}},
+        .srcOffsets = std::array{vk::Offset3D{from(x0, ui_width, source_width), from(y0, ui_height, source_height), 0},
+            vk::Offset3D{from(x1, ui_width, source_width), from(y1, ui_height, source_height), 1}},
         .dstSubresource = {vk::ImageAspectFlagBits::eColor, 0, 0, 1},
-        .dstOffsets = std::array{vk::Offset3D{0, 0, 0},
-            vk::Offset3D{s32(ui_width), s32(ui_height), 1}},
+        .dstOffsets = std::array{vk::Offset3D{x0, y0, 0}, vk::Offset3D{x1, y1, 1}},
     };
-    scheduler.Record([source, source_layout, ui = vk::Image(ui_image),
+    scheduler.Record([source, source_layout, ui = vk::Image(ui_image), bars,
                       region](vk::CommandBuffer cmd) {
         vk::ImageMemoryBarrier2 barrier{
             .srcStageMask = vk::PipelineStageFlagBits2::eAllCommands,
@@ -1653,6 +1788,18 @@ void TemporalUpscaler::RunUiOnly(VideoCore::ImageId color_id, VideoCore::ImageId
             .subresourceRange = {vk::ImageAspectFlagBits::eColor, 0, 1, 0, 1},
         };
         cmd.pipelineBarrier2({.imageMemoryBarrierCount = 1, .pImageMemoryBarriers = &barrier});
+        if (bars) {
+            const vk::ImageSubresourceRange all{vk::ImageAspectFlagBits::eColor, 0, 1, 0, 1};
+            cmd.clearColorImage(ui, vk::ImageLayout::eTransferDstOptimal,
+                                vk::ClearColorValue{std::array{0.0f, 0.0f, 0.0f, 1.0f}}, all);
+            vk::MemoryBarrier2 cleared{
+                .srcStageMask = vk::PipelineStageFlagBits2::eTransfer,
+                .srcAccessMask = vk::AccessFlagBits2::eTransferWrite,
+                .dstStageMask = vk::PipelineStageFlagBits2::eTransfer,
+                .dstAccessMask = vk::AccessFlagBits2::eTransferWrite,
+            };
+            cmd.pipelineBarrier2({.memoryBarrierCount = 1, .pMemoryBarriers = &cleared});
+        }
         cmd.blitImage(source, source_layout, ui, vk::ImageLayout::eTransferDstOptimal, region,
                       vk::Filter::eLinear);
         barrier.srcStageMask = vk::PipelineStageFlagBits2::eTransfer;
@@ -2210,9 +2357,9 @@ bool TemporalUpscaler::UseFsr4() const {
         return dlss && dlss->Available() && !fsr4_failed;
     }
     const bool supported = selected == BbSettings::UpscalerFsr411
-                               ? instance.IsFsr411Supported()
+                               ? instance.IsFsr411Available() // the replay or fsr4vk
                                : instance.IsFsr4Int8Supported();
-    return BbSettings::IsFsr4(selected) && supported && !fsr4_failed;
+    return BbSettings::IsFsr4(selected) && supported && !fsr4_failed && !fsr4_building;
 }
 
 bool TemporalUpscaler::RecordFsr4(vk::CommandBuffer cmdbuf, Fsr4Upscaler::Image color,
@@ -2257,7 +2404,12 @@ bool TemporalUpscaler::RecordFsr4(vk::CommandBuffer cmdbuf, Fsr4Upscaler::Image 
         BbSettings::Get().fsr4_problem = kept[next].c_str();
         next = (next + 1) % kept.size();
     }
-    if (!ok && (use_dlss ? dlss->Fatal() : fsr4->Fatal())) {
+    if (!ok && !use_dlss && fsr4->Preparing()) {
+        // Its model is being built: FSR 3.1 meanwhile (EnsureResources makes its context next
+        // frame), and FSR 4 again when the build is done (the per-frame settings above).
+        fsr4_building = true;
+        reset = true;
+    } else if (!ok && (use_dlss ? dlss->Fatal() : fsr4->Fatal())) {
         std::printf("Upscaler: falling back to FSR 3.1\n");
         BbSettings::Get().upscaler = BbSettings::UpscalerFsr3;
         fsr4_failed = true; // EnsureResources creates the FSR 3 context next frame

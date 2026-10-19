@@ -64,6 +64,13 @@ int main() {
     s.upscaler = BbSettings::UpscalerDlss;
     BbSettings::ConfigureUpscalerSupport(false, false, true);
     assert(s.upscaler == BbSettings::UpscalerDlss && s.dlss_supported);
+    // FSR 4.1.1 without its dot products, on a GPU with FSR 4: FSR 4, not 3.1.
+    s.upscaler = BbSettings::UpscalerFsr411;
+    BbSettings::ConfigureUpscalerSupport(true, false, false);
+    assert(s.upscaler == BbSettings::UpscalerFsr4);
+    s.upscaler = BbSettings::UpscalerFsr411;
+    BbSettings::ConfigureUpscalerSupport(false, false, false);
+    assert(s.upscaler == BbSettings::UpscalerFsr3);
     s.camera_controls = true;
     s.camera_fov_scale = 1.25f;
     s.camera_distance_scale = 0.80f;
@@ -84,6 +91,122 @@ int main() {
     { std::ofstream file(path); file << "camera_fov_scale=nan\ncamera_distance_scale=-10\ncamera_height_scale=inf\n"; }
     BbSettings::Load();
     assert(s.camera_fov_scale == 1.0f && s.camera_distance_scale == 0.5f && s.camera_height_scale == 1.0f);
+    // Menu languages: the code is read and written back; the added languages translate by the
+    // English text and fall back to it; Russian keeps its own text.
+    { std::ofstream file(path); file << "menu_language=pt_BR\n"; }
+    BbSettings::Load();
+    assert(s.menu_language == BbSettings::MenuLanguage::PortugueseBrazil);
+    assert(std::string(BbSettings::MenuText("Close", "Закрыть")) == "Fechar");
+    assert(std::string(BbSettings::MenuText("Not in the tables", "x")) == "Not in the tables");
+    BbSettings::Save();
+    assert(Read(path).find("menu_language=pt_BR\n") != std::string::npos);
+    s.menu_language = BbSettings::MenuLanguage::Turkish;
+    assert(std::string(BbSettings::MenuText("Close", "Закрыть")) == "Kapat");
+    s.menu_language = BbSettings::MenuLanguage::Russian;
+    assert(std::string(BbSettings::MenuText("Close", "Закрыть")) == "Закрыть");
+    // Cheats: off, infinite or an amount 1-99, written back as read; anything else is off.
+    { std::ofstream file(path); file << "cheat_vials=infinite\ncheat_bullets=50\n"; }
+    BbSettings::Load();
+    assert(s.cheat_vials == BbSettings::CheatInfinite && s.cheat_bullets == 50);
+    BbSettings::Save();
+    assert(Read(path).find("cheat_vials=infinite\n") != std::string::npos);
+    assert(Read(path).find("cheat_bullets=50\n") != std::string::npos);
+    { std::ofstream file(path); file << "cheat_vials=100\ncheat_bullets=lots\n"; }
+    BbSettings::Load();
+    assert(s.cheat_vials == BbSettings::CheatOff && s.cheat_bullets == BbSettings::CheatOff);
+    BbSettings::Save();
+    assert(Read(path).find("cheat_vials=off\n") != std::string::npos);
+    // The other cheats: 0/1 switches, firearm range off/150/200/300, echo multiplier 1/2/5/10;
+    // written back as read, anything else the game's own.
+    assert(Read(path).find("cheat_gun_range=off\n") != std::string::npos);
+    assert(Read(path).find("cheat_echo_multiplier=1\n") != std::string::npos);
+    assert(Read(path).find("cheat_stamina=0\n") != std::string::npos);
+    {
+        std::ofstream file(path);
+        file << "cheat_stamina=1\ncheat_stealth=1\ncheat_gun_range=200\ncheat_keep_echoes=1\n"
+                "cheat_echo_multiplier=5\ncheat_no_durability=1\ncheat_consumables=1\n";
+    }
+    BbSettings::Load();
+    assert(s.cheat_stamina && s.cheat_stealth && s.cheat_keep_echoes && s.cheat_no_durability && s.cheat_consumables);
+    assert(s.cheat_gun_range == 200 && s.cheat_echo_multiplier == 5);
+    BbSettings::Save();
+    for (const char* line : {"cheat_stamina=1\n", "cheat_stealth=1\n", "cheat_gun_range=200\n", "cheat_keep_echoes=1\n",
+                             "cheat_echo_multiplier=5\n", "cheat_no_durability=1\n", "cheat_consumables=1\n"}) {
+        assert(Read(path).find(line) != std::string::npos);
+    }
+    {
+        std::ofstream file(path);
+        file << "cheat_stamina=0\ncheat_stealth=0\ncheat_gun_range=250\ncheat_keep_echoes=0\n"
+                "cheat_echo_multiplier=3\ncheat_no_durability=0\ncheat_consumables=0\n";
+    }
+    BbSettings::Load();
+    assert(!s.cheat_stamina && !s.cheat_stealth && !s.cheat_keep_echoes && !s.cheat_no_durability && !s.cheat_consumables);
+    assert(s.cheat_gun_range == 0 && s.cheat_echo_multiplier == 1);
+    { std::ofstream file(path); file << "cheat_gun_range=300\ncheat_echo_multiplier=10\n"; }
+    BbSettings::Load();
+    assert(s.cheat_gun_range == 300 && s.cheat_echo_multiplier == 10);
+    { std::ofstream file(path); file << "cheat_gun_range=off\ncheat_echo_multiplier=x2\n"; }
+    BbSettings::Load();
+    assert(s.cheat_gun_range == 0 && s.cheat_echo_multiplier == 1);
+    BbSettings::Save();
+    assert(Read(path).find("cheat_gun_range=off\n") != std::string::npos);
+    assert(Read(path).find("cheat_echo_multiplier=1\n") != std::string::npos);
+    // HDR output: hdr 0/1 (applied at start), paper white 10-500 and peak 10-4000 nits, boost
+    // 0-1; written back as read; anything else clamped or the default.
+    assert(Read(path).find("hdr=0\n") != std::string::npos);
+    assert(Read(path).find("hdr_paper_white=200\n") != std::string::npos);
+    assert(Read(path).find("hdr_peak=1000\n") != std::string::npos);
+    assert(Read(path).find("hdr_boost=0.25\n") != std::string::npos);
+    // hdr_mode: native (the default: highlights from the game's HDR scene) or expand (from the
+    // SDR picture); live, so it is not a startup setting.
+    assert(s.hdr_mode == BbSettings::HdrModeNative);
+    assert(Read(path).find("hdr_mode=native\n") != std::string::npos);
+    { std::ofstream file(path); file << "hdr=1\nhdr_paper_white=250\nhdr_peak=20000\nhdr_boost=0.75\n"
+                                        "hdr_mode=expand\n"; }
+    BbSettings::Load();
+    assert(s.hdr && s.startup_hdr && s.hdr_paper_white == 250.0f && s.hdr_peak == 4000.0f &&
+           s.hdr_boost == 0.75f && s.hdr_mode == BbSettings::HdrModeExpand);
+    BbSettings::Save();
+    for (const char* line : {"hdr=1\n", "hdr_paper_white=250\n", "hdr_peak=4000\n", "hdr_boost=0.75\n",
+                             "hdr_mode=expand\n"}) {
+        assert(Read(path).find(line) != std::string::npos);
+    }
+    assert(Read(path).find("hdr_mode=native\n") == std::string::npos);
+    { std::ofstream file(path); file << "hdr=0\nhdr_paper_white=10\nhdr_peak=nan\nhdr_boost=-1\n"
+                                        "hdr_mode=bright\n"; }
+    BbSettings::Load();
+    assert(!s.hdr && !s.startup_hdr && s.hdr_paper_white == 10.0f && s.hdr_peak == 1000.0f &&
+           s.hdr_boost == 0.0f && s.hdr_mode == BbSettings::HdrModeNative);
+    { std::ofstream file(path); file << "hdr_mode=expand\n"; }
+    BbSettings::Load();
+    assert(s.hdr_mode == BbSettings::HdrModeExpand);
+    { std::ofstream file(path); file << "hdr_mode=native\n"; }
+    BbSettings::Load();
+    assert(s.hdr_mode == BbSettings::HdrModeNative);
+    // BB_HDR* override the file.
+#ifdef _WIN32
+    _putenv_s("BB_HDR", "1");
+    _putenv_s("BB_HDR_PEAK", "600");
+    _putenv_s("BB_HDR_MODE", "expand");
+#else
+    setenv("BB_HDR", "1", 1);
+    setenv("BB_HDR_PEAK", "600", 1);
+    setenv("BB_HDR_MODE", "expand", 1);
+#endif
+    BbSettings::Load();
+    assert(s.hdr && s.startup_hdr && s.hdr_peak == 600.0f && s.hdr_paper_white == 10.0f &&
+           s.hdr_mode == BbSettings::HdrModeExpand);
+#ifdef _WIN32
+    _putenv_s("BB_HDR", "");
+    _putenv_s("BB_HDR_PEAK", "");
+    _putenv_s("BB_HDR_MODE", "");
+#else
+    unsetenv("BB_HDR");
+    unsetenv("BB_HDR_PEAK");
+    unsetenv("BB_HDR_MODE");
+#endif
+    BbSettings::Load();
+    assert(s.hdr_mode == BbSettings::HdrModeNative);
     std::filesystem::remove(temporary);
     std::puts("PASS: settings save keeps other keys, menu position");
 }

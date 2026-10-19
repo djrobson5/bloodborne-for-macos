@@ -2,7 +2,10 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include "bbport_toggles.h"
+#include <mutex>
 #include <ranges>
+#include <tuple>
+#include <unordered_map>
 #include "common/assert.h"
 #include "video_core/renderer_vulkan/liverpool_to_vk.h"
 #include "video_core/renderer_vulkan/vk_instance.h"
@@ -18,6 +21,30 @@ namespace VideoCore {
 using namespace Vulkan;
 
 Common::IncrementalIdProvider<u64> Image::global_image_uid{};
+
+/// bbport: the driver's answer for a format, type, usage and flags never changes, and an area load
+/// creates hundreds of images of a few kinds: asked once per kind instead of once per image.
+static vk::ResultValue<vk::ImageFormatProperties2> ImageFormatProperties(
+    const Vulkan::Instance& instance, const vk::PhysicalDeviceImageFormatInfo2& format_info) {
+    using Key = std::tuple<VkFormat, VkImageType, VkImageUsageFlags, VkImageCreateFlags>;
+    struct KeyHash {
+        std::size_t operator()(const Key& k) const {
+            return std::hash<u64>{}((u64(std::get<0>(k)) << 40) ^ (u64(std::get<1>(k)) << 36) ^
+                                    (u64(std::get<2>(k)) << 18) ^ u64(std::get<3>(k)));
+        }
+    };
+    static std::mutex mutex;
+    static std::unordered_map<Key, vk::ResultValue<vk::ImageFormatProperties2>, KeyHash> cache;
+    const Key key{VkFormat(format_info.format), VkImageType(format_info.type),
+                  VkImageUsageFlags(format_info.usage), VkImageCreateFlags(format_info.flags)};
+    std::scoped_lock lock{mutex};
+    if (const auto it = cache.find(key); it != cache.end()) {
+        return it->second;
+    }
+    const auto result = instance.GetPhysicalDevice().getImageFormatProperties2(format_info);
+    cache.emplace(key, result);
+    return result;
+}
 
 static vk::ImageUsageFlags ImageUsageFlags(const Vulkan::Instance& instance,
                                            const ImageInfo& info) {
@@ -112,6 +139,7 @@ void UniqueImage::Create(const vk::ImageCreateInfo& image_ci) {
         return vk::DeviceSize(env ? std::strtoull(env, nullptr, 10) : 4) << 20;
     }();
     VmaAllocationCreateFlags dedicated = 0;
+    BbStats::Timer timer{BbStats::t_image_alloc}; // through vmaCreateImage
     if (device && dedicated_from != 0) {
         const vk::DeviceImageMemoryRequirements query{.pCreateInfo = &image_ci};
         if (device.getImageMemoryRequirements(query).memoryRequirements.size >= dedicated_from) {
@@ -180,8 +208,10 @@ Image::Image(const Vulkan::Instance& instance, Vulkan::Runtime& runtime_,
         .usage = usage_flags,
         .flags = flags,
     };
-    const auto image_format_properties =
-        instance.GetPhysicalDevice().getImageFormatProperties2(format_info);
+    const auto image_format_properties = [&] {
+        BbStats::Timer timer{BbStats::t_image_query};
+        return ImageFormatProperties(instance, format_info);
+    }();
     if (image_format_properties.result == vk::Result::eErrorFormatNotSupported) {
         LOG_ERROR(Render_Vulkan, "image format {} type {} is not supported (flags {}, usage {})",
                   vk::to_string(supported_format), vk::to_string(format_info.type),

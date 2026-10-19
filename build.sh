@@ -35,29 +35,59 @@ if [[ -n $windows ]]; then
     libraries=("${libraries[@]/-mwindows/-mconsole}")
     cstd=(-std=gnu11 -D_FILE_OFFSET_BITS=64 -D_WIN32_WINNT=0x0A00)
 fi
+# BB_JOBS=N: at most N compile and link-time optimization jobs (less memory, e.g. while the
+# game runs).
 # GPU library (shadPS4 video core + drivers), built by CMake into out/gpu/libbbgpu.so.
 # BB_PGO: generate (instrumented build that writes pgo/ while the game runs), use, off.
 # Default: use the profile in pgo/ when there is one. BB_LTO=OFF disables link-time optimization.
+# Clang (Windows CLANG64) writes pgo/default_*.profraw: merged here into pgo/default.profdata,
+# which the "use" build reads (GCC: pgo/*.gcda, read as they are).
+mkdir -p pgo
+if [[ ${BB_PGO:-} != generate && -n $(find pgo -name '*.profraw' -print -quit 2>/dev/null) &&
+      ( ! -f pgo/default.profdata || -n $(find pgo -name '*.profraw' -newer pgo/default.profdata -print -quit) ) ]]; then
+    profdata=$(command -v llvm-profdata || true)
+    if [[ -n $profdata ]]; then
+        "$profdata" merge -o pgo/default.profdata pgo/*.profraw
+        echo "PGO: merged $(find pgo -name '*.profraw' | wc -l) raw profile(s) into pgo/default.profdata"
+    else
+        echo 'PGO: pgo/*.profraw found but no llvm-profdata in PATH; not merged' >&2
+    fi
+fi
 pgo=${BB_PGO:-}
 if [[ -z $pgo ]]; then
-    if [[ -n $(find pgo -name '*.gcda' -print -quit 2>/dev/null) ]]; then pgo=use; else pgo=off; fi
+    if [[ -n $(find pgo \( -name '*.gcda' -o -name 'default.profdata' \) -print -quit 2>/dev/null) ]]; then
+        pgo=use
+    else
+        pgo=off
+    fi
 fi
-mkdir -p pgo
 # Submodules (git clone --recursive, or: git submodule update --init) and this port's changes
 # to FSR-Vulkan (gpu/patches/fsr-vulkan), applied to its working tree once.
 if [[ ! -f gpu/third_party/fsr-vulkan/CMakeLists.txt || ! -f gpu/third_party/imgui/imgui.h ]]; then
     git submodule update --init --recursive
 fi
-for patch in gpu/patches/fsr-vulkan/*.patch; do
-    if ! git -C gpu/third_party/fsr-vulkan apply --reverse --check "$PWD/$patch" 2>/dev/null; then
-        git -C gpu/third_party/fsr-vulkan apply "$PWD/$patch"
-    fi
-done
-cmake -S gpu -B out/gpu -G Ninja -DCMAKE_BUILD_TYPE=RelWithDebInfo -DBB_PGO="$pgo" \
-    -DBB_LTO="${BB_LTO:-ON}" -DBB_PGO_DIR="$PWD/pgo" >/dev/null
-echo "GPU library: PGO $pgo, LTO ${BB_LTO:-ON}"
+# A plain source copy (no submodule checkout) already has them applied.
+if [[ -e gpu/third_party/fsr-vulkan/.git ]]; then
+    for patch in gpu/patches/fsr-vulkan/*.patch; do
+        if ! git -C gpu/third_party/fsr-vulkan apply --reverse --check "$PWD/$patch" 2>/dev/null; then
+            git -C gpu/third_party/fsr-vulkan apply "$PWD/$patch"
+        fi
+    done
+fi
+# Line tables only (not full debug info): crash offsets still resolve to function and
+# file:line with llvm-symbolizer, and compiling and linking take much less time.
+gpu_config=(-G Ninja -DCMAKE_BUILD_TYPE=RelWithDebInfo -DBB_PGO="$pgo" -DBB_LTO="${BB_LTO:-ON}"
+            -DBB_PGO_DIR="$PWD/pgo" -DBB_MARCH="${BB_MARCH:-}"
+            "-DCMAKE_C_FLAGS_RELWITHDEBINFO=-O2 -gline-tables-only -DNDEBUG"
+            "-DCMAKE_CXX_FLAGS_RELWITHDEBINFO=-O2 -gline-tables-only -DNDEBUG")
+# Configured once per set of options (ninja itself reruns CMake when a CMakeLists.txt changes).
+if [[ ! -f out/gpu/build.ninja || $(cat out/gpu/bb-configure.txt 2>/dev/null) != "${gpu_config[*]}" ]]; then
+    cmake -S gpu -B out/gpu "${gpu_config[@]}" >/dev/null
+    printf '%s' "${gpu_config[*]}" > out/gpu/bb-configure.txt
+fi
+echo "GPU library: PGO $pgo, LTO ${BB_LTO:-ON}, march ${BB_MARCH:-default}"
 # A failed GPU build must stop here: an older libbbgpu.so would otherwise be used silently.
-if ! ninja -C out/gpu bbgpu bb-engine-assets > out/gpu-build.log 2>&1; then
+if ! ninja -C out/gpu ${BB_JOBS:+-j "$BB_JOBS"} bbgpu bb-engine-assets > out/gpu-build.log 2>&1; then
     grep -v '^\[' out/gpu-build.log | tail -40 >&2
     echo 'GPU library build failed (full log: out/gpu-build.log)' >&2; exit 1
 fi
@@ -72,7 +102,11 @@ if [[ -n $windows ]]; then
     runtime+=(src/win32_*.c)
     # The static library's link-time optimization (ThinLTO in lld) runs here; on Linux it runs in
     # the .so link.
-    link=(-Wl,--disable-dynamicbase,--disable-high-entropy-va -lwinmm -lws2_32 -lpsapi -flto=thin)
+    # The ThinLTO cache keeps each module's optimized code: a rebuild after a small change
+    # optimizes only the modules it touched (and what inlines from them), on every thread.
+    link=(-Wl,--disable-dynamicbase,--disable-high-entropy-va -lwinmm -lws2_32 -lpsapi -flto=thin
+          -Wl,--thinlto-cache-dir="$PWD/out/thinlto-cache" -Wl,--thinlto-jobs="${BB_JOBS:-all}"
+          -Wl,--thinlto-cache-policy=cache_size_bytes=6g:prune_after=1209600s)
 fi
 # Third-party decoders: compiled once, without this project's -Werror policy.
 atrac9=(third_party/LibAtrac9/C/src/*.c)

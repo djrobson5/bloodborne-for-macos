@@ -19,7 +19,19 @@ namespace BbThreads {
 // Windows (bbport_platform.cpp): the process affinity mask; THREAD_PRIORITY_IDLE.
 unsigned Available();
 void MakeBackground();
+/// The serial render chain (GPU command thread, draw recording, Vulkan recording) runs above
+/// the game's own threads (THREAD_PRIORITY_ABOVE_NORMAL; BB_GPU_THREAD_PRIORITY=0: normal).
+/// `bulk`: threads doing large copies (texture uploads while an area streams in) are raised
+/// only with 16 or more hardware threads; with fewer they took the cores the game's own
+/// threads needed exactly then.
+void MakeCritical(bool bulk = false);
+/// An idle spin of a raised thread before it sleeps, in microseconds: `wanted`, at most 50
+/// with fewer than 16 hardware threads (a raised thread spinning keeps a game thread waiting).
+unsigned CapSpinUs(unsigned wanted);
 #else
+/// Linux: unchanged (normal priority; raising it needs privileges).
+inline void MakeCritical(bool = false) {}
+inline unsigned CapSpinUs(unsigned wanted) { return wanted; }
 /// Hardware threads available to the process.
 inline unsigned Available() {
     cpu_set_t set;

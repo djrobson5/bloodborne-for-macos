@@ -3,6 +3,8 @@
 
 #pragma once
 
+#include <string_view>
+#include <vector>
 #include <fmt/format.h>
 
 #include "common/assert.h"
@@ -27,6 +29,25 @@ vk::UniqueInstance CreateInstance(Frontend::WindowSystemType window_type, bool e
                                   bool enable_crash_diagnostic);
 
 vk::UniqueDebugUtilsMessengerEXT CreateDebugCallback(vk::Instance instance);
+
+/// bbport: whether CreateInstance enabled this instance extension (the last instance created).
+bool IsInstanceExtensionEnabled(std::string_view name);
+
+/// bbport: VK_EXT_full_screen_exclusive on Windows (the swapchain stays a normal window
+/// swapchain: drivers otherwise switch a screen-covering window to exclusive fullscreen, which
+/// turned Windows HDR off); nullptr on the other platforms.
+const char* FullScreenExclusiveExtensionName();
+
+/// bbport: a VkSurfaceFullScreenExclusiveInfoEXT {DISALLOWED} (its pNext null) for the pNext of
+/// the swapchain's creation and of the *2 surface queries; nullptr when `enabled` is false or
+/// on the other platforms.
+const void* FullScreenExclusiveDisallowed(bool enabled);
+
+/// bbport: the surface's present modes; with `full_screen_exclusive`, as reported for the
+/// FullScreenExclusiveDisallowed chain (vkGetPhysicalDeviceSurfacePresentModes2EXT).
+vk::ResultValue<std::vector<vk::PresentModeKHR>> GetSurfacePresentModes(
+    vk::Instance instance, vk::PhysicalDevice physical, vk::SurfaceKHR surface,
+    bool full_screen_exclusive);
 
 template <typename T>
 concept VulkanHandleType = vk::isVulkanHandleType<T>::value;

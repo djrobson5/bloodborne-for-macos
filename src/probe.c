@@ -8,11 +8,13 @@
 #include <cpuid.h>
 #include "runtime.h"
 #include "gpu/bbgpu.h"
+#include "respawn_patch.h"
 #if !defined(__x86_64__) || !defined(__GNUC__)
 #error This prototype requires x86-64 GCC or Clang (including MinGW).
 #endif
 #ifdef _WIN32
 #include <windows.h>
+#include <dbghelp.h>
 #include <timeapi.h>
 #include <process.h>
 #include <psapi.h>
@@ -436,6 +438,145 @@ static int fatal(DWORD code) {
         return 0;
     }
 }
+/* A fault in host code, before any handler of its own runs. On a guest thread the handler
+ * search has to cross guest frames, which have no unwind data: Windows then ends the process
+ * with the fault's code and the unhandled filter never runs, so this note is the only trace.
+ * Every one on guest threads; the first few elsewhere (a driver may fault on purpose). No stdio
+ * locks (the faulting thread may hold them). */
+static void note_host_fault(EXCEPTION_POINTERS *e) {
+    static volatile LONG notes;
+    EXCEPTION_RECORD *r = e->ExceptionRecord;
+    if (r->ExceptionCode == EXCEPTION_BREAKPOINT) return;
+    if (!runtime_thread_has_record() && InterlockedIncrement(&notes) > 4) return;
+    char line[1024], where[512], thread_name[64] = "";
+    describe(where, sizeof(where), (uintptr_t)e->ContextRecord->Rip);
+    PWSTR description = NULL;
+    if (SUCCEEDED(GetThreadDescription(GetCurrentThread(), &description)) && description) {
+        WideCharToMultiByte(CP_UTF8, 0, description, -1, thread_name, sizeof(thread_name), NULL, NULL);
+        LocalFree(description);
+    }
+    int n = snprintf(line, sizeof(line), "Host fault 0x%08lx at %s", r->ExceptionCode, where);
+    if (r->ExceptionCode == EXCEPTION_ACCESS_VIOLATION && r->NumberParameters >= 2)
+        n += snprintf(line + n, sizeof(line) - n, ", %s address %p",
+                      r->ExceptionInformation[0] == 1 ? "writing" : r->ExceptionInformation[0] == 8 ? "executing" : "reading",
+                      (void *)r->ExceptionInformation[1]);
+    n += snprintf(line + n, sizeof(line) - n, " (thread %lu %s; if the game closes now, this is why)\n",
+                  GetCurrentThreadId(), thread_name);
+    HANDLE out = GetStdHandle(STD_ERROR_HANDLE);
+    DWORD written;
+    WriteFile(out, line, (DWORD)strlen(line), &written, NULL);
+    /* The host call chain: this handler, the dispatcher, then the faulting frames. */
+    void *frames[32];
+    USHORT depth = RtlCaptureStackBackTrace(0, 32, frames, NULL);
+    for (USHORT i = 0; i < depth; ++i) {
+        describe(where, sizeof(where), (uintptr_t)frames[i]);
+        snprintf(line, sizeof(line), "  host #%u %s\n", i, where);
+        WriteFile(out, line, (DWORD)strlen(line), &written, NULL);
+    }
+}
+/* The engine's own folder (out\: bb-probe.exe and the CLANG64 DLLs) as a mapped file name. */
+static char own_dir[MAX_PATH];
+static void find_own_dir(void) {
+    if (!GetMappedFileNameA(GetCurrentProcess(), (void *)find_own_dir, own_dir, sizeof(own_dir))) own_dir[0] = 0;
+    char *slash = strrchr(own_dir, '\\');
+    if (slash) slash[1] = 0;
+}
+/* Whether Windows' handler search can get past this host fault. It walks the frames by their
+ * unwind data; at a guest frame (none) it gives up and ends the process with the fault's code,
+ * without the unhandled filter. The same walk here: a frame with a handler of its own on the
+ * way (a driver's or Windows' __try) may still handle it; the engine's own frames only have the
+ * C++ personality routine, which leaves faults alone. A fault during the walk (a broken stack):
+ * not decided, the search goes on. */
+static int host_fault_dead_end(const CONTEXT *fault) {
+    if (!own_dir[0]) return 0;
+    CONTEXT c = *fault;
+    RuntimeRecoverBuf recover;
+    if (RUNTIME_RECOVER_SET(recover)) return 0;
+    runtime_fault_recover = &recover;
+    int dead_end = 0;
+    for (int depth = 0; depth < 64 && c.Rip; ++depth) {
+        if (guest_address((uintptr_t)c.Rip)) { dead_end = 1; break; }
+        DWORD64 base = 0;
+        RUNTIME_FUNCTION *function = RtlLookupFunctionEntry(c.Rip, &base, NULL);
+        if (!function) { c.Rip = *(DWORD64 *)c.Rsp; c.Rsp += 8; continue; } /* leaf */
+        void *handler_data;
+        DWORD64 frame;
+        PEXCEPTION_ROUTINE handler = RtlVirtualUnwind(UNW_FLAG_EHANDLER, base, c.Rip, function, &c, &handler_data, &frame, NULL);
+        char path[MAX_PATH];
+        if (handler && !(GetMappedFileNameA(GetCurrentProcess(), (void *)handler, path, sizeof(path)) &&
+                         !_strnicmp(path, own_dir, strlen(own_dir)))) break;
+    }
+    runtime_fault_recover = NULL;
+    return dead_end;
+}
+/* Crash dump (logs\crash.dmp, beside the session log) and the unhandled filter's upkeep, on a
+ * helper thread. MiniDumpWriteDump cannot walk the thread that calls it reliably: the crashing
+ * thread wakes this one and waits for it, bounded (a lock the dump needs may be held by the
+ * crashed thread). dbghelp is loaded only then. Every second meanwhile the unhandled filter is
+ * set again: overlays (Steam, RTSS, Discord) replace it, and theirs end the process silently. */
+static LONG WINAPI unhandled_filter(EXCEPTION_POINTERS *e);
+static HANDLE crash_dump_request, crash_dump_done;
+static EXCEPTION_POINTERS *volatile crash_dump_exception;
+static volatile DWORD crash_dump_thread_id;
+static volatile LONG crash_dump_written;
+static char crash_dump_dir[MAX_PATH], crash_dump_path[MAX_PATH];
+typedef BOOL (WINAPI *MiniDumpWriteDumpFn)(HANDLE, DWORD, HANDLE, MINIDUMP_TYPE, PMINIDUMP_EXCEPTION_INFORMATION,
+                                          PMINIDUMP_USER_STREAM_INFORMATION, PMINIDUMP_CALLBACK_INFORMATION);
+static unsigned __stdcall crash_helper_thread(void *unused) {
+    (void)unused;
+    for (DWORD waited; (waited = WaitForSingleObject(crash_dump_request, 1000)) != WAIT_OBJECT_0;) {
+        if (waited != WAIT_TIMEOUT) { SetEvent(crash_dump_done); return 0; }
+        LPTOP_LEVEL_EXCEPTION_FILTER previous = SetUnhandledExceptionFilter(unhandled_filter);
+        static int noted;
+        if (previous != unhandled_filter && !noted) {
+            noted = 1;
+            fprintf(stderr, "Crash reports: another module replaced the unhandled exception filter (an overlay?); set again\n");
+        }
+    }
+    if (crash_dump_dir[0]) CreateDirectoryA(crash_dump_dir, NULL);
+    HMODULE dbghelp = LoadLibraryW(L"dbghelp.dll");
+    MiniDumpWriteDumpFn write_dump = dbghelp ? (MiniDumpWriteDumpFn)(void *)GetProcAddress(dbghelp, "MiniDumpWriteDump") : NULL;
+    HANDLE file = write_dump ? CreateFileA(crash_dump_path, GENERIC_WRITE, 0, NULL, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL)
+                             : INVALID_HANDLE_VALUE;
+    if (file != INVALID_HANDLE_VALUE) {
+        MINIDUMP_EXCEPTION_INFORMATION exception = {crash_dump_thread_id, crash_dump_exception, FALSE};
+        const MINIDUMP_TYPE type = (MINIDUMP_TYPE)(MiniDumpNormal | MiniDumpWithThreadInfo | MiniDumpWithIndirectlyReferencedMemory);
+        if (write_dump(GetCurrentProcess(), GetCurrentProcessId(), file, type, &exception, NULL, NULL)) crash_dump_written = 1;
+        CloseHandle(file);
+    }
+    SetEvent(crash_dump_done);
+    return 0;
+}
+static void start_crash_helper(void) {
+    /* The session log's folder (BB_LOG_FILE, set by the launcher), else logs\ here. */
+    const char *log = getenv("BB_LOG_FILE");
+    const char *slash = log ? strrchr(log, '\\') : NULL, *other = log ? strrchr(log, '/') : NULL;
+    if (other > slash) slash = other;
+    if (slash && (size_t)(slash - log) + sizeof("\\crash.dmp") < sizeof(crash_dump_path)) {
+        snprintf(crash_dump_path, sizeof(crash_dump_path), "%.*s\\crash.dmp", (int)(slash - log), log);
+    } else {
+        snprintf(crash_dump_dir, sizeof(crash_dump_dir), "logs");
+        snprintf(crash_dump_path, sizeof(crash_dump_path), "logs\\crash.dmp");
+    }
+    crash_dump_request = CreateEventW(NULL, FALSE, FALSE, NULL);
+    crash_dump_done = CreateEventW(NULL, TRUE, FALSE, NULL);
+    HANDLE thread = crash_dump_request && crash_dump_done ? (HANDLE)_beginthreadex(NULL, 0, crash_helper_thread, NULL, 0, NULL) : NULL;
+    if (thread) CloseHandle(thread);
+    else crash_dump_request = NULL;
+}
+/* Called once (report_exception lets one thread through), before terminate(). */
+static void write_crash_dump(EXCEPTION_POINTERS *e) {
+    if (!crash_dump_request) return;
+    crash_dump_exception = e;
+    crash_dump_thread_id = GetCurrentThreadId();
+    SetEvent(crash_dump_request);
+    const DWORD waited = WaitForSingleObject(crash_dump_done, 30000);
+    char line[MAX_PATH + 64];
+    snprintf(line, sizeof(line), waited == WAIT_OBJECT_0 && crash_dump_written ? "Crash dump: %s\n" : "Crash dump: not written (%s)\n",
+             crash_dump_path);
+    DWORD written;
+    WriteFile(GetStdHandle(STD_ERROR_HANDLE), line, (DWORD)strlen(line), &written, NULL);
+}
 static LONG CALLBACK vectored_handler(EXCEPTION_POINTERS *e) {
     EXCEPTION_RECORD *r = e->ExceptionRecord;
     if (r->ExceptionCode == EXCEPTION_SINGLE_STEP && hw_watch_file && (e->ContextRecord->Dr6 & 1)) {
@@ -458,13 +599,19 @@ static LONG CALLBACK vectored_handler(EXCEPTION_POINTERS *e) {
             return EXCEPTION_CONTINUE_EXECUTION;
         }
     }
-    /* Host code may handle its own exceptions (drivers probe memory under __try). */
-    if (!fatal(r->ExceptionCode) || !guest_address((uintptr_t)e->ContextRecord->Rip)) return EXCEPTION_CONTINUE_SEARCH;
+    if (!fatal(r->ExceptionCode)) return EXCEPTION_CONTINUE_SEARCH;
+    /* Host code may handle its own exceptions (drivers probe memory under __try): only noted. */
+    if (!guest_address((uintptr_t)e->ContextRecord->Rip) && !host_fault_dead_end(e->ContextRecord)) {
+        note_host_fault(e);
+        return EXCEPTION_CONTINUE_SEARCH;
+    }
     report_exception(e);
+    write_crash_dump(e);
     terminate(128 + 11);
 }
 static LONG WINAPI unhandled_filter(EXCEPTION_POINTERS *e) {
     report_exception(e);
+    write_crash_dump(e);
     terminate(128 + 11);
 }
 /* link_modules.py rewrote the guest's `mov rax, fs:[0]` into `mov rax, gs:[0]`. GS is the TEB
@@ -666,7 +813,11 @@ void runtime_restart(void) {
 static int loader_main(int argc, char **argv);
 static int main_argc;
 static char **main_argv;
-static unsigned __stdcall loader_thread(void *unused) { (void)unused; return (unsigned)loader_main(main_argc, main_argv); }
+static unsigned __stdcall loader_thread(void *unused) {
+    (void)unused;
+    runtime_win_set_thread_name("main"); /* the game's main loop (BB_SAMPLE_THREADS=main) */
+    return (unsigned)loader_main(main_argc, main_argv);
+}
 int main(int argc, char **argv) {
     timeBeginPeriod(1); /* 1 ms waits for timed locks and sleeps outside runtime_sleep_ns */
     /* No EcoQoS: Windows 11 otherwise moves the threads of an unfocused window to efficiency
@@ -674,8 +825,10 @@ int main(int argc, char **argv) {
     PROCESS_POWER_THROTTLING_STATE throttling = {PROCESS_POWER_THROTTLING_CURRENT_VERSION,
                                                  PROCESS_POWER_THROTTLING_EXECUTION_SPEED, 0};
     SetProcessInformation(GetCurrentProcess(), ProcessPowerThrottling, &throttling, sizeof(throttling));
+    find_own_dir();
     AddVectoredExceptionHandler(1, vectored_handler);
     SetUnhandledExceptionFilter(unhandled_filter);
+    start_crash_helper();
     start_dump_thread();
     start_hw_watch();
     main_argc = argc; main_argv = argv;
@@ -903,6 +1056,20 @@ int main(int argc, char **argv) {
         memcpy(image + relocs[i].target, &value, 8);
     }
     if (patch_file) apply_patches(patch_file, segments, ns, relocs, nr);
+    /* AwesomeObserver 149972b: no 12-second minimum loading time after death. */
+    if (!cpu_only) {
+        const char *respawn_fix = getenv("BB_RESPAWN_DELAY_FIX");
+        if (respawn_fix && !strcmp(respawn_fix, "0")) {
+            puts("Respawn loading: original minimum delay requested (BB_RESPAWN_DELAY_FIX=0)");
+        } else {
+            int patched = bb_patch_respawn_delay(image, (size_t)size);
+            if (patched == BB_RESPAWN_APPLIED || patched == BB_RESPAWN_ALREADY_APPLIED)
+                printf("Respawn loading: 12-second minimum delay removed%s; readiness checks preserved\n",
+                       patched == BB_RESPAWN_ALREADY_APPLIED ? " (already patched)" : "");
+            else
+                puts("Respawn loading: unsupported or modified instructions; minimum-delay fix skipped");
+        }
+    }
 #ifdef _WIN32
     printf("Guest thread pointer reads: %" PRIu64 " use TEB TLS slot %u\n", patch_tls_reads(segments, ns), runtime_win_tls_slot());
 #endif

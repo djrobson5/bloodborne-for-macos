@@ -8,7 +8,6 @@
 #include <mutex>
 #include <vector>
 
-#include <core/user_settings.h>
 #include "common/elf_info.h"
 #include "common/logging/log.h"
 #include "core/emulator_settings.h"
@@ -16,10 +15,11 @@
 #include "core/libraries/kernel/process.h"
 #include "core/libraries/libs.h"
 #include "core/libraries/np/np_error.h"
+#include "core/libraries/np/np_handler/np_handler.h"
 #include "core/libraries/np/np_manager.h"
 #include "core/tls.h"
 #include "core/user_manager.h"
-#include "np_handler.h"
+#include "core/user_settings.h"
 
 namespace Libraries::Np::NpManager {
 
@@ -256,7 +256,7 @@ s32 PS4_SYSV_ABI sceNpCheckPlus(s32 req_id, const OrbisNpCheckPlusParameter* par
     }
     if (param->features < 1 || param->features > 3) {
         // TODO: If compiled SDK version is greater or equal to fw 3.50,
-        // // error if param->features != 1 instead.
+        // error if param->features != 1 instead.
         return ORBIS_NP_ERROR_INVALID_ARGUMENT;
     }
     // The reserved field must be zero-initialized by the caller.
@@ -275,7 +275,7 @@ s32 PS4_SYSV_ABI sceNpCheckPlus(s32 req_id, const OrbisNpCheckPlusParameter* par
         return CompleteRequest(*req, ORBIS_NP_ERROR_SIGNED_OUT);
     }
     LOG_DEBUG(Lib_NpManager, "req_id = {:#x}, features = {:#x}", req_id, param->features);
-    // Grant PS+ — shadNet has no subscription gating.
+    // Grant PS+  shadNet has no subscription gating.
     result->authorized = true;
     return CompleteRequest(*req, ORBIS_OK);
 }
@@ -1167,6 +1167,12 @@ s32 PS4_SYSV_ABI sceNpIsPlusMember(Libraries::UserService::OrbisUserServiceUserI
     return ORBIS_OK;
 }
 
+s32 PS4_SYSV_ABI sceNpNotifyPlusFeature(void* param) {
+    LOG_DEBUG(Lib_NpManager, "called");
+
+    return ORBIS_OK;
+}
+
 s32 PS4_SYSV_ABI sceNpRegisterPlusEventCallback(OrbisNpPlusEventCallback callback, void* userdata) {
     if (callback == nullptr) {
         return ORBIS_NP_ERROR_INVALID_ARGUMENT;
@@ -1202,8 +1208,6 @@ void DeregisterNpCallback(std::string key) {
     g_np_callbacks.erase(key);
 }
 
-// Registration occurs before guest memory/TLS and game metadata are ready.
-// Connect only after the native runtime has completed those steps.
 void InitializeRuntime() {
     ASSERT_MSG(Libraries::Kernel::sceKernelGetCompiledSdkVersion(&g_firmware_version) == ORBIS_OK,
                "Failed to get compiled SDK version.");
@@ -1218,11 +1222,9 @@ void InitializeRuntime() {
         },
         nullptr);
     Libraries::Np::NpHandler::GetInstance().Initialize();
-
 }
 
 void RegisterLib(Core::Loader::SymbolsResolver* sym) {
-
     LIB_FUNCTION("GpLQDNKICac", "libSceNpManager", 1, "libSceNpManager", sceNpCreateRequest);
     LIB_FUNCTION("eiqMCt9UshI", "libSceNpManager", 1, "libSceNpManager", sceNpCreateAsyncRequest);
     LIB_FUNCTION("2rsFmlGWleQ", "libSceNpManager", 1, "libSceNpManager", sceNpCheckNpAvailability);
@@ -1262,6 +1264,7 @@ void RegisterLib(Core::Loader::SymbolsResolver* sym) {
     LIB_FUNCTION("aJZyCcHxzu4", "libSceNpManager", 1, "libSceNpManager",
                  sceNpUnregisterGamePresenceCallbackA);
     LIB_FUNCTION("Ybu6AxV6S0o", "libSceNpManager", 1, "libSceNpManager", sceNpIsPlusMember);
+    LIB_FUNCTION("Gaxrp3EWY-M", "libSceNpManager", 1, "libSceNpManager", sceNpNotifyPlusFeature);
     LIB_FUNCTION("GImICnh+boA", "libSceNpManager", 1, "libSceNpManager",
                  sceNpRegisterPlusEventCallback);
     LIB_FUNCTION("xViqJdDgKl0", "libSceNpManager", 1, "libSceNpManager",

@@ -37,6 +37,10 @@ void EnsureSrtFaultHandler();
 
 namespace Shader {
 
+void RegisterSrtFaultHandler() {
+    EnsureSrtFaultHandler();
+}
+
 PFN_SrtWalker RegisterWalkerCode(const u8* ptr, size_t size) {
     // bbport: walkers restored from the pipeline cache fault on null SRT pointers like freshly
     // generated ones; without the handler the first such fault ended the process.
@@ -887,6 +891,8 @@ void FlattenExtendedUserdataPass(IR::Program& program) {
 #else
 
 namespace Shader {
+
+void RegisterSrtFaultHandler() {}
 
 PFN_SrtWalker RegisterWalkerCode(const u8* ptr, size_t size) {
     UNREACHABLE_MSG("RegisterWalkerCode unimplemented for target architecture.");

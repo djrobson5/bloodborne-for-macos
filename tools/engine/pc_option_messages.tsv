@@ -7,7 +7,7 @@
 # The port takes the next free blocks - 116000 PC Settings, 117000 PC
 # Graphics, 118000 PC Controls, 119000 Key Bindings, 120000 PC Effects, 121000
 # PC Camera, 122000 the title menu's Quit Game, 123000 Steam Deck (shown on a
-# Deck only), 124000 PC Enhancements - and 110006..110013 for the System rows
+# Deck only), 124000 PC Enhancements, 125000 PC Colour - and 110006..110014 for the System rows
 # that open them. All are unused in the shipped menu.msgbnd. (Motion blur,
 # depth of field and chromatic aberration moved to PC Effects with their
 # 117000 ids.)
@@ -27,12 +27,13 @@
 # id	menu text (group 0xc8)	line help (group 0xc9)
 110006	PC Settings	Options added by the PC port.
 110007	PC Graphics	Graphics options added by the PC port.
-110008	PC Controls	The mouse: camera, sensitivity and the pointer.
+110008	PC Controls	The mouse: camera, sensitivity and the pointer; button prompts and controller icons.
 110009	Key Bindings	Keyboard and mouse bindings.
 110010	PC Effects	Post-processing: blur, bloom, vignette and lens effects.
 110011	PC Camera	The follow camera: field of view, distance and height.
 110012	Steam Deck	Frame rate and model detail for the Steam Deck.
 110013	PC Enhancements	Enable the mirror, rebirth and PC Camera controls. Each needs a restart.
+110014	PC Colour	Brightness, contrast, saturation and hue of the picture.
 116000	Vertical Sync	Wait for the display. Off can tear.
 116001	Fullscreen	Borderless, at the desktop resolution.
 116002	Mouse in Menus	Move and click to select.
@@ -59,7 +60,12 @@
 120020	PC Effects	
 120000	Bloom	The glow around bright light. 10 is the game's own.
 120001	Vignette	The darkened frame edges some areas use.
-120002	Saturation	Colour. 5 is the game's own; 0 is black and white.
+125020	PC Colour	
+125004	Picture Tuning	Applies PC Graphics, PC Effects and PC Colour live. Off: the game's own picture. Moving one of their settings turns it on.
+125000	Brightness	How bright the picture is. 5 is the game's own.
+125001	Contrast	The difference between dark and bright. 5 is the game's own.
+125002	Saturation	Colour. 5 is the game's own; 0 is black and white.
+125003	Hue	Shifts every colour. 5 is the game's own.
 121020	PC Camera	
 121000	Camera Distance	How far behind the character the camera sits. 5 is the game's own.
 121001	Camera Height	How high above the character the camera looks. 5 is the game's own.
@@ -120,9 +126,19 @@
 14000336	Undo Rebirth	
 
 118005	Camera Auto Rotation	Allow the camera to turn automatically while using the mouse.
-117040	2560x1080
-117041	3440x1440
-117042	3840x1600
-117043	3840x1080
-117044	5120x1440
-117045	5120x2160
+118006	Button Prompts	The button icons in menus and prompts. Automatic shows keys while the keyboard or mouse is in use.
+118010	Automatic	
+118011	Keyboard	
+118012	Controller	
+118007	Controller Icons	The controller's buttons in menus and prompts. Automatic shows Xbox buttons while an Xbox controller is in use.
+118013	Automatic	
+118014	PlayStation	
+118015	Xbox	
+117040	2560x1080 (21:9)
+117041	3440x1440 (21:9)
+117042	3840x1600 (24:10)
+117043	3840x1080 (32:9)
+117044	5120x1440 (32:9)
+117045	5120x2160 (21:9)
+117046	7680x2160 (32:9)
+117047	Display (auto)

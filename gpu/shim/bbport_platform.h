@@ -18,6 +18,12 @@
 
 namespace BbPlatform {
 
+/// RAM of the game and of the PC (bytes).
+struct Memory {
+    std::uint64_t private_bytes = 0, working_set = 0, peak_working_set = 0;
+    std::uint64_t free_phys = 0, total_phys = 0, commit_left = 0;
+};
+
 struct Usage {
     std::uint64_t user_us = 0, sys_us = 0, invol_switches = 0, vol_switches = 0, minor_faults = 0;
 };
@@ -26,6 +32,7 @@ struct Usage {
 /// CPU time and scheduling counters of the calling thread (thread = true) or of the process.
 /// Windows has no per-thread context switch or fault counters: those stay 0 for threads.
 bool GetUsage(bool thread, Usage& out);
+bool GetMemory(Memory& out);
 /// OS id of the calling thread.
 std::uint32_t CurrentThreadId();
 /// A CPU clock of the calling thread that other threads can read (-1: unavailable): a
@@ -38,6 +45,10 @@ void DescribeAddress(const void* address, char* out, std::size_t size);
 std::size_t CaptureStack(void** frames, std::size_t count);
 bool ReadProcessMemory(const void* source, void* destination, std::size_t size);
 #else
+inline bool GetMemory(Memory&) {
+    return false;
+}
+
 inline bool GetUsage(bool thread, Usage& out) {
     rusage usage{};
     if (getrusage(thread ? RUSAGE_THREAD : RUSAGE_SELF, &usage) != 0) {

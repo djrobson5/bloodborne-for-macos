@@ -23,6 +23,12 @@ typedef struct {
     struct { uint16_t x,y;uint8_t id; } touch[2];
 } BbPcPad;
 int bbgpu_pc_input(BbPcPad*,const bool* keys,int nkeys,int gamepad_present);
+/* src/runtime_pad.c, for the game's button icons (engine/key_prompts.cpp): the gamepad in use's
+ * SDL_GamepadType (SDL_GAMEPAD_TYPE_UNKNOWN without one), and the gamepad button bound to a PS4
+ * button (its scePad bit; the touchpad's right side with right_side): an SDL_GamepadButton,
+ * SDL_GAMEPAD_BUTTON_COUNT and +1 for the left and right trigger, -1 for none. */
+int runtime_pad_type(void);
+int runtime_pad_button(uint32_t ps_button,int right_side);
 #ifdef __cplusplus
 }
 #endif

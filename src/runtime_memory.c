@@ -18,6 +18,7 @@
 #else
 #include <fcntl.h>
 #include <sys/mman.h>
+#include <ucontext.h>
 #include <unistd.h>
 #endif
 /* sceKernelGetDirectMemorySize on retail PS4: 5056 MiB. BB_DMEM_MB raises it (the resolution
@@ -124,7 +125,8 @@ static GpuRange hook_map, hook_unmap, hook_invalidate;
 static GpuRange hook_note_write; /* bbport: data written into GPU memory (runtime_memory_note_write) */
 enum { HOOK_MAP, HOOK_UNMAP, HOOK_INVALIDATE };
 typedef struct { int kind; uintptr_t address; uint64_t size; } PendingHook;
-static PendingHook pending[64]; static size_t pending_count;
+/* Grows as needed (a batch map or an unmap across many mappings queues one each). */
+static PendingHook *pending; static size_t pending_count, pending_capacity;
 static size_t allocations, maps, flexible_maps, protects, queries;
 static uint64_t live_bytes, flexible_bytes;
 
@@ -270,7 +272,12 @@ static void zero_phys(uint64_t phys, uint64_t size) { punch(phys,size); }
 static void queue_hook(int kind, uintptr_t address, uint64_t size) {
     GpuRange hook = kind==HOOK_MAP ? hook_map : kind==HOOK_UNMAP ? hook_unmap : hook_invalidate;
     if (!hook) return;
-    if (pending_count==sizeof(pending)/sizeof(*pending)) { fputs("STOP: GPU hook queue overflow\n",stderr); exit(21); }
+    if (pending_count==pending_capacity) {
+        size_t capacity=pending_capacity ? pending_capacity*2 : 64;
+        PendingHook *next=realloc(pending,capacity*sizeof(*pending));
+        if (!next) { fputs("STOP: GPU hook queue overflow\n",stderr); exit(21); }
+        pending=next; pending_capacity=capacity;
+    }
     pending[pending_count++]=(PendingHook){kind,address,size};
 }
 /* Runs queued GPU notifications; callers invoke it after dropping the lock. */
@@ -427,6 +434,17 @@ static int direct_range_allocated(uint64_t phys, uint64_t size) {
 }
 
 static ABI uint64_t direct_size(void) { return POOL_SIZE; }
+/* bbport: the game doesn't check a failed allocation (it writes through the null result a moment
+ * later, "writing address 0"), so the log says why. A patch that enlarges the game's heaps
+ * ("Increased Graphics Heap Sizes", the resolution patches above 1080p) needs the larger pool. */
+static void report_pool_full(uint64_t size, uint64_t used) {
+    static unsigned reported;
+    if (__atomic_fetch_add(&reported,1,__ATOMIC_RELAXED)>=3) return;
+    printf("Runtime: direct allocation of %" PRIu64 " MiB failed: the game's memory pool is full (%" PRIu64 " of %" PRIu64
+           " MiB in use); a patch that enlarges the game's heaps needs BB_DMEM_MB=9152\n",
+           size>>20, used>>20, (uint64_t)POOL_SIZE>>20);
+    fflush(stdout);
+}
 static ABI int32_t direct_allocate(int64_t low, int64_t high, uint64_t size,
                                   uint64_t alignment, int type, int64_t *out) {
     if (!alignment) alignment = PAGE;
@@ -440,7 +458,12 @@ static ABI int32_t direct_allocate(int64_t low, int64_t high, uint64_t size,
     int slot = -1;
     for (int i=0; i<LIMIT; ++i) if (!blocks[i].used) { slot=i; break; }
     for (;;) {
-        if (slot<0 || start > end || size > end-start) { write_unlock(); return NO_SPACE; }
+        if (slot<0 || start > end || size > end-start) {
+            const uint64_t used = live_bytes;
+            write_unlock();
+            if ((uint64_t)high >= POOL_SIZE) report_pool_full(size, used);
+            return NO_SPACE;
+        }
         int overlap = 0;
         for (int i=0; i<LIMIT; ++i) {
             Block b = blocks[i];
@@ -503,10 +526,14 @@ static ABI int32_t direct_unmap(void *address, uint64_t size) {
     /* The GPU forgets the range before it disappears (as shadPS4's early GPU unmap). */
     if (hook_unmap && !((uintptr_t)address%PAGE) && size) hook_unmap((uintptr_t)address,align_up(size,PAGE));
     write_lock();
-    size_t before=pending_count;
+    size_t before=pending_count, kept=before;
     int32_t result=unmap_locked((uintptr_t)address,size);
-    pending_count=before; /* already notified above */
+    /* The unmaps were notified above; the invalidations of view pieces remapped around the
+     * range (restore_remnant: their GPU protection is gone) still go out. */
+    for (size_t i=before;i<pending_count;++i) if (pending[i].kind!=HOOK_UNMAP) pending[kept++]=pending[i];
+    pending_count=kept;
     write_unlock();
+    flush_hooks();
     return result;
 }
 static ABI int32_t direct_release(uint64_t start, uint64_t size) {
@@ -1007,6 +1034,80 @@ void runtime_memory_gpu_protect(uintptr_t address, uint64_t size, int read, int 
 #endif
     }
     read_unlock();
+}
+/* bbport: the fault handler's last resort (bbgpu_handle_fault). An access the guest's own
+ * protection allows faulted on a page GPU tracking protected, and the tracking did not resolve
+ * it (repeated: it claimed the fault, yet the same access keeps faulting; else: no record of the
+ * page). An unhandled fault ends the game without a trace, so the page gets the guest's
+ * protection back: the GPU may miss writes there until it protects the page again. No locks
+ * beyond the table's (nested per thread) and no allocation: this runs in the fault handler. */
+int runtime_memory_restore_access(void *context, uintptr_t address, int repeated) {
+    int is_write;
+#ifdef _WIN32
+    const ULONG_PTR kind=((EXCEPTION_POINTERS *)context)->ExceptionRecord->ExceptionInformation[0];
+    if (kind==8) return 0; /* execution: never a tracking fault */
+    is_write=kind==1;
+#else
+    const greg_t error=((ucontext_t *)context)->uc_mcontext.gregs[REG_ERR];
+    if (error & 0x10) return 0; /* instruction fetch */
+    is_write=(error & 2)!=0;
+#endif
+    const uintptr_t page=address&~(uintptr_t)4095;
+    int restored=0, ok=0;
+    read_lock();
+    const size_t i=vma_index(address);
+    if (i<vma_count && vmas[i].start<=address && vmas[i].kind!=KIND_RESERVED) {
+        const int guest=host_prot(vmas[i].prot);
+        if (guest & (is_write ? PROT_WRITE : PROT_READ)) {
+#ifdef _WIN32
+            MEMORY_BASIC_INFORMATION info;
+            if (VirtualQuery((void *)page,&info,sizeof(info)) && info.State==MEM_COMMIT) {
+                const DWORD mode=info.Protect & 0xff;
+                const int allowed = is_write ? (mode==PAGE_READWRITE || mode==PAGE_EXECUTE_READWRITE)
+                                             : (mode!=PAGE_NOACCESS && mode!=PAGE_EXECUTE);
+                /* Already allowed: changed back meanwhile (the tracking, another thread). */
+                restored=!allowed && !win_mem_protect(page,page+4096,guest);
+                ok=allowed || restored;
+            }
+#else
+            restored=ok=!mprotect((void *)page,4096,guest);
+#endif
+        }
+    }
+    read_unlock();
+    if (restored) {
+        static _Atomic unsigned notes;
+        const unsigned n=atomic_fetch_add(&notes,1)+1;
+        if (n<=8 || !(n&(n-1))) { /* the first ones, then at powers of two */
+            char line[256];
+            int length=snprintf(line,sizeof(line),
+                "Runtime: %s fault at %#llx: guest page left protected by GPU tracking (%s); "
+                "access restored (%u so far)\n", is_write ? "write" : "read", (unsigned long long)address,
+                repeated ? "the fault repeats" : "not handled", n);
+            if (length<0) length=0;
+            if (length>=(int)sizeof(line)) length=(int)sizeof(line)-1;
+#ifdef _WIN32
+            DWORD written;
+            WriteFile(GetStdHandle(STD_ERROR_HANDLE),line,(DWORD)length,&written,NULL);
+#else
+            { ssize_t written_=write(2,line,(size_t)length); (void)written_; }
+#endif
+        }
+    }
+    return ok;
+}
+/* bbport: whether the guest may write all of [address, address+size) (its own protection). */
+int runtime_memory_guest_writable(uintptr_t address, uint64_t size) {
+    if (!size) return 0;
+    int ok=1;
+    read_lock();
+    uintptr_t at=address;
+    for (size_t i=vma_index(address); at<address+size; ++i) {
+        if (i==vma_count || vmas[i].start>at || vmas[i].kind==KIND_RESERVED || !(host_prot(vmas[i].prot) & PROT_WRITE)) { ok=0; break; }
+        at=vmas[i].end;
+    }
+    read_unlock();
+    return ok;
 }
 /* Host view of a guest range, for the GPU backend: the range must be mapped. */
 int runtime_memory_is_mapped(uintptr_t address, uint64_t size) {

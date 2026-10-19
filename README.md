@@ -420,10 +420,10 @@ covers file system and time zone details. With libc++ on Windows, `std::thread::
 | `patches/` | Community patches for Bloodborne |
 | `tools/` | Developer tools: scripted runs, A/B toggles, FSR benchmark helpers, FSR 4 shader rewrites, `fsr4cap` (FSR 4.1.1 recording/extraction) |
 | `tests/` | Loader, runtime, patch and renderer tests |
-| `docs/` | Design notes and measurements ([upscaler](docs/upscaler.md), [parallel GPU](docs/parallel_gpu.md), [motion vectors](docs/motion_vectors.md), [roadmap](docs/ROADMAP.md)) |
+| `docs/` | Design notes and measurements ([upscaler](docs/upscaler.md), [HDR output](docs/hdr.md), [parallel GPU](docs/parallel_gpu.md), [motion vectors](docs/motion_vectors.md), [roadmap](docs/ROADMAP.md)) |
 
 Tests: `bash build.sh --test`, `python3 -m unittest discover -s tests`, and
-`ninja -C out/gpu motion-history-test ui-composition-test scene-resolution-test motion-shader-test settings-test`.
+`ninja -C out/gpu motion-history-test ui-composition-test scene-resolution-test motion-shader-test settings-test hdr-native-shader-test`.
 
 ## Roadmap
 

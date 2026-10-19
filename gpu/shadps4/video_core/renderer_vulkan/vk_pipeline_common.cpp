@@ -1,12 +1,18 @@
 // SPDX-FileCopyrightText: Copyright 2024 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <algorithm>
+#include <chrono>
+#include <cstdio>
+#include <cstdlib>
 #include <span>
+#include <string>
 
 #include <boost/container/small_vector.hpp>
 #include <boost/container/static_vector.hpp>
 
 #include "shader_recompiler/resource.h"
+#include "video_core/renderer_vulkan/pipeline_compile_queue.h"
 #include "video_core/renderer_vulkan/vk_instance.h"
 #include "video_core/renderer_vulkan/vk_pipeline_cache.h"
 #include "video_core/renderer_vulkan/vk_pipeline_common.h"
@@ -20,7 +26,98 @@ Pipeline::Pipeline(const Instance& instance_, Scheduler& scheduler_, DescriptorH
     : instance{instance_}, scheduler{scheduler_}, desc_heap{desc_heap_}, profile{profile_},
       is_compute{is_compute_} {}
 
-Pipeline::~Pipeline() = default;
+Pipeline::~Pipeline() {
+    // bbport: a compile thread may still be writing `pipeline` (BB_ASYNC_PIPELINES).
+    WaitReady();
+}
+
+// bbport: time render threads waited for pipelines created on compile threads; reported with
+// the compile time of the GPU thread (BB_FRAME_STATS "shader/pipeline compiles, ... ms").
+extern std::atomic<u64> g_bb_compile_ns;
+
+void Pipeline::WaitReady() const noexcept {
+    if (ready.load(std::memory_order_acquire)) {
+        return;
+    }
+    const auto start = std::chrono::steady_clock::now();
+    // bbport: still queued (the compile threads busy with the pipelines before it): compiled
+    // here, instead of waiting for them first and then for this one.
+    if (auto job = TakePipelineJob(this)) {
+        job();
+        pipeline_compile_stats.taken.fetch_add(1, std::memory_order_relaxed);
+    }
+    while (!ready.load(std::memory_order_acquire)) {
+        ready.wait(false, std::memory_order_acquire);
+    }
+    const u64 waited = u64(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                               std::chrono::steady_clock::now() - start)
+                               .count());
+    g_bb_compile_ns += waited;
+    pipeline_compile_stats.NoteWait(waited);
+}
+
+namespace {
+bool EnvOff(const char* name) {
+    const char* env = std::getenv(name);
+    return env && env[0] == '0';
+}
+} // namespace
+
+u64 SkipUncompiledBudgetNs() {
+    static const u64 budget = [] {
+        if (EnvOff("BB_SKIP_UNCOMPILED")) {
+            return u64{0};
+        }
+        const char* env = std::getenv("BB_SKIP_UNCOMPILED_MS");
+        const u64 ms = env && env[0] ? std::strtoull(env, nullptr, 10) : 1000;
+        return ms * 1'000'000;
+    }();
+    return budget;
+}
+
+bool LatePipelineBindEnabled() {
+    static const bool enabled = !EnvOff("BB_LATE_PIPELINE_BIND");
+    return enabled;
+}
+
+void LogPipelineCompileMode(const Instance& instance, bool late_binds_possible) {
+    if (!AsyncPipelinesEnabled()) {
+        std::printf("Pipelines: new ones compiled where the draw needs them (BB_ASYNC_PIPELINES=0)\n");
+        return;
+    }
+    // VK_EXT_graphics_pipeline_library is reported, not used: shaders reach the port at the draw
+    // that needs them and a pipeline's shaders share one descriptor set layout, so the libraries
+    // would be compiled at that draw as well (docs/pipeline_compiles.md).
+    const auto extensions = instance.GetAvailableExtensions();
+    const bool gpl = std::ranges::find(extensions, std::string{
+                                                       VK_EXT_GRAPHICS_PIPELINE_LIBRARY_EXTENSION_NAME}) !=
+                     extensions.end();
+    bool fast_linking = false;
+    if (gpl) {
+        const auto chain = instance.GetPhysicalDevice()
+                               .getProperties2<vk::PhysicalDeviceProperties2,
+                                               vk::PhysicalDeviceGraphicsPipelineLibraryPropertiesEXT>();
+        fast_linking = chain.get<vk::PhysicalDeviceGraphicsPipelineLibraryPropertiesEXT>()
+                           .graphicsPipelineLibraryFastLinking;
+    }
+    const u64 budget_ms = SkipUncompiledBudgetNs() / 1'000'000;
+    std::printf("Pipelines: new ones compiled on %u threads; draws of one still compiling: scene "
+                "geometry %s, other draws %s (BB_SKIP_UNCOMPILED, BB_LATE_PIPELINE_BIND); graphics "
+                "pipeline library %s, not used\n",
+                PipelineCompileThreads(),
+                budget_ms ? fmt::format("left out for up to {} ms", budget_ms).c_str() : "waits",
+                late_binds_possible && LatePipelineBindEnabled()
+                    ? "bind it on the recording threads (they wait for it)"
+                    : "wait for it on the draw recording thread",
+                gpl ? (fast_linking ? "offered (fast linking)" : "offered (no fast linking)")
+                    : "not offered");
+    std::fflush(stdout);
+}
+
+void Pipeline::MarkReady() noexcept {
+    ready.store(true, std::memory_order_release);
+    ready.notify_all();
+}
 
 
 void Pipeline::BindResources(DescriptorWrites& set_writes, const Shader::PushData& push_data,

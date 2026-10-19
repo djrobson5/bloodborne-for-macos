@@ -57,6 +57,7 @@ void menu_pointer_click();
 uint32_t menu_pointer_take_press();
 uint64_t menu_pointer_tick();
 bool menu_pointer_in_menu();
+bool menu_pointer_navigating();
 uint32_t menu_region_confirm_button();
 uint32_t menu_confirm_button();
 uint32_t menu_back_button();

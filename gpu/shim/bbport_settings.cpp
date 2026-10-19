@@ -6,9 +6,11 @@
 #endif
 // SPDX-License-Identifier: GPL-2.0-or-later
 #include "bbport_settings.h"
+#include "bbport_menu_i18n.h"
 #include "input/ini_bindings.h"
 
 #include <algorithm>
+#include <cctype>
 #include <cstdio>
 #include <cmath>
 #include <cstdlib>
@@ -31,13 +33,62 @@ float Clamp(float v, float lo, float hi) {
     return std::clamp(v, lo, hi);
 }
 
+// cheat_vials / cheat_bullets: off, infinite or an amount 1..CheatMaxAmount; anything else is off.
+int CheatValue(const std::string& key, const std::string& value) {
+    if (value == "off" || value == "0") {
+        return CheatOff;
+    }
+    if (value == "infinite") {
+        return CheatInfinite;
+    }
+    char* end = nullptr;
+    const long amount = std::strtol(value.c_str(), &end, 10);
+    if (!value.empty() && end && *end == '\0' && amount >= 1 && amount <= CheatMaxAmount) {
+        return int(amount);
+    }
+    std::printf("Settings: unknown %s '%s' (expected off, infinite or 1-%d); off\n", key.c_str(),
+                value.c_str(), CheatMaxAmount);
+    return CheatOff;
+}
+
+std::string CheatText(int value) {
+    return value == CheatInfinite ? "infinite"
+           : value >= 1 && value <= CheatMaxAmount ? std::to_string(value)
+                                                   : "off";
+}
+
+// cheat_gun_range: off or one of CheatGunRanges (percent); cheat_echo_multiplier: one of
+// CheatEchoMultipliers. Anything else is the game's own (off / 1).
+template <std::size_t N>
+int CheatChoice(const std::string& key, const std::string& value, const int (&choices)[N], const char* expected) {
+    if (value == "off") {
+        return choices[0];
+    }
+    char* end = nullptr;
+    const long v = std::strtol(value.c_str(), &end, 10);
+    if (!value.empty() && end && *end == '\0' && std::find(choices, choices + N, int(v)) != choices + N) {
+        return int(v);
+    }
+    std::printf("Settings: unknown %s '%s' (expected %s); %d\n", key.c_str(), value.c_str(), expected, choices[0]);
+    return choices[0];
+}
+
 void Set(Values& v, const std::string& key, const std::string& value) {
     const float f = float(std::atof(value.c_str()));
     const int i = std::atoi(value.c_str());
     if (key == "menu_language") {
-        if (value == "en") v.menu_language = MenuLanguage::English;
-        else if (value == "ru") v.menu_language = MenuLanguage::Russian;
-        else std::printf("Settings: unknown menu_language '%s' (expected en or ru)\n", value.c_str());
+        bool known = false;
+        for (int l = 0; l < MenuLanguageCount; ++l) {
+            if (value == MenuLanguageCodes[l]) {
+                v.menu_language = MenuLanguage(l);
+                known = true;
+            }
+        }
+        if (!known) {
+            std::printf("Settings: unknown menu_language '%s' (expected en, ru, es, pt_BR, fr, de, it, pl "
+                        "or tr)\n",
+                        value.c_str());
+        }
     } else if (key == "upscaler") {
         for (int u = 0; u < UpscalerCount; ++u) {
             if (value == UpscalerName(u)) {
@@ -66,6 +117,18 @@ void Set(Values& v, const std::string& key, const std::string& value) {
         v.debug_view = std::clamp(i, 0, DebugViewCount - 1);
     } else if (key == "show_fps") {
         v.show_fps = i != 0;
+    } else if (key == "show_fps_rate") {
+        v.show_fps_rate = i != 0;
+    } else if (key == "show_fps_frame_time") {
+        v.show_fps_frame_time = i != 0;
+    } else if (key == "show_fps_upscaler") {
+        v.show_fps_upscaler = i != 0;
+    } else if (key == "show_fps_cpu") {
+        v.show_fps_cpu = i != 0;
+    } else if (key == "show_fps_gpu") {
+        v.show_fps_gpu = i != 0;
+    } else if (key == "hide_cursor") {
+        v.hide_cursor = i != 0;
     } else if (key == "menu_pos") {
         float x = -1.0f, y = -1.0f;
         if (std::sscanf(value.c_str(), "%f,%f", &x, &y) == 2 && x >= 0.0f && x <= 1.0f && y >= 0.0f &&
@@ -91,6 +154,30 @@ void Set(Values& v, const std::string& key, const std::string& value) {
         v.mouse_invert_y=i!=0;
     } else if (key == "mouse_auto_rotation") {
         v.mouse_auto_rotation=i!=0;
+    } else if (key == "button_prompts") {
+        int mode = -1;
+        for (int m = 0; m < PromptsCount; ++m) {
+            if (value == ButtonPromptsNames[m]) {
+                mode = m;
+            }
+        }
+        if (mode < 0) {
+            std::printf("Settings: unknown button_prompts '%s' (expected auto, keyboard or controller); auto\n",
+                        value.c_str());
+        }
+        v.button_prompts = mode < 0 ? PromptsAuto : mode;
+    } else if (key == "pad_icons") {
+        int mode = -1;
+        for (int m = 0; m < PadIconsCount; ++m) {
+            if (value == PadIconsNames[m]) {
+                mode = m;
+            }
+        }
+        if (mode < 0) {
+            std::printf("Settings: unknown pad_icons '%s' (expected auto, playstation or xbox); auto\n",
+                        value.c_str());
+        }
+        v.pad_icons = mode < 0 ? PadIconsAuto : mode;
     } else if (key == "mouse_sensitivity") {
         v.mouse_sensitivity=std::clamp(i,0,10);
     } else if (key == "camera_controls") {
@@ -109,22 +196,77 @@ void Set(Values& v, const std::string& key, const std::string& value) {
         v.graphics_controls=i!=0;
     } else if (key == "graphics_vignette") {
         v.graphics_vignette=i!=0;
+    // Wide limits: the menu's sliders show the useful range, Ctrl+click types any value up to these.
     } else if (key == "graphics_ao_strength") {
-        v.graphics_ao_strength=Clamp(std::isfinite(f)?f:1.0f,0.0f,2.0f);
+        v.graphics_ao_strength=Clamp(std::isfinite(f)?f:1.0f,0.0f,5.0f);
     } else if (key == "graphics_shadow_scale") {
-        v.graphics_shadow_scale=Clamp(std::isfinite(f)?f:1.0f,1.0f,3.0f);
+        v.graphics_shadow_scale=Clamp(std::isfinite(f)?f:1.0f,0.25f,8.0f);
     } else if (key == "graphics_bloom") {
-        v.graphics_bloom=Clamp(std::isfinite(f)?f:1.0f,0.0f,1.0f);
+        v.graphics_bloom=Clamp(std::isfinite(f)?f:1.0f,0.0f,10.0f);
     } else if (key == "graphics_saturation") {
-        v.graphics_saturation=Clamp(std::isfinite(f)?f:1.0f,0.0f,2.0f);
+        v.graphics_saturation=Clamp(std::isfinite(f)?f:1.0f,0.0f,5.0f);
+    } else if (key == "graphics_fog") {
+        v.graphics_fog=Clamp(std::isfinite(f)?f:1.0f,0.0f,5.0f);
+    } else if (key == "graphics_brightness") {
+        v.graphics_brightness=Clamp(std::isfinite(f)?f:1.0f,0.0f,5.0f);
+    } else if (key == "graphics_contrast") {
+        v.graphics_contrast=Clamp(std::isfinite(f)?f:1.0f,0.5f,1.5f);
+    } else if (key == "graphics_hue") {
+        v.graphics_hue=Clamp(std::isfinite(f)?f:0.0f,-180.0f,180.0f);
     } else if (key == "model_lod") {
         v.model_lod = std::clamp(i, -2, 2);
     } else if (key == "fullscreen") {
         v.fullscreen = i != 0;
+    } else if (key == "hdr") {
+        v.hdr = i != 0;
+    } else if (key == "hdr_paper_white") {
+        v.hdr_paper_white = Clamp(std::isfinite(f) ? f : HdrPaperWhiteDefault, HdrPaperWhiteMin,
+                                  HdrPaperWhiteMax);
+    } else if (key == "hdr_peak") {
+        v.hdr_peak = Clamp(std::isfinite(f) ? f : HdrPeakDefault, HdrPeakMin, HdrPeakMax);
+    } else if (key == "hdr_boost") {
+        v.hdr_boost = Clamp(std::isfinite(f) ? f : HdrBoostDefault, 0.0f, 1.0f);
+    } else if (key == "hdr_ui_brightness") {
+        v.hdr_ui_brightness = Clamp(std::isfinite(f) ? f : 1.0f, HdrUiBrightnessMin, HdrUiBrightnessMax);
+    } else if (key == "hdr_ui_color") {
+        v.hdr_ui_color = Clamp(std::isfinite(f) ? f : HdrUiColorDefault, 0.0f, 1.0f);
+    } else if (key == "hdr_mode") {
+        int mode = -1;
+        for (int m = 0; m < HdrModeCount; ++m) {
+            if (value == HdrModeNames[m]) {
+                mode = m;
+            }
+        }
+        if (mode < 0) {
+            std::printf("Settings: unknown hdr_mode '%s' (expected native or expand); native\n",
+                        value.c_str());
+        }
+        v.hdr_mode = mode < 0 ? HdrModeNative : mode;
     } else if (key == "live_resolution") {
         v.live_resolution = value == "auto" ? -1 : std::clamp(i, 0, 1);
+    } else if (key == "cheat_vials") {
+        v.cheat_vials = CheatValue(key, value);
+    } else if (key == "cheat_bullets") {
+        v.cheat_bullets = CheatValue(key, value);
+    } else if (key == "cheat_stamina") {
+        v.cheat_stamina = i != 0;
+    } else if (key == "cheat_stealth") {
+        v.cheat_stealth = i != 0;
+    } else if (key == "cheat_keep_echoes") {
+        v.cheat_keep_echoes = i != 0;
+    } else if (key == "cheat_no_durability") {
+        v.cheat_no_durability = i != 0;
+    } else if (key == "cheat_consumables") {
+        v.cheat_consumables = i != 0;
+    } else if (key == "cheat_gun_range") {
+        v.cheat_gun_range = CheatChoice(key, value, CheatGunRanges, "off, 150, 200 or 300");
+    } else if (key == "cheat_echo_multiplier") {
+        v.cheat_echo_multiplier = CheatChoice(key, value, CheatEchoMultipliers, "1, 2, 5 or 10");
     } else if (key == "output_res") {
-        for (int r = 0; r < OutputCount; ++r) {
+        if (value == "auto") {
+            v.output_res = OutputAuto;
+        }
+        for (int r = 0; r < OutputAuto; ++r) {
             if (value == std::to_string(OutputWidths[r]) + "x" + std::to_string(OutputHeights[r])) {
                 v.output_res = r;
             }
@@ -138,7 +280,53 @@ void Set(Values& v, const std::string& key, const std::string& value) {
     }
 }
 
+// The menu's language for the launcher's code (BB_MENU_LANGUAGE: en, ru, pt_BR...) or a locale
+// (ru_RU.UTF-8, de_DE...): its first two letters; Portuguese only as pt_BR. Else English.
+MenuLanguage LanguageOfLocale(const char* lang) {
+    if (!lang || !lang[0] || !lang[1]) {
+        return MenuLanguage::English;
+    }
+    const auto lower = [lang](int i) { return char(std::tolower(static_cast<unsigned char>(lang[i]))); };
+    if (lower(0) == 'p' && lower(1) == 't') {
+        return (lang[2] == '_' || lang[2] == '-') && lower(3) == 'b' && lower(4) == 'r'
+                   ? MenuLanguage::PortugueseBrazil
+                   : MenuLanguage::English;
+    }
+    for (int l = 0; l < MenuLanguageCount; ++l) {
+        const char* code = MenuLanguageCodes[l];
+        if (code[2] == '\0' && lower(0) == code[0] && lower(1) == code[1]) {
+            return MenuLanguage(l);
+        }
+    }
+    return MenuLanguage::English;
+}
+
 } // namespace
+
+// The display's size for output_res = auto: BB_DISPLAY_SIZE ("WxH", from run_windows.py), even
+// (the game has half-resolution buffers); 1920x1080 without it.
+static std::pair<int, int> DisplaySize() {
+    static const std::pair<int, int> size = [] {
+        int w = 0, h = 0;
+        const char* env = std::getenv("BB_DISPLAY_SIZE");
+        if (env && std::sscanf(env, "%dx%d", &w, &h) == 2 && w >= 640 && h >= 360 && w <= 16384 &&
+            h <= 8640) {
+            return std::pair<int, int>{w & ~1, h & ~1};
+        }
+        return std::pair<int, int>{1920, 1080};
+    }();
+    return size;
+}
+
+int OutputWidth(int index) {
+    index = std::clamp(index, 0, OutputCount - 1);
+    return index == OutputAuto ? DisplaySize().first : OutputWidths[index];
+}
+
+int OutputHeight(int index) {
+    index = std::clamp(index, 0, OutputCount - 1);
+    return index == OutputAuto ? DisplaySize().second : OutputHeights[index];
+}
 
 Values& Get() {
     static Values values;
@@ -146,7 +334,11 @@ Values& Get() {
 }
 
 const char* MenuText(const char* english, const char* russian) {
-    return Get().menu_language == MenuLanguage::Russian ? russian : english;
+    switch (const MenuLanguage language = Get().menu_language) {
+    case MenuLanguage::English: return english;
+    case MenuLanguage::Russian: return russian;
+    default: return MenuTranslation(language, english);
+    }
 }
 
 void Load() {
@@ -166,9 +358,7 @@ void Load() {
                 }
             }
         }
-        v.menu_language = lang && (lang[0] == 'r' || lang[0] == 'R') && (lang[1] == 'u' || lang[1] == 'U')
-                              ? MenuLanguage::Russian
-                              : MenuLanguage::English;
+        v.menu_language = LanguageOfLocale(lang);
     }
     if (FILE* file = std::fopen(Path(), "r")) {
         char line[256];
@@ -196,6 +386,9 @@ void Load() {
         {"BB_REACTIVE", "reactive"},              {"BB_REACTIVE_SCALE", "reactive_scale"},
         {"BB_REACTIVE_THRESHOLD", "reactive_threshold"}, {"BB_REACTIVE_MAX", "reactive_max"},
         {"BB_UPSCALE_PRESET", "preset"},            {"BB_OBJECT_MOTION", "object_motion"},
+        {"BB_HDR", "hdr"},                          {"BB_HDR_PAPER_WHITE", "hdr_paper_white"},
+        {"BB_HDR_PEAK", "hdr_peak"},                {"BB_HDR_BOOST", "hdr_boost"},
+        {"BB_HDR_MODE", "hdr_mode"},
     };
     for (const auto& [env, key] : env_keys) {
         if (const char* value = std::getenv(env)) {
@@ -211,6 +404,7 @@ void Load() {
     v.startup_model_lod = v.model_lod;
     v.startup_output_res = v.output_res;
     v.startup_live_resolution = v.live_resolution;
+    v.startup_hdr = v.hdr;
 }
 
 void ConfigureUpscalerSupport(bool fsr4, bool fsr411, bool dlss) {
@@ -223,6 +417,12 @@ void ConfigureUpscalerSupport(bool fsr4, bool fsr411, bool dlss) {
         v.fsr4_problem = "DLSS needs an NVIDIA RTX GPU, its driver's NGX and nvngx_dlss; using FSR 3.1";
         std::printf("Upscaler: dlss unavailable; falling back to FSR 3.1 before the first frame\n");
         v.upscaler = UpscalerFsr3;
+    } else if (requested == UpscalerFsr411 && !v.fsr411_supported && v.fsr4_supported) {
+        // FSR 4.1.1 needs mixed-precision dot products (VK_VALVE_shader_mixed_float_dot_product)
+        // that FSR 4 does not, and its fsr4_411 files: the next best is FSR 4, not 3.1.
+        v.fsr4_problem = "FSR 4.1.1 needs its fsr4_411 files and a GPU that runs its shaders; using FSR 4";
+        std::printf("Upscaler: fsr411 unavailable (GPU or fsr4_411 files); falling back to FSR 4 before the first frame\n");
+        v.upscaler = UpscalerFsr4;
     } else if ((requested == UpscalerFsr4 && !v.fsr4_supported) ||
         (requested == UpscalerFsr411 && !v.fsr411_supported)) {
         v.fsr4_problem = "GPU does not support the selected FSR 4 shaders; using FSR 3.1";
@@ -264,7 +464,7 @@ void Save() {
         return std::string(text);
     };
     const auto flag = [](bool value) { return std::string(value ? "1" : "0"); };
-    put("menu_language", v.menu_language == MenuLanguage::Russian ? "ru" : "en");
+    put("menu_language", MenuLanguageCodes[int(v.menu_language.load())]);
     put("upscaler", UpscalerName(v.upscaler));
     put("preset", std::to_string(v.preset.load()));
     put("sharpen", flag(v.sharpen));
@@ -277,6 +477,12 @@ void Save() {
     put("reactive_max", fixed(v.reactive_max, 2));
     put("debug_view", std::to_string(v.debug_view.load()));
     put("show_fps", flag(v.show_fps));
+    put("show_fps_rate", flag(v.show_fps_rate));
+    put("show_fps_frame_time", flag(v.show_fps_frame_time));
+    put("show_fps_upscaler", flag(v.show_fps_upscaler));
+    put("show_fps_cpu", flag(v.show_fps_cpu));
+    put("show_fps_gpu", flag(v.show_fps_gpu));
+    put("hide_cursor", flag(v.hide_cursor));
     put("fsr4_auto_exposure", flag(v.fsr4_auto_exposure));
     put("fsr4_invert_jitter", flag(v.fsr4_invert_jitter));
     // Read by patches.py at start.
@@ -284,12 +490,23 @@ void Save() {
         put(Effects[e].key, flag(v.effects[e]));
     }
     put("fullscreen", flag(v.fullscreen));
+    put("hdr", flag(v.hdr));
+    put("hdr_paper_white", fixed(v.hdr_paper_white, 0));
+    put("hdr_peak", fixed(v.hdr_peak, 0));
+    put("hdr_boost", fixed(v.hdr_boost, 2));
+    put("hdr_ui_brightness", fixed(v.hdr_ui_brightness, 2));
+    put("hdr_ui_color", fixed(v.hdr_ui_color, 2));
+    put("hdr_mode", HdrModeNames[std::clamp(v.hdr_mode.load(), 0, HdrModeCount - 1)]);
     put("graphics_controls",flag(v.graphics_controls));
     put("graphics_vignette",flag(v.graphics_vignette));
     put("graphics_ao_strength",fixed(v.graphics_ao_strength,2));
     put("graphics_shadow_scale",fixed(v.graphics_shadow_scale,2));
     put("graphics_bloom",fixed(v.graphics_bloom,2));
     put("graphics_saturation",fixed(v.graphics_saturation,2));
+    put("graphics_fog",fixed(v.graphics_fog,2));
+    put("graphics_brightness",fixed(v.graphics_brightness,2));
+    put("graphics_contrast",fixed(v.graphics_contrast,2));
+    put("graphics_hue",fixed(v.graphics_hue,0));
     put("camera_controls", flag(v.camera_controls));
     put("widescreen",flag(v.widescreen));
     put("pc_controls",flag(v.pc_controls));
@@ -299,14 +516,26 @@ void Save() {
     put("mouse_invert_y",flag(v.mouse_invert_y));
     put("mouse_auto_rotation",flag(v.mouse_auto_rotation));
     put("mouse_sensitivity",std::to_string(v.mouse_sensitivity.load()));
+    put("button_prompts", ButtonPromptsNames[std::clamp(v.button_prompts.load(), 0, PromptsCount - 1)]);
+    put("pad_icons", PadIconsNames[std::clamp(v.pad_icons.load(), 0, PadIconsCount - 1)]);
     put("change_appearance", flag(v.change_appearance));
     put("rebirth", flag(v.rebirth));
     put("camera_fov_scale", fixed(v.camera_fov_scale, 2));
     put("camera_distance_scale", fixed(v.camera_distance_scale, 2));
     put("camera_height_scale", fixed(v.camera_height_scale, 2));
     put("model_lod", std::to_string(v.model_lod.load()));
-    put("output_res", std::to_string(OutputWidths[v.output_res]) + "x" +
-                          std::to_string(OutputHeights[v.output_res]));
+    put("cheat_vials", CheatText(v.cheat_vials));
+    put("cheat_bullets", CheatText(v.cheat_bullets));
+    put("cheat_stamina", flag(v.cheat_stamina));
+    put("cheat_stealth", flag(v.cheat_stealth));
+    put("cheat_gun_range", v.cheat_gun_range == 0 ? "off" : std::to_string(v.cheat_gun_range.load()));
+    put("cheat_keep_echoes", flag(v.cheat_keep_echoes));
+    put("cheat_echo_multiplier", std::to_string(v.cheat_echo_multiplier.load()));
+    put("cheat_no_durability", flag(v.cheat_no_durability));
+    put("cheat_consumables", flag(v.cheat_consumables));
+    put("output_res", v.output_res == OutputAuto ? std::string("auto")
+                                                  : std::to_string(OutputWidths[v.output_res]) + "x" +
+                                                        std::to_string(OutputHeights[v.output_res]));
     // Read by run.sh at start.
     put("live_resolution", v.live_resolution < 0 ? "auto" : flag(v.live_resolution != 0));
     if (v.menu_x >= 0.0f && v.menu_y >= 0.0f) {

@@ -3,7 +3,8 @@
  * `mov rax, fs:[0]` into `mov rax, gs:[0]`, so GS base = guest TCB while glibc
  * keeps FS. On Windows GS is the TEB: the loader points the instruction at a TEB
  * TLS slot that holds the guest TCB instead.
- * Priorities/affinity are recorded, not enforced by a PS4 scheduler. */
+ * Priorities/affinity are recorded, not enforced by a PS4 scheduler; only the audio range of
+ * priorities raises the host thread's priority (apply_priority). */
 #define _GNU_SOURCE
 #include "runtime.h"
 #include <stdio.h>
@@ -130,6 +131,8 @@ void runtime_thread_attach_main(void) {
     GuestThread *t=runtime_thread_current();
     snprintf(t->name,sizeof(t->name),"main");
 }
+/* No record is created here: the fault handler asks (probe.c). */
+int runtime_thread_has_record(void) { return current!=NULL; }
 static GuestThread *find_thread(void *handle) {
     GuestThread *found=NULL;
     host_lock(&lock);
@@ -244,10 +247,26 @@ static void set_host_name(const char *name) {
     pthread_setname_np(pthread_self(),host);
 #endif
 }
+/* bbport: PS4 priorities run from 256 (highest) to 767. Bloodborne starts FMOD's output, mixer,
+ * stream and file threads at 256-265 and every other thread at 700. At the host priority of the
+ * ~60 game threads (and below the render threads with BB_GPU_THREAD_PRIORITY), a busy CPU ran
+ * FMOD's mixer late: late and stuttering sound on CPUs with slower cores. That range runs above
+ * them; it is mostly asleep. BB_AUDIO_THREAD_PRIORITY=0: all at normal priority, as before. */
+#define HIGH_PRIO_LAST 300
+static void apply_priority(int prio) {
+    static int enabled=-1;
+    if (enabled<0) { const char *e=getenv("BB_AUDIO_THREAD_PRIORITY"); enabled=!(e && e[0]=='0'); }
+    if (enabled) host_thread_set_high_priority(prio<=HIGH_PRIO_LAST);
+    static int noted;
+    if (prio<=HIGH_PRIO_LAST && !__atomic_exchange_n(&noted,1,__ATOMIC_RELAXED))
+        printf("Runtime: audio threads (priority %d-%d) %s\n",256,HIGH_PRIO_LAST,
+               enabled ? "above the game's other threads" : "at normal priority (BB_AUDIO_THREAD_PRIORITY=0)");
+}
 static void *host_start(void *p) {
     GuestThread *t=p;
     attach(t);
     set_host_name(t->name);
+    if (t->attr.prio<=HIGH_PRIO_LAST) apply_priority(t->attr.prio);
     if (!EXIT_SET(t->exit_jump)) t->result=t->entry(t->argument);
     runtime_thread_keys_cleanup();
     host_lock(&lock); t->finished=1; ++exited; host_unlock(&lock);
@@ -323,6 +342,8 @@ static ABI int32_t thread_get_prio(GuestThread *t,int *prio) {
 }
 static ABI int32_t thread_set_prio(GuestThread *t,int prio) {
     if (!find_thread(t)) return ERR(3);
+    /* Only the calling thread's own host priority can change here (others' handles may be gone). */
+    if (t==current && (prio<=HIGH_PRIO_LAST)!=(t->attr.prio<=HIGH_PRIO_LAST)) apply_priority(prio);
     t->attr.prio=prio; return 0;
 }
 static ABI int32_t thread_set_affinity(GuestThread *t,uint64_t mask) {
@@ -366,6 +387,8 @@ int32_t runtime_thread_spawn(void **out,void *(ABI *entry)(void *),void *argumen
 int32_t runtime_thread_join_spawned(void *thread,void **result) {
     return posix(thread_join(thread,result));
 }
+/* pthread_exit for host code on a guest thread (the network library's sceNet threads). */
+__attribute__((noreturn)) void runtime_thread_exit(void *value) { thread_exit(value); }
 
 uintptr_t runtime_thread_resolve(const char *name) {
     static const struct { const char *nid; void *fn; } table[]={

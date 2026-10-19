@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <algorithm>
+#include <atomic>
 #include <cmath>
 #include <vector>
 #include <chrono>
@@ -33,6 +34,7 @@ extern "C" void runtime_wait_report(double frames);
 #include "core/libraries/videoout/videoout_error.h"
 #include "imgui/renderer/imgui_core.h"
 #include "video_core/amdgpu/liverpool.h"
+#include "video_core/renderer_vulkan/pipeline_compile_queue.h"
 #include "video_core/renderer_vulkan/vk_breadcrumbs.h"
 #include "video_core/renderer_vulkan/vk_instance.h"
 #include "video_core/renderer_vulkan/vk_presenter.h"
@@ -372,6 +374,23 @@ static void PrintMemory() {
 #endif
 }
 
+/// bbport: the game's RAM and the PC's, once a minute in every session: steady growth over a
+/// session is a leak, and a crash right after "free" ran out is the PC running out of memory.
+static void LogRam() {
+    BbPlatform::Memory m;
+    if (!BbPlatform::GetMemory(m)) {
+        return;
+    }
+    const auto mib = [](u64 bytes) { return static_cast<unsigned long long>(bytes >> 20); };
+    std::printf("Memory: game %llu MiB in RAM (%llu MiB committed, peak %llu MiB); PC %llu of %llu "
+                "MiB free, %llu MiB commit left; GPU images %llu MiB, %llu MiB cached in %llu\n",
+                mib(m.working_set), mib(m.private_bytes), mib(m.peak_working_set), mib(m.free_phys),
+                mib(m.total_phys), mib(m.commit_left), mib(BbStats::vk_image_bytes.load()),
+                mib(BbStats::live_image_bytes.load()),
+                static_cast<unsigned long long>(BbStats::live_images.load()));
+    std::fflush(stdout);
+}
+
 void VideoOutDriver::Flip(const Request& req) {
     // Update HDR status before presenting, then present the frame (bbport: on the swap thread).
     RunPresenter([this, frame = req.frame, hdr = req.port->is_hdr] {
@@ -380,6 +399,14 @@ void VideoOutDriver::Flip(const Request& req) {
     });
     Vulkan::FrameCapture::OnFlip(req.index >= 0 ? req.port->buffer_slots[req.index].address_left
                                                 : 0);
+
+    {
+        static auto next_ram = std::chrono::steady_clock::now() + std::chrono::seconds(30);
+        if (const auto now = std::chrono::steady_clock::now(); now >= next_ram) {
+            next_ram = now + std::chrono::seconds(60);
+            LogRam();
+        }
+    }
 
     // bbport: BB_FRAME_STATS=1 prints flip rate and frame time spread every 5 seconds.
     static const bool frame_stats = EmulatorSettingsImpl::Flag("BB_FRAME_STATS", false);
@@ -455,6 +482,17 @@ void VideoOutDriver::Flip(const Request& req) {
                         (t_now[0] - last_t[0]) / 1e6, (t_now[1] - last_t[1]) / 1e6,
                         (t_now[2] - last_t[2]) / 1e6, (t_now[3] - last_t[3]) / 1e6,
                         (t_now[4] - last_t[4]) / 1e6, (t_now[5] - last_t[5]) / 1e6);
+            // bbport: the parts of image create and refresh (texture loading).
+            static u64 last_parts[5];
+            const u64 parts[5] = {BbStats::t_image_query.load(), BbStats::t_image_alloc.load(),
+                                  BbStats::t_refresh_hash.load(), BbStats::t_refresh_obtain.load(),
+                                  BbStats::t_refresh_detile.load()};
+            std::printf("       of which: format query %.1f, allocation %.1f; hashing %.1f, "
+                        "source data %.1f, detiling %.1f\n",
+                        (parts[0] - last_parts[0]) / 1e6, (parts[1] - last_parts[1]) / 1e6,
+                        (parts[2] - last_parts[2]) / 1e6, (parts[3] - last_parts[3]) / 1e6,
+                        (parts[4] - last_parts[4]) / 1e6);
+            std::copy(std::begin(parts), std::end(parts), std::begin(last_parts));
             std::printf("       GPU thread page faults %llu (process %llu), protection faults %llu; "
                         "protect calls %llu (%llu pages), of which write-revoking %llu (%llu pages)\n",
                         static_cast<unsigned long long>(minflt - last_minflt),
@@ -587,6 +625,85 @@ void VideoOutDriver::Flip(const Request& req) {
                         BbStats::tick_wait_ns.exchange(0) / (window * 1e7),
                         frames ? double(BbStats::reduced_draws.exchange(0)) / frames : 0.0,
                         frames ? double(BbStats::scene_draws.exchange(0)) / frames : 0.0);
+            // bbport: where host copies and deferred fences were waited for (by call site, mostly
+            // the draw recording thread's tasks), and the page protection changes of the draw
+            // recording thread and of the others (BB_DMA_WAITS, BB_FENCE_ORDER, BB_DEFER_PROTECT).
+            {
+                const double f = frames ? double(frames) : 1.0;
+                const auto per_frame = [&](std::atomic<u64>& counter) {
+                    return double(counter.exchange(0)) / f;
+                };
+                const auto ms_per_frame = [&](std::atomic<u64>& ns) {
+                    return double(ns.exchange(0)) / (f * 1e6);
+                };
+                std::printf("Stage B waits: fences");
+                for (u32 s = 0; s < BbStats::WaitSites; ++s) {
+                    const double n = per_frame(BbStats::signal_waits[s]);
+                    const double ms = ms_per_frame(BbStats::signal_wait_ns[s]);
+                    const double skipped = per_frame(BbStats::signal_waits_skipped[s]);
+                    if (n + skipped > 0.0) {
+                        std::printf(" %s %.1f/frame %.3f ms", BbStats::WaitSiteNames[s], n, ms);
+                        if (skipped > 0.0) {
+                            std::printf(" (%.1f/frame not needed)", skipped);
+                        }
+                    }
+                }
+                std::printf("; copies");
+                for (u32 s = 0; s < BbStats::WaitSites; ++s) {
+                    const double n = per_frame(BbStats::copy_waits[s]);
+                    const double ms = ms_per_frame(BbStats::copy_wait_ns[s]);
+                    if (n > 0.0) {
+                        std::printf(" %s %.1f/frame %.3f ms", BbStats::WaitSiteNames[s], n, ms);
+                    }
+                }
+                std::printf("; fence barriers %.1f/frame; DMA into memory stored by the CPU "
+                            "%.1f/frame, recorded for the GPU %.1f/frame\n",
+                            per_frame(BbStats::fence_barriers), per_frame(BbStats::dma_on_cpu),
+                            per_frame(BbStats::dma_on_gpu));
+                double stage_b_calls = 0.0, stage_b_ms = 0.0;
+                std::array<double, BbStats::ProtectKinds> kind_calls{};
+                for (u32 k = 0; k < BbStats::ProtectKinds; ++k) {
+                    kind_calls[k] = per_frame(BbStats::stage_b_protect_calls[k]);
+                    stage_b_calls += kind_calls[k];
+                    stage_b_ms += ms_per_frame(BbStats::stage_b_protect_ns[k]);
+                }
+                const double other_calls = per_frame(BbStats::other_protect_calls);
+                const double other_ms = ms_per_frame(BbStats::other_protect_ns);
+                const double deferred_pages = per_frame(BbStats::deferred_protect_pages);
+                const double deferred_calls = per_frame(BbStats::deferred_protect_calls);
+                const double deferred_ms = ms_per_frame(BbStats::deferred_protect_ns);
+                std::printf("Stage B protects: %.1f/frame %.3f ms (uploads %.1f, textures %.1f, "
+                            "other %.1f); other threads %.1f/frame %.3f ms; deferred %.0f "
+                            "pages/frame, applied in %.1f calls/frame %.3f ms (bb:Protect or "
+                            "copies), copies that flushed %.1f/frame, cancelled %.0f pages/frame\n",
+                            stage_b_calls, stage_b_ms, kind_calls[BbStats::ProtectUpload],
+                            kind_calls[BbStats::ProtectTexture], kind_calls[BbStats::ProtectOther],
+                            other_calls, other_ms, deferred_pages, deferred_calls, deferred_ms,
+                            per_frame(BbStats::copy_flushes),
+                            per_frame(BbStats::deferred_cancelled_pages));
+            }
+            // bbport (docs/pipeline_compiles.md): what draws of pipelines still compiling did.
+            {
+                auto& p = Vulkan::pipeline_compile_stats;
+                const u64 background = p.background.exchange(0), taken = p.taken.exchange(0);
+                const u64 skipped = p.skipped_draws.exchange(0);
+                const u64 skipped_pipelines = p.skipped_pipelines.exchange(0);
+                const u64 late = p.late_binds.exchange(0), waits = p.waits.exchange(0);
+                const u64 wait_ns = p.wait_ns.exchange(0), longest = p.longest_wait_ns.exchange(0);
+                if (background + skipped + late + waits != 0) {
+                    std::printf("Pipelines: %llu compiled in the background (%llu by the thread "
+                                "that needed them); %llu draws of %llu pipelines left out while "
+                                "compiling; %llu draws/dispatches bound on the recording threads; "
+                                "%llu waits, %.1f ms, longest %.1f ms\n",
+                                static_cast<unsigned long long>(background),
+                                static_cast<unsigned long long>(taken),
+                                static_cast<unsigned long long>(skipped),
+                                static_cast<unsigned long long>(skipped_pipelines),
+                                static_cast<unsigned long long>(late),
+                                static_cast<unsigned long long>(waits), wait_ns / 1e6,
+                                longest / 1e6);
+                }
+            }
             VideoCore::PageManager::ReportFaultSites();
             if (const u64 notes = BbStats::cpu_write_notes.exchange(0)) {
                 std::printf("Write notices: %.0f/s, %.2f MB/s (libc copies over pages the GPU side "
@@ -695,8 +812,19 @@ void VideoOutDriver::Flip(const Request& req) {
         }
     }
 
-    // Update flip status.
     auto* port = req.port;
+    // bbport: release the buffer this flip replaced before the game can learn of the flip (flip
+    // status, flip events), not after: the game renders into that buffer next and sets its label
+    // to 1 again, which a later reset here cleared (the flip IRQ then waited up to 20 ms for a
+    // label that never came, video_out.cpp). Frames are prepared at submission, so the buffer
+    // is no longer read here.
+    if (port->prev_index != -1) {
+        port->buffer_labels[port->prev_index] = 0;
+        port->SignalVoLabel();
+    }
+    port->prev_index = req.index;
+
+    // Update flip status.
     {
         std::unique_lock lock{port->port_mutex};
         auto& flip_status = port->flip_status;
@@ -722,14 +850,6 @@ void VideoOutDriver::Flip(const Request& req) {
                                         (req.flip_arg << 16)));
         }
     }
-
-    // Reset prev flip label
-    if (port->prev_index != -1) {
-        port->buffer_labels[port->prev_index] = 0;
-        port->SignalVoLabel();
-    }
-    // save to prev buf index
-    port->prev_index = req.index;
 }
 
 void VideoOutDriver::DrawBlankFrame() {
@@ -753,8 +873,18 @@ bool VideoOutDriver::SubmitFlip(VideoOutPort* port, s32 index, s64 flip_arg,
     {
         std::unique_lock lock{port->port_mutex};
         if (index != -1 && port->flip_status.flip_pending_num > 16) {
-            LOG_ERROR(Lib_VideoOut, "Flip queue is full");
-            return false;
+            // bbport: an EOP flip has nobody to return the error to: refusing it ended the game
+            // (assertion, exit 23), and dropping it would keep its buffer's label (the game may
+            // wait for it). It is queued anyway; frame preparation waits for a free frame.
+            if (!is_eop) {
+                LOG_ERROR(Lib_VideoOut, "Flip queue is full");
+                return false;
+            }
+            static std::atomic<u32> notes{0};
+            if (notes.fetch_add(1, std::memory_order_relaxed) < 4) {
+                std::printf("VideoOut: %d flips pending; EOP flip queued anyway\n",
+                            port->flip_status.flip_pending_num);
+            }
         }
 
         if (is_eop) {
@@ -813,8 +943,9 @@ void VideoOutDriver::PresentThread(std::stop_token token) {
     const auto frame_period = frame_limit ? std::chrono::nanoseconds(1000000000 / frame_limit)
                                           : std::chrono::nanoseconds(0);
     auto next_flip = std::chrono::steady_clock::now();
-    std::printf("VideoOut: vblank %u Hz, frame limit %u FPS\n",
-                EmulatorSettings.GetVblankFrequency(), frame_limit);
+    std::printf("VideoOut: vblank %u Hz, frame limit %u FPS, precise pacing %s\n",
+                EmulatorSettings.GetVblankFrequency(), frame_limit,
+                Common::PrecisePacingEnabled() ? "on" : "off");
 
     const auto receive_request = [this] -> Request {
         std::scoped_lock lk{mutex};
@@ -830,6 +961,137 @@ void VideoOutDriver::PresentThread(std::stop_token token) {
     // it arrives and its slot allows (no limit: at once), between vblanks, instead of on the
     // next vblank tick.
     const bool immediate_flips = frame_limit != 0 || EmulatorSettings.IsUncappedVblank();
+
+    const auto signal_vblank = [this] {
+        auto& vblank_status = main_port.vblank_status;
+        // Needs lock here as can be concurrently read by `sceVideoOutGetVblankStatus`
+        std::scoped_lock lock{main_port.vo_mutex};
+
+        // Trigger flip events for the port
+        for (auto event : main_port.vblank_events) {
+            auto equeue = Kernel::GetEqueue(event);
+            if (equeue != nullptr) {
+                equeue->TriggerEvent(static_cast<u64>(OrbisVideoOutInternalEventId::Vblank),
+                                     Kernel::OrbisKernelEvent::Filter::VideoOut,
+                                     reinterpret_cast<void*>(
+                                         static_cast<u64>(OrbisVideoOutInternalEventId::Vblank) |
+                                         (vblank_status.count << 16)));
+            }
+        }
+
+        // Update vblank status
+        vblank_status.count++;
+        vblank_status.process_time = Libraries::Kernel::sceKernelGetProcessTime();
+        vblank_status.tsc = Libraries::Kernel::sceKernelReadTsc();
+        main_port.vblank_cv.notify_all();
+    };
+
+    // bbport: precise pacing for immediate flips (Common::PrecisePacingEnabled: on by default on
+    // Windows, BB_PRECISE_PACING=0 turns it off; off on Linux unless =1). Adapted from
+    // IFreemz/shadPS4-Bloodborne-DLSS-FSR (6c69c55, "Even flip pacing for G-Sync, precise
+    // vblank ticks"), GPL-2.0-or-later.
+    // - Vblank ticks run on a fixed schedule (next = previous + period), re-anchored to now only
+    //   after a stall of more than a period; waits sleep on a high-resolution timer and spin the
+    //   last stretch, so ticks neither drift nor jitter by the OS timer granularity.
+    // - Flips keep an even rhythm of one pace period (the frame limit's period, or the vblank
+    //   period without a limit), and two flips are never closer than 7/8 of it: a late frame is
+    //   not followed by a catch-up flip right after it. With G-Sync/FreeSync the display
+    //   refreshes on every flip, so uneven flips are refresh rate swings (judder, flicker).
+    // Flips on vblank ticks without a frame limit keep the AccurateTimer path below.
+    if (immediate_flips && Common::PrecisePacingEnabled()) {
+        using Clock = std::chrono::steady_clock;
+        const std::chrono::nanoseconds pace = frame_limit ? frame_period : vblank_period;
+        const std::chrono::nanoseconds min_gap = pace * 7 / 8;
+        const std::chrono::nanoseconds slack = pace - min_gap;
+        // OS sleeps wake up late: sleep most of the way, spin the rest. The spin follows how late
+        // the timer actually wakes (Common::PreciseSpin; at most 1.5 ms and 1/8 of the vblank
+        // period), and only flips get it when there is a frame limit: vblank ticks then only
+        // count time, and spinning before each of 480 a second kept a core busy, taken from the
+        // game's own threads on 6-8 core CPUs.
+        const std::chrono::nanoseconds spin_cap = std::min<std::chrono::nanoseconds>(
+            std::chrono::microseconds(1500), vblank_period / 8);
+        const auto wait_until = [&](Clock::time_point deadline, bool exact) {
+            const auto spin = exact ? Common::PreciseSpin(spin_cap) : std::chrono::nanoseconds(0);
+            const auto left = deadline - Clock::now();
+            if (left > spin) {
+                Common::AccurateSleep(
+                    std::chrono::duration_cast<std::chrono::nanoseconds>(left - spin), nullptr,
+                    false);
+            }
+            while (Clock::now() < deadline) {
+                std::this_thread::yield();
+            }
+        };
+        const std::chrono::nanoseconds spin = Common::PreciseSpin(spin_cap);
+
+        Clock::time_point next_tick = Clock::now();
+        next_flip = next_tick;
+        Clock::time_point last_flip = next_tick - min_gap;
+        const auto take_flip = [&](const Request& request, Clock::time_point now) {
+            next_flip = std::max<Clock::time_point>(next_flip + pace, now + min_gap);
+            last_flip = now;
+            Flip(request);
+            FRAME_END;
+        };
+        const auto end_tick = [&](Clock::time_point tick_deadline) {
+            wait_until(tick_deadline, !frame_limit);
+            // Fixed schedule; after a long stall (a breakpoint, a hitch) start again from now.
+            const auto now = Clock::now();
+            next_tick = now - tick_deadline > vblank_period ? now : tick_deadline;
+        };
+
+        while (!token.stop_requested()) {
+            const Clock::time_point tick_deadline = next_tick + vblank_period;
+
+            if (DebugState.IsGuestThreadsPaused()) {
+                DrawLastFrame();
+                end_tick(tick_deadline);
+                continue;
+            }
+
+            // Check if it's time to take a request. On a tick, a flip up to `slack` before its
+            // slot is fine (ticks and flips run on separate schedules), as long as it keeps the
+            // minimum gap.
+            const auto now = Clock::now();
+            const bool flip_slot = now + slack >= next_flip && now >= last_flip + min_gap;
+            if (flip_slot && main_port.vblank_status.count % (main_port.flip_rate + 1) == 0) {
+                const auto request = receive_request();
+                if (!request) {
+                    if (!main_port.is_open) {
+                        DrawBlankFrame();
+                    } else if (ImGui::Core::MustKeepDrawing()) {
+                        DrawLastFrame();
+                    }
+                } else {
+                    take_flip(request, now);
+                }
+            }
+
+            signal_vblank();
+
+            // Until the next vblank: take flip requests as they arrive (not with a flip rate,
+            // which asks for flips on vblank ticks).
+            while (main_port.flip_rate == 0 && !token.stop_requested()) {
+                {
+                    std::unique_lock lk{mutex};
+                    if (!request_cv.wait_until(lk, tick_deadline - spin,
+                                               [this] { return !requests.empty(); })) {
+                        break; // next vblank
+                    }
+                }
+                if (next_flip >= tick_deadline) {
+                    break; // its slot is at (or after) the next vblank
+                }
+                wait_until(next_flip, true);
+                const auto request = receive_request();
+                if (request) {
+                    take_flip(request, Clock::now());
+                }
+            }
+            end_tick(tick_deadline);
+        }
+        return;
+    }
 
     while (!token.stop_requested()) {
         timer.Start();
@@ -864,29 +1126,7 @@ void VideoOutDriver::PresentThread(std::stop_token token) {
             }
         }
 
-        {
-            // Needs lock here as can be concurrently read by `sceVideoOutGetVblankStatus`
-            std::scoped_lock lock{main_port.vo_mutex};
-
-            // Trigger flip events for the port
-            for (auto event : main_port.vblank_events) {
-                auto equeue = Kernel::GetEqueue(event);
-                if (equeue != nullptr) {
-                    equeue->TriggerEvent(
-                        static_cast<u64>(OrbisVideoOutInternalEventId::Vblank),
-                        Kernel::OrbisKernelEvent::Filter::VideoOut,
-                        reinterpret_cast<void*>(
-                            static_cast<u64>(OrbisVideoOutInternalEventId::Vblank) |
-                            (vblank_status.count << 16)));
-                }
-            }
-
-            // Update vblank status
-            vblank_status.count++;
-            vblank_status.process_time = Libraries::Kernel::sceKernelGetProcessTime();
-            vblank_status.tsc = Libraries::Kernel::sceKernelReadTsc();
-            main_port.vblank_cv.notify_all();
-        }
+        signal_vblank();
 
         if (!immediate_flips || main_port.flip_rate != 0) {
             timer.End();

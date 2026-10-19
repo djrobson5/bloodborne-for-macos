@@ -54,7 +54,7 @@ bool host_mouse_stage_position(float& x,float& y) {
     // Presenter fits the output; Scaleform fits its native 1920x1080 stage.
     const auto& s=BbSettings::Get();
     const int idx=std::clamp(BbSettings::ResolutionNeedsRestart()?s.startup_output_res:s.output_res.load(),0,BbSettings::OutputCount-1);
-    const float ow=BbSettings::OutputWidths[idx],oh=BbSettings::OutputHeights[idx];
+    const float ow=float(BbSettings::OutputWidth(idx)),oh=float(BbSettings::OutputHeight(idx));
     const float present=std::min(window_w/ow,window_h/oh);
     if(!s.widescreen){
         x=(mouse_x-(window_w-ow*present)/2)/present*1920/ow;
@@ -162,8 +162,10 @@ extern "C" int bbgpu_pc_input(BbPcPad* d,const bool* keys,int nkeys,int gamepad_
             if(p.lx==128)p.lx=127;if(p.ly==128)p.ly=127;
             if(p.rx==128)p.rx=127;if(p.ry==128)p.ry=127;
         }
-        // Separate immutable menu navigation from gameplay keys.
-        if(menu && keys) {
+        // Separate immutable menu navigation from gameplay keys (only while a menu has the screen:
+        // menu_pointer_navigating).
+        const bool navigating=menu && menu_pointer_navigating();
+        if(navigating && keys) {
             for(int i=kBindLookU;i<=kBindLookR;i++)held[i]=false;
             if(keys[SDL_SCANCODE_UP]||held[kBindMoveF])p.buttons|=0x10;
             if(keys[SDL_SCANCODE_DOWN]||held[kBindMoveB])p.buttons|=0x40;
@@ -178,7 +180,7 @@ extern "C" int bbgpu_pc_input(BbPcPad* d,const bool* keys,int nkeys,int gamepad_
             if(s.mouse_menu){
                 if(edges&1)menu_pointer_click();
                 if(edges&SDL_BUTTON_RMASK)p.buttons|=menu_back_button();
-                if(scroll>0)p.buttons|=0x10;if(scroll<0)p.buttons|=0x40;
+                if(navigating && scroll>0)p.buttons|=0x10;if(navigating && scroll<0)p.buttons|=0x40;
                 p.buttons|=menu_pointer_take_press();
             }
         }else {

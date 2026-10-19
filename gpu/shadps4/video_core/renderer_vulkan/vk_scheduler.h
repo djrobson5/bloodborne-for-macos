@@ -19,6 +19,7 @@
 #include <thread>
 #include <queue>
 
+#include "bbport_copy.h"
 #include "bbport_toggles.h"
 #include "common/assert.h"
 #include "common/interval_set.h"
@@ -601,6 +602,37 @@ struct SubmissionBatch {
 class RecordChunk {
 public:
     static constexpr size_t Capacity = 128 * 1024;
+    /// Room kept free in the chunk for the command that consumes reserved data.
+    static constexpr size_t CommandReserve = 1024;
+
+    /// Makes room for `bytes` of Allocate() data. Groups that fit stay inline (no allocation);
+    /// a group larger than an empty chunk (e.g. thousands of buffer copies or barriers) gets
+    /// one uninitialized heap block owned by this chunk, freed when the chunk is recycled, so
+    /// no span outlives the commands that read it. False: retire this chunk and retry.
+    /// Ported from AwesomeObserver/bloodborne_pc 54bd756 (Evgeniy Doronin, GPL-2.0-or-later);
+    /// it replaces an ASSERT that ended the game with exit code 23.
+    bool ReserveData(size_t bytes) {
+        const size_t remaining = Capacity - used;
+        if (remaining < CommandReserve) {
+            return false;
+        }
+        if (spill_remaining >= bytes) {
+            return true;
+        }
+        if (bytes <= remaining - CommandReserve) {
+            spill_cursor = nullptr;
+            spill_remaining = 0;
+            return true;
+        }
+        if (bytes <= Capacity - CommandReserve) {
+            return false;
+        }
+        std::unique_ptr<std::byte[]> block{new std::byte[bytes]};
+        spill_cursor = block.get();
+        spill_remaining = bytes;
+        spill_blocks.push_back(std::move(block));
+        return true;
+    }
 
     /// Returns false (and leaves `func` untouched) when the chunk has no room.
     template <typename Func>
@@ -625,8 +657,19 @@ public:
 
     /// Raw storage in the chunk for a command's variable-length data; null when full.
     void* Allocate(size_t bytes, size_t align) {
+        if (spill_cursor) {
+            void* result = spill_cursor;
+            size_t remaining = spill_remaining;
+            if (!std::align(align, bytes, result, remaining)) {
+                return nullptr;
+            }
+            spill_used += spill_remaining - remaining + bytes;
+            spill_cursor = static_cast<std::byte*>(result) + bytes;
+            spill_remaining = remaining - bytes;
+            return result;
+        }
         const size_t offset = (used + align - 1) & ~(align - 1);
-        if (offset + bytes > Capacity) {
+        if (offset > Capacity || bytes > Capacity - offset) {
             return nullptr;
         }
         used = offset + bytes;
@@ -643,6 +686,9 @@ public:
         }
         first = last = nullptr;
         used = 0;
+        spill_cursor = nullptr;
+        spill_remaining = spill_used = 0;
+        spill_blocks.clear();
     }
 
     [[nodiscard]] bool Empty() const noexcept {
@@ -650,7 +696,7 @@ public:
     }
 
     [[nodiscard]] size_t Size() const noexcept {
-        return used;
+        return used + spill_used;
     }
 
     u32 segment = 0; ///< the command buffer segment the chunk is recorded into (Scheduler)
@@ -687,6 +733,9 @@ private:
 
     alignas(64) std::byte storage[Capacity];
     size_t used = 0;
+    std::vector<std::unique_ptr<std::byte[]>> spill_blocks; ///< oversized data (ReserveData)
+    std::byte* spill_cursor = nullptr;
+    size_t spill_remaining = 0, spill_used = 0;
     CommandBase* first{};
     CommandBase* last{};
 };
@@ -812,9 +861,9 @@ public:
             func(current_cmdbuf);
             return;
         }
-        if (!record_chunk->Push(std::forward<Func>(func))) {
+        if (!CurrentChunk().Push(std::forward<Func>(func))) {
             RetireChunk();
-            const bool pushed = record_chunk->Push(std::forward<Func>(func));
+            const bool pushed = CurrentChunk().Push(std::forward<Func>(func));
             ASSERT(pushed);
         }
     }
@@ -861,12 +910,15 @@ public:
     /// Makes room for `bytes` of RecordData() plus the command that uses them in the current
     /// chunk: data and command must share a chunk, which is recycled once executed.
     void ReserveRecordData(size_t bytes) {
+        ProducerScope producer{*this, "ReserveRecordData"};
         if (!IsRecordingDeferred()) {
             return;
         }
-        ASSERT(bytes + 1024 <= RecordChunk::Capacity);
-        if (RecordChunk::Capacity - record_chunk->Size() < bytes + 1024) {
+        // Oversized groups spill into a block owned by the chunk (AwesomeObserver 54bd756).
+        if (!record_chunk->ReserveData(bytes)) {
             RetireChunk();
+            const bool reserved = record_chunk->ReserveData(bytes);
+            ASSERT_MSG(reserved, "Cannot reserve {} bytes in an empty recording chunk", bytes);
         }
     }
 
@@ -882,6 +934,7 @@ public:
         const size_t bytes = data.size_bytes();
         ReserveRecordData(bytes + alignof(T));
         auto* dst = static_cast<T*>(record_chunk->Allocate(bytes, alignof(T)));
+        ASSERT_MSG(dst, "Cannot allocate {} recorded bytes, alignment {}", bytes, alignof(T));
         std::memcpy(dst, data.data(), bytes);
         return {dst, data.size()};
     }
@@ -898,8 +951,8 @@ public:
     /// bbport: guest memory copies on the recording thread (small ones, RecordHostCopy) or the
     /// copy threads (BbCopy::Async) must be done before the guest learns the GPU is past them
     /// (it may then rewrite the memory, e.g. UI vertices: flickering) and before the
-    /// submission that reads them. Waits for all.
-    void WaitHostCopies();
+    /// submission that reads them. Waits for all. `site`: the caller (BbStats::WaitSite).
+    void WaitHostCopies(u32 site = BbStats::WaitOther);
 
     /// bbport: guest memory [address, address + size) a host copy issued now will read (the
     /// source of a deferred upload or rename). WaitHostCopiesFor waits only for these.
@@ -908,7 +961,7 @@ public:
     /// write there (the command processor's WRITE_DATA/DMA) must not change what they copy.
     /// Writes elsewhere do not wait (the hardware's command processor writes do not wait for
     /// earlier draws either).
-    void WaitHostCopiesFor(u64 address, u64 size);
+    void WaitHostCopiesFor(u64 address, u64 size, u32 site = BbStats::WaitOther);
 
     /// Runs `copy` on a recording thread in order with the commands, the other host copies and
     /// the signals of SignalAfterHostCopies (the threads spin for work anyway, so small copies cost no wakeup);
@@ -923,14 +976,66 @@ public:
 
     /// bbport: runs `signal` once the guest memory copies issued so far are done, without
     /// waiting here: the recording thread reaches it after the copies queued before it and hands
-    /// it to the copy threads' completion (BbCopy::AfterCopies).
-    void SignalAfterHostCopies(std::function<void()> signal);
+    /// it to the copy threads' completion (BbCopy::AfterCopies). `signal` goes into the ordered
+    /// chunk as it is (no std::function allocated on this thread: ~450 fences a frame on the
+    /// draw recording thread). `kick` false: the caller queues another one right after this one,
+    /// which hands both to the recording threads (KickRecording) at once.
+    /// `label`, `label_size`: the guest memory the signal writes (an EOP label); none: a signal
+    /// later guest-visible writes must not overtake at all (WaitDeferredSignalsFor).
+    template <typename Func>
+    void SignalAfterHostCopies(Func&& signal, bool kick = true, u64 label = 0,
+                               u32 label_size = 0) {
+        // A direct segment queues it too: signals queued before it must not be overtaken.
+        if (!IsRecordingDeferred() && !direct_segment) {
+            WaitHostCopies();
+            signal();
+            return;
+        }
+        BbCopy::FlushBatch();
+        const u64 seq = deferred_signals_issued.fetch_add(1, std::memory_order_relaxed) + 1;
+        NoteDeferredLabel(label, label_size, seq);
+        RecordOrdered([signal = std::forward<Func>(signal),
+                       done = deferred_signals_done]() mutable {
+            BbCopy::AfterCopies([signal = std::move(signal), done = std::move(done)]() mutable {
+                signal();
+                done->fetch_add(1, std::memory_order_release);
+            });
+        });
+        if (kick) {
+            KickRecording(true);
+        }
+    }
 
     /// bbport: before a guest-visible write that is not deferred (WriteData, end-of-shader
     /// fences, flip): waits until every signal handed to SignalAfterHostCopies ran, so that
     /// the write cannot overtake an earlier fence. Otherwise the guest, seeing the later value,
     /// may free memory the earlier fence then writes into (corrupted heap, guest fault).
-    void WaitDeferredSignals();
+    /// `site`: the caller (BbStats::WaitSite).
+    void WaitDeferredSignals(u32 site = BbStats::WaitOther);
+
+    /// bbport BB_FENCE_ORDER=ordered (or experiment bit 8; default all: WaitDeferredSignals): a
+    /// CPU write of the command processor (WriteData, DMA) into [address, address + size),
+    /// reading [src, src + src_size), waits only for the deferred signals the hardware would
+    /// have written before it: those issued before the last point the command processor waited
+    /// for a fence still deferred (NoteSignalBarrier), signals without a known label, and the
+    /// fences writing the same memory. On the PS4 the command processor runs WRITE_DATA when it
+    /// reaches it and an EOP label lands at the end of the pipe, later, unless a WAIT_REG_MEM on
+    /// it came in between.
+    void WaitDeferredSignalsFor(u32 site, u64 address, u64 size, u64 src = 0, u64 src_size = 0);
+
+    /// Records the point where the command processor waited for a fence that is still deferred
+    /// (a WaitRegMem met through Liverpool::PendingFenceValue): writes after it follow every
+    /// signal issued so far.
+    void NoteSignalBarrier() {
+        signal_barrier.store(deferred_signals_issued.load(std::memory_order_relaxed),
+                             std::memory_order_relaxed);
+    }
+
+    /// BB_FENCE_ORDER=ordered or experiment bit 8: WaitDeferredSignalsFor waits only for what it
+    /// must. FenceOrderPossible: it may be switched on while the game runs (BB_TOGGLE_FILE), so the
+    /// barriers are recorded all along.
+    [[nodiscard]] static bool FenceOrderScoped();
+    [[nodiscard]] static bool FenceOrderPossible();
 
     /// Whether a render pass with exactly this state is open.
     [[nodiscard]] bool IsRenderingWith(const RenderState& state) const {
@@ -1011,12 +1116,32 @@ private:
 
     std::unique_ptr<RecordChunk> AcquireChunk();
 
-    /// Moves the full current chunk aside; a new one takes its place.
+    /// Moves the full current chunk aside; a new one takes its place (swapped in: never null).
     void RetireChunk() {
         ProducerScope producer{*this, "RetireChunk"};
-        segment_bytes += record_chunk->Size();
-        full_chunks.push_back(std::move(record_chunk));
-        record_chunk = AcquireChunk();
+        auto full = AcquireChunk();
+        record_chunk.swap(full);
+        if (full) {
+            segment_bytes += full->Size();
+            full_chunks.push_back(std::move(full));
+        }
+    }
+
+    /// The current chunks, never null: replacements are swapped in (RetireChunk, HandOver), so
+    /// a fault handler that records on this thread while one is replaced still finds one; a
+    /// null one is replaced here. From deadinside28/bloodborne_pc 10baf9d (issue #100: a read
+    /// of RecordChunk::Capacity at address 0x20000 on a Windows build).
+    RecordChunk& CurrentChunk() {
+        if (!record_chunk) [[unlikely]] {
+            record_chunk = AcquireChunk();
+        }
+        return *record_chunk;
+    }
+    RecordChunk& OrderedChunk() {
+        if (!ordered_chunk) [[unlikely]] {
+            ordered_chunk = AcquireChunk();
+        }
+        return *ordered_chunk;
     }
 
     /// Waits for the recording threads, then records on this thread into the current segment's
@@ -1058,10 +1183,11 @@ private:
             return;
         }
         auto command = [func = std::forward<Func>(func)](vk::CommandBuffer) mutable { func(); };
-        if (!ordered_chunk->Push(std::move(command))) {
-            ordered_full.push_back(std::move(ordered_chunk));
-            ordered_chunk = AcquireChunk();
-            const bool pushed = ordered_chunk->Push(std::move(command));
+        if (!OrderedChunk().Push(std::move(command))) {
+            auto full = AcquireChunk();
+            ordered_chunk.swap(full);
+            ordered_full.push_back(std::move(full));
+            const bool pushed = OrderedChunk().Push(std::move(command));
             ASSERT(pushed);
         }
     }
@@ -1077,6 +1203,14 @@ private:
     void SubmitExecution(SubmitInfo& info);
 
     void PriorityPendingOpsThread(std::stop_token stoken);
+
+    /// bbport: the label a deferred signal writes (SignalAfterHostCopies), for
+    /// WaitDeferredSignalsFor; none: everything after it waits for it.
+    void NoteDeferredLabel(u64 label, u32 label_size, u64 seq);
+    /// The newest pending signal (sequence above `done`) whose label overlaps the range; 0: none.
+    [[nodiscard]] u64 NewestLabelOverlap(u64 done, u64 address, u64 size) const;
+    /// Waits until the first `need` deferred signals ran.
+    void WaitDeferredSignalsUpTo(u64 need, u32 site);
 
 private:
     const Instance& instance;
@@ -1156,6 +1290,19 @@ private:
     std::atomic<const char*> producer_where{nullptr}; ///< and where
     std::shared_ptr<std::atomic<u64>> deferred_signals_done =
         std::make_shared<std::atomic<u64>>(0);
+    /// bbport (WaitDeferredSignalsFor): signals issued before the last command processor wait on a
+    /// deferred fence, or before the last signal without a label.
+    std::atomic<u64> signal_barrier{0};
+    /// Labels of the last deferred signals (the thread issuing them, A or B, as the signals).
+    struct DeferredLabel {
+        u64 address = 0;
+        u64 size = 0;
+        u64 seq = 0;
+    };
+    static constexpr u32 DeferredLabels = 256;
+    std::array<DeferredLabel, DeferredLabels> deferred_labels{};
+    u64 deferred_label_count = 0;
+    u64 deferred_label_lost = 0; ///< the newest signal whose entry was overwritten
     tracy::VkCtxScope* profiler_scope{};
 };
 

@@ -606,15 +606,29 @@ Slider camera[] = {
 bool seeded=false;
 bool camera_page=false,graphics_page=false,input_page=false;
 Slider graphics_sliders[]={{nullptr,117007,0,0.2f,5},{nullptr,117006,1,0.2f,0}};
-Slider effect_sliders[]={{nullptr,120000,0,0.1f,10},{nullptr,120002,0,0.2f,5}};
+Slider effect_sliders[]={{nullptr,120000,0,0.1f,10}};
+Slider fog_slider[]={{nullptr,117008,0,0.1f,10}};  // after the output list: the list stays row 4
+// Brightness, contrast, saturation and hue (bbport): 5 is the area's own.
+Slider color_sliders[]={{nullptr,125000,0.5f,0.1f,5},{nullptr,125001,0.95f,0.01f,5},{nullptr,125002,0,0.2f,5},
+                        {nullptr,125003,-20.0f,4.0f,5}};
 struct StartupToggle { std::atomic<bool>* setting=nullptr; std::uint32_t id; std::uint8_t value=0,last=0; };
+StartupToggle color_toggle[]={{nullptr,125004}};  // Picture tuning, live
+bool color_seeded=false;
 StartupToggle enhancements[]={{nullptr,124001},{nullptr,124002},{nullptr,124004}};
 bool enhancements_seeded=false;
 StartupToggle graphics_toggles[]={{nullptr,117001},{nullptr,117000}};
 StartupToggle effect_toggles[]={{nullptr,117005},{nullptr,117002},{nullptr,117003},{nullptr,120001}};
 bool graphics_seeded=false,effects_seeded=false;
 std::int32_t output_resolution=1,last_resolution=1;
-const Choice outputs[]={{0,117010},{1,117012},{2,117013},{3,117015},{4,117040},{5,117041},{6,117042},{7,117043},{8,117044},{9,117045}};
+const Choice outputs[]={{0,117010},{1,117012},{2,117013},{3,117015},{4,117040},{5,117041},{6,117042},{7,117043},{8,117044},{9,117045},{10,117046},{11,117047}};
+static_assert(sizeof(outputs)/sizeof(outputs[0])==BbSettings::OutputCount);
+// What "Defaults" puts a toggle back to: an effect's own default (bbport_settings.h Effects: CA,
+// DoF, motion blur and the game's AA are off), on for the others (vignette).
+std::uint8_t DefaultOf(const std::atomic<bool>* setting) {
+    for (int e=0;e<BbSettings::EffectCount;++e)
+        if (setting==&BbSettings::Get().effects[e]) return BbSettings::Effects[e].default_on?1:0;
+    return 1;
+}
 template<typename Rows> void SeedSliders(Rows& rows) {
     for (auto& s:rows) s.value=s.last=static_cast<std::uint8_t>(std::clamp(std::lround((s.setting->load()-s.base)/s.step),0l,10l));
 }
@@ -657,21 +671,32 @@ GUEST_ABI void GraphicsHandler(void* dialog,void* params) {
     host_log("pc-options: PCGraphics opened, dialog=%p params=%p",dialog,params);
     alignas(16) std::uint8_t scratch[0x100]{};
     hle_call_guest<std::int64_t>(guest_fn(kScratchInit),&scratch);
-    for (auto& t:graphics_toggles) { t.value=t.last=t.setting->load()?1:0;add_toggle_row(dialog,&t.value,t.id,1); }
+    for (auto& t:graphics_toggles) { t.value=t.last=t.setting->load()?1:0;add_toggle_row(dialog,&t.value,t.id,DefaultOf(t.setting)); }
     SeedSliders(graphics_sliders);
     for (auto& s:graphics_sliders) add_slider_row(dialog,&s.value,s.id,s.def);
     output_resolution=last_resolution=BbSettings::Get().output_res;
     add_list_row(dialog,&output_resolution,117004,outputs,BbSettings::OutputCount,BbSettings::OutputDefault);
-    graphics_seeded=true;log_rows("PCGraphics",dialog,5,5);
+    SeedSliders(fog_slider);
+    for (auto& s:fog_slider) add_slider_row(dialog,&s.value,s.id,s.def);
+    graphics_seeded=true;log_rows("PCGraphics",dialog,6,6);
 }
 GUEST_ABI void EffectsHandler(void* dialog,void* params) {
     host_log("pc-options: PCEffects opened, dialog=%p params=%p",dialog,params);
     alignas(16) std::uint8_t scratch[0x100]{};
     hle_call_guest<std::int64_t>(guest_fn(kScratchInit),&scratch);
-    for (auto& t:effect_toggles) { t.value=t.last=t.setting->load()?1:0;add_toggle_row(dialog,&t.value,t.id,1); }
+    for (auto& t:effect_toggles) { t.value=t.last=t.setting->load()?1:0;add_toggle_row(dialog,&t.value,t.id,DefaultOf(t.setting)); }
     SeedSliders(effect_sliders);
     for (auto& s:effect_sliders) add_slider_row(dialog,&s.value,s.id,s.def);
-    effects_seeded=true;log_rows("PCEffects",dialog,6,6);
+    effects_seeded=true;log_rows("PCEffects",dialog,5,5);
+}
+GUEST_ABI void ColorHandler(void* dialog,void* params) {
+    host_log("pc-options: PCColour opened, dialog=%p params=%p",dialog,params);
+    alignas(16) std::uint8_t scratch[0x100]{};
+    hle_call_guest<std::int64_t>(guest_fn(kScratchInit),&scratch);
+    for (auto& t:color_toggle) { t.value=t.last=t.setting->load()?1:0;add_toggle_row(dialog,&t.value,t.id,0); }
+    SeedSliders(color_sliders);
+    for (auto& s:color_sliders) add_slider_row(dialog,&s.value,s.id,s.def);
+    color_seeded=true;log_rows("PCColour",dialog,5,5);
 }
 GUEST_ABI std::int64_t OpenGraphics(void* root,void* params) {
     return open_named(root,params,"PCGraphics",reinterpret_cast<void*>(&GraphicsHandler),4);
@@ -687,9 +712,22 @@ GUEST_ABI void* OpenEffectsRow(void* out,void* ctx) {
     GuestFunction f(kOpenerFunctorVTable,reinterpret_cast<void*>(&OpenEffects));
     hle_call_guest<std::int64_t>(guest_fn(kOpenSectionFlow),out,ctx,f.buf);return out;
 }
+GUEST_ABI std::int64_t OpenColor(void* root,void* params) {
+    return open_named(root,params,"PCColour",reinterpret_cast<void*>(&ColorHandler),-1);
+}
+GUEST_ABI void* OpenColorRow(void* out,void* ctx) {
+    GuestFunction f(kOpenerFunctorVTable,reinterpret_cast<void*>(&OpenColor));
+    hle_call_guest<std::int64_t>(guest_fn(kOpenSectionFlow),out,ctx,f.buf);return out;
+}
 
 StartupToggle controls[]={{nullptr,118000},{nullptr,118002},{nullptr,118003},{nullptr,116002},{nullptr,118005}};
 std::uint8_t sensitivity=5,last_sensitivity=5;bool controls_seeded=false;
+// Button Prompts (engine/key_prompts.h): BbSettings::ButtonPrompts.
+std::int32_t prompts=0,last_prompts=0;
+const Choice prompt_choices[]={{BbSettings::PromptsAuto,118010},{BbSettings::PromptsKeyboard,118011},{BbSettings::PromptsController,118012}};
+// Controller Icons: BbSettings::PadIcons.
+std::int32_t pad_icons=0,last_pad_icons=0;
+const Choice pad_icon_choices[]={{BbSettings::PadIconsAuto,118013},{BbSettings::PadIconsPlayStation,118014},{BbSettings::PadIconsXbox,118015}};
 GUEST_ABI void ControlsHandler(void* dialog,void*) {
     alignas(16) std::uint8_t scratch[0x100]{};hle_call_guest<std::int64_t>(guest_fn(kScratchInit),&scratch);
     auto& s=BbSettings::Get();sensitivity=last_sensitivity=s.mouse_sensitivity;
@@ -697,9 +735,13 @@ GUEST_ABI void ControlsHandler(void* dialog,void*) {
     add_toggle_row(dialog,&controls[0].value,118000,1);
     add_slider_row(dialog,&sensitivity,118001,5);
     for(int i=1;i<5;i++)add_toggle_row(dialog,&controls[i].value,controls[i].id,i==3?1:0);
-    controls_seeded=true;log_rows("PCControls",dialog,6,6);
+    prompts=last_prompts=s.button_prompts;
+    add_list_row(dialog,&prompts,118006,prompt_choices,BbSettings::PromptsCount,BbSettings::PromptsAuto);
+    pad_icons=last_pad_icons=s.pad_icons;
+    add_list_row(dialog,&pad_icons,118007,pad_icon_choices,BbSettings::PadIconsCount,BbSettings::PadIconsAuto);
+    controls_seeded=true;log_rows("PCControls",dialog,8,8);
 }
-GUEST_ABI std::int64_t OpenControls(void* root,void* params) {return open_named(root,params,"PCControls",reinterpret_cast<void*>(&ControlsHandler),-1);}
+GUEST_ABI std::int64_t OpenControls(void* root,void* params) {return open_named(root,params,"PCControls",reinterpret_cast<void*>(&ControlsHandler),-2);}
 GUEST_ABI std::int64_t OpenKeys(void* root,void* params) {return open_named(root,params,"PCKeys",reinterpret_cast<void*>(&pc_keys_handler),-2);}
 GUEST_ABI void* OpenControlsRow(void* out,void* ctx) {GuestFunction f(kOpenerFunctorVTable,reinterpret_cast<void*>(&OpenControls));hle_call_guest<std::int64_t>(guest_fn(kOpenSectionFlow),out,ctx,f.buf);return out;}
 GUEST_ABI void* OpenKeysRow(void* out,void* ctx) {GuestFunction f(kOpenerFunctorVTable,reinterpret_cast<void*>(&OpenKeys));hle_call_guest<std::int64_t>(guest_fn(kOpenSectionFlow),out,ctx,f.buf);return out;}
@@ -712,6 +754,8 @@ GUEST_ABI void* SystemFinalize(void* out,void* builder,void* arg3) {
           hle_call_guest<std::int64_t>(guest_fn(kAddCommandRow),builder,c.buf,f.buf,&flag); }
         { Captions c(110010);GuestFunction f(kRowFunctorVTable,reinterpret_cast<void*>(&OpenEffectsRow));
           hle_call_guest<std::int64_t>(guest_fn(kAddCommandRow),builder,c.buf,f.buf,&flag); }
+        { Captions c(110014);GuestFunction f(kRowFunctorVTable,reinterpret_cast<void*>(&OpenColorRow));
+          hle_call_guest<std::int64_t>(guest_fn(kAddCommandRow),builder,c.buf,f.buf,&flag); }
     }
     if(input_page) {
         {Captions c(110008);GuestFunction f(kRowFunctorVTable,reinterpret_cast<void*>(&OpenControlsRow));hle_call_guest<std::int64_t>(guest_fn(kAddCommandRow),builder,c.buf,f.buf,&flag);}
@@ -720,7 +764,7 @@ GUEST_ABI void* SystemFinalize(void* out,void* builder,void* arg3) {
     if (camera_page) { Captions c(110011);GuestFunction f(kRowFunctorVTable,reinterpret_cast<void*>(&OpenCameraRow));
       hle_call_guest<std::int64_t>(guest_fn(kAddCommandRow),builder,c.buf,f.buf,&flag); }
     hle_call_guest<std::int64_t>(guest_fn(kSystemFinalize),out,builder,arg3);
-    host_log("pc-options: System list includes PC Enhancements%s%s",graphics_page?", PC Graphics / PC Effects":"",camera_page?", PC Camera":"");
+    host_log("pc-options: System list includes PC Enhancements%s%s",graphics_page?", PC Graphics / PC Effects / PC Colour":"",camera_page?", PC Camera":"");
     return out;
 }
 } // namespace
@@ -783,7 +827,10 @@ bool Install(std::uint8_t* image,std::size_t size) {
     graphics_sliders[0].setting=&settings.graphics_ao_strength;graphics_sliders[1].setting=&settings.graphics_shadow_scale;
     effect_toggles[0].setting=&settings.effects[2];effect_toggles[1].setting=&settings.effects[1];
     effect_toggles[2].setting=&settings.effects[0];effect_toggles[3].setting=&settings.graphics_vignette;
-    effect_sliders[0].setting=&settings.graphics_bloom;effect_sliders[1].setting=&settings.graphics_saturation;
+    effect_sliders[0].setting=&settings.graphics_bloom;fog_slider[0].setting=&settings.graphics_fog;
+    color_sliders[0].setting=&settings.graphics_brightness;color_sliders[1].setting=&settings.graphics_contrast;
+    color_sliders[2].setting=&settings.graphics_saturation;color_sliders[3].setting=&settings.graphics_hue;
+    color_toggle[0].setting=&settings.graphics_controls;
     enhancements[0].setting=&settings.change_appearance;
     enhancements[1].setting=&settings.rebirth;
     enhancements[2].setting=&settings.camera_controls;
@@ -797,7 +844,7 @@ bool Install(std::uint8_t* image,std::size_t size) {
     std::memcpy(p,&target,8); p+=8; *p++=0x41; *p++=0xff; *p=0xe3;
     const std::int32_t to_pad=pad-(call+5); std::memcpy(image+call+1,&to_pad,4);
     g_installed=true;
-    host_log("pc-options: native System pages installed (%u local assets): Enhancements%s%s",installed,graphics_page?", Graphics / Effects":"",camera_page?", Camera":"");
+    host_log("pc-options: native System pages installed (%u local assets): Enhancements%s%s",installed,graphics_page?", Graphics / Effects / Colour":"",camera_page?", Camera":"");
     return true;
 }
 bool ClickDecides(std::uint8_t* list, int index) {
@@ -850,17 +897,31 @@ void Tick() {
         changed=true;
     }
     auto push_sliders=[&](auto& rows,bool active) {
-        if (!active) return;
-        for (auto& s:rows) if (s.value!=s.last) { s.last=std::min<std::uint8_t>(s.value,10);*s.setting=s.base+s.last*s.step;changed=true; }
+        bool moved=false;
+        if (!active) return moved;
+        for (auto& s:rows) if (s.value!=s.last) { s.last=std::min<std::uint8_t>(s.value,10);*s.setting=s.base+s.last*s.step;changed=moved=true; }
+        return moved;
     };
     auto push_toggles=[&](auto& rows,bool active) {
-        if (!active) return;
-        for (auto& t:rows) if (t.value!=t.last) { t.last=t.value;*t.setting=t.value!=0;changed=true; }
+        bool moved=false;
+        if (!active) return moved;
+        for (auto& t:rows) if (t.value!=t.last) { t.last=t.value;*t.setting=t.value!=0;changed=moved=true; }
+        return moved;
     };
-    push_sliders(graphics_sliders,graphics_seeded);push_sliders(effect_sliders,effects_seeded);
+    // Picture tuning gates the picture settings (engine/graphics.cpp), live: moving one of them
+    // turns it on, and its own switch is on PC Colour.
+    push_toggles(color_toggle,color_seeded);
+    bool picture=push_sliders(graphics_sliders,graphics_seeded);picture|=push_sliders(effect_sliders,effects_seeded);
+    picture|=push_sliders(fog_slider,graphics_seeded);picture|=push_sliders(color_sliders,color_seeded);
     push_toggles(controls,controls_seeded);
     if(controls_seeded && sensitivity!=last_sensitivity){last_sensitivity=std::min<std::uint8_t>(sensitivity,10);BbSettings::Get().mouse_sensitivity=last_sensitivity;changed=true;}
-    push_toggles(graphics_toggles,graphics_seeded);push_toggles(effect_toggles,effects_seeded);
+    if(controls_seeded && prompts!=last_prompts){last_prompts=std::clamp(prompts,0,BbSettings::PromptsCount-1);BbSettings::Get().button_prompts=last_prompts;changed=true;}
+    if(controls_seeded && pad_icons!=last_pad_icons){last_pad_icons=std::clamp(pad_icons,0,BbSettings::PadIconsCount-1);BbSettings::Get().pad_icons=last_pad_icons;changed=true;}
+    picture|=push_toggles(graphics_toggles,graphics_seeded);picture|=push_toggles(effect_toggles,effects_seeded);
+    if (picture && !BbSettings::Get().graphics_controls) {
+        BbSettings::Get().graphics_controls=true;
+        for (auto& t:color_toggle) t.value=t.last=1;
+    }
     if (graphics_seeded && output_resolution!=last_resolution) {
         last_resolution=std::clamp(output_resolution,0,BbSettings::OutputCount-1);
         BbSettings::Get().output_res=last_resolution;changed=true;

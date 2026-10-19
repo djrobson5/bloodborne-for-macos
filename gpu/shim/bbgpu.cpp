@@ -8,6 +8,7 @@
 #include <sys/resource.h>
 #endif
 #include "bbport_free_check.h"
+#include "bbport_sampler.h"
 #include "bbport_toggles.h"
 #include "engine/engine_hooks.h"
 #include <algorithm>
@@ -29,6 +30,7 @@
 #include "common/elf_info.h"
 #include "common/logging/log.h"
 #include "common/rdtsc.h"
+#include "common/signal_context.h"
 #include "core/libraries/kernel/orbis_error.h"
 #include "core/libraries/libs.h"
 #include "core/emulator_settings.h"
@@ -55,7 +57,9 @@ int32_t* runtime_errno(void);
 void runtime_memory_set_gpu_hooks(RuntimeGpuRange map, RuntimeGpuRange unmap, RuntimeGpuRange invalidate);
 void runtime_memory_set_note_write_hook(RuntimeGpuRange note);
 void runtime_memory_set_cpu_write_hook(RuntimeGpuRange hook);
+int runtime_memory_restore_access(void* context, uintptr_t address, int repeated);
 }
+namespace Shader { void RegisterSrtFaultHandler(); }
 
 Frontend::WindowSDL* g_window = nullptr;
 
@@ -186,6 +190,10 @@ u64 MemoryManager::ClampRangeSize(VAddr virtual_addr, u64 size) {
     }
     return runtime_memory_clamp(virtual_addr, size);
 }
+bool MemoryManager::IsValidMapping(VAddr virtual_addr, u64 size) {
+    const u64 wanted = size ? size : 1;
+    return virtual_addr && runtime_memory_clamp(virtual_addr, wanted) >= wanted;
+}
 static void CopySparseSerial(VAddr source, u8* dest, u64 size) {
     // BB_READBACKS=2 protects GPU-written pages against reads: the copy threads and recorders
     // read through the backing view, as a read fault on them would wait for the GPU thread,
@@ -274,8 +282,29 @@ bool g_window_ready;
 } // namespace
 
 #ifdef BB_PGO_GENERATE
+#ifdef __clang__
+// bbport: clang's profile runtime (IR instrumentation, .profraw). __gcov_dump links there too
+// but writes only gcov data (none here): the profile was written at a normal exit only. With
+// -fprofile-generate=<dir> the file is default_%m.profraw and each write merges into it, hence
+// the reset after it.
+extern "C" int __llvm_profile_write_file(void);
+extern "C" void __llvm_profile_reset_counters(void);
+static void ProfileDump() {
+    __llvm_profile_write_file();
+}
+static void ProfileReset() {
+    __llvm_profile_reset_counters();
+}
+#else
 extern "C" void __gcov_dump(void);
 extern "C" void __gcov_reset(void);
+static void ProfileDump() {
+    __gcov_dump();
+}
+static void ProfileReset() {
+    __gcov_reset();
+}
+#endif
 // Instrumented build (BB_PGO=generate): the game often ends through _exit (watchdog, guest
 // exit), which skips the profile write at exit. Write every 30 s and reset: the files sum the
 // intervals.
@@ -284,8 +313,8 @@ static void StartProfileWriter() {
         Common::SetCurrentThreadName("bb:pgo");
         for (;;) {
             std::this_thread::sleep_for(std::chrono::seconds(30));
-            __gcov_dump();
-            __gcov_reset();
+            ProfileDump();
+            ProfileReset();
             std::printf("PGO: profile written\n");
         }
     }).detach();
@@ -294,9 +323,13 @@ static void StartProfileWriter() {
 
 extern "C" int bbgpu_init(const BbGpuConfig* config) {
     BbSettings::Load();
+    // The fault handlers are registered before any guest thread runs: the registry is a std::set
+    // the fault handler walks without a lock (the SRT walker's was added at the first shader).
+    Shader::RegisterSrtFaultHandler();
 #ifdef BB_PGO_GENERATE
     StartProfileWriter();
 #endif
+    BbSampler::Start(); // BB_SAMPLE_THREADS: where loading time goes
     g_sdk_version = config->sdk_version;
 #ifdef _WIN32
     if (config->user_dir && !std::getenv("BB_GPU_USER_DIR")) _putenv_s("BB_GPU_USER_DIR", config->user_dir);
@@ -322,6 +355,20 @@ extern "C" int bbgpu_init(const BbGpuConfig* config) {
         // _Exit skips renderer destructors. Snapshot completed pipeline work and drain its
         // asynchronous cache writes before terminating; no gameplay queue waits are added.
         Vulkan::PipelineCache::SaveAllForShutdown();
+        // bbport: give the display back before terminating (_Exit skips SDL's cleanup): leave
+        // fullscreen and hide the window, on this thread, which owns it. It is not destroyed:
+        // the present thread may still be presenting to its Vulkan surface, and a window
+        // destroyed under a live swapchain fails the next present or recreate (an assert,
+        // exit 23). A window call that blocks cannot hold the exit up: the watchdog ends it.
+        std::thread([] {
+            std::this_thread::sleep_for(std::chrono::seconds(2));
+            std::fflush(stdout);
+            std::_Exit(0);
+        }).detach();
+        if (SDL_Window* sdl_window = window->GetSDLWindow()) {
+            SDL_SetWindowFullscreen(sdl_window, false);
+            SDL_HideWindow(sdl_window);
+        }
         std::fflush(stdout);
         std::_Exit(0);
     });
@@ -364,6 +411,36 @@ extern "C" uintptr_t bbgpu_resolve(const char* scoped_nid) {
     return 0;
 }
 
+namespace {
+// bbport: the same access (instruction and address) faulting again within microseconds, many
+// times in a row: the tracking claimed the fault but left the page protected, and the thread
+// would retry forever. A write the game repeats each frame comes milliseconds apart.
+struct RepeatedFault {
+    u64 rip = 0, address = 0, last_tsc = 0;
+    u32 count = 0;
+};
+thread_local RepeatedFault repeated_fault;
+
+bool FaultRepeats(void* ucontext, void* address) {
+    constexpr u64 RepeatCycles = 4'000'000; // ~1 ms
+    constexpr u32 RepeatLimit = 64;
+    auto& r = repeated_fault;
+    const u64 rip = reinterpret_cast<u64>(Common::GetRip(ucontext));
+    const u64 now = Common::FencedRDTSC();
+    if (rip != r.rip || reinterpret_cast<u64>(address) != r.address ||
+        now - r.last_tsc > RepeatCycles) {
+        r = {rip, reinterpret_cast<u64>(address), now, 0};
+        return false;
+    }
+    r.last_tsc = now;
+    if (++r.count < RepeatLimit) {
+        return false;
+    }
+    r.count = 0;
+    return true;
+}
+} // namespace
+
 extern "C" int bbgpu_handle_fault(void* ucontext, void* address) {
     // BB_LABEL_TRAP (diagnostic): its read-only label pages first. Not passed on to GPU page
     // tracking (a write fault drains the draw pipe: thousands a second would change the timing
@@ -372,12 +449,23 @@ extern "C" int bbgpu_handle_fault(void* ucontext, void* address) {
         return 1;
     }
     if (Core::Signals::Instance()->DispatchAccessViolation(ucontext, address)) {
+        if (FaultRepeats(ucontext, address)) {
+            runtime_memory_restore_access(ucontext, reinterpret_cast<uintptr_t>(address), 1);
+        }
         return 1;
     }
-    return BbFreeCheck::OnStaleTrapFault(reinterpret_cast<std::uint64_t>(address)) ? 1 : 0;
+    if (BbFreeCheck::OnStaleTrapFault(reinterpret_cast<std::uint64_t>(address))) {
+        return 1;
+    }
+    // bbport: nobody claimed it. A guest page the guest may access but GPU tracking left
+    // protected (a stale protection, a page it no longer knows) gets its access back; ending the
+    // game for it is worse than a GPU copy that may miss a write. Real faults stay unhandled.
+    return runtime_memory_restore_access(ucontext, reinterpret_cast<uintptr_t>(address), 0);
 }
 
+extern "C" void bbnet_set_image(unsigned char* image, uint64_t size);
 extern "C" void bbgpu_patch_image(unsigned char* image, uint64_t size) {
+    bbnet_set_image(image, size); // before the engine's hooks change the code it checks
     BbGnmHooks::PatchImage(image, size);
     BbEngine::Install(image, size);
 }
@@ -406,11 +494,13 @@ static void KernelServiceThread(std::stop_token stoken) {
         {
             std::unique_lock lock{m_asio_req};
             cv_asio_req.wait(lock, stoken, [] { return asio_requests != 0; });
+            // Taken before the run: a request made while it runs (a timer armed after run()
+            // found no work) wakes the next one instead of being cleared after it.
+            asio_requests.exchange(0);
         }
         if (stoken.stop_requested()) break;
         io_context.run();
         io_context.restart();
-        asio_requests = 0;
     }
 }
 

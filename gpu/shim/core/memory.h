@@ -16,6 +16,9 @@ public:
         // The PS4's GPU can only handle 40 bit addresses.
         return virtual_addr + size < 0x100'0000'0000ULL;
     }
+    /// Whether [virtual_addr, +size) is committed, readable guest memory (shadPS4's NP signaling
+    /// diagnostics check it before reading).
+    bool IsValidMapping(VAddr virtual_addr, u64 size = 0);
     u64 ClampRangeSize(VAddr virtual_addr, u64 size);
     void CopySparseMemory(VAddr source, u8* dest, u64 size);
     bool TryWriteBacking(void* address, const void* data, u64 size);

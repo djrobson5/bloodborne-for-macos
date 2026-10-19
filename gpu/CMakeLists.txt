@@ -16,6 +16,14 @@ add_compile_options(-fno-omit-frame-pointer)
 # profile). Covers bbgpu and the static libraries linked into it. No -march: the same build
 # runs on the Steam Deck.
 option(BB_LTO "Link-time optimization of bbgpu" ON)
+# bbport: optional instruction set level (BB_MARCH=x86-64-v2 in build.sh; empty: the compiler's
+# default, x86-64). v2 (SSE4.2, POPCNT, SSSE3, CX16) is a subset of what the game's own code
+# already requires (probe.c check_cpu: AVX, BMI1, LZCNT, POPCNT, SSE4.2, MOVBE), so it shuts out
+# no CPU that can run the game; v3 would (it adds AVX2/BMI2/FMA).
+set(BB_MARCH "" CACHE STRING "-march for bbgpu and its static libraries (empty: default)")
+if (BB_MARCH)
+    add_compile_options(-march=${BB_MARCH})
+endif()
 set(BB_PGO "off" CACHE STRING "Profile-guided optimization: off, generate, use")
 set(BB_PGO_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../pgo" CACHE PATH "Profile directory")
 if (BB_LTO)
@@ -29,9 +37,20 @@ if (BB_LTO)
 endif()
 if (BB_PGO STREQUAL "generate")
     # Atomic counters: the GPU, recording, preparation and copy threads run the same code.
+    # GCC writes .gcda files into BB_PGO_DIR, clang default_<pool>.profraw files (build.sh merges
+    # them into default.profdata with llvm-profdata).
     add_compile_options(-fprofile-generate=${BB_PGO_DIR} -fprofile-update=atomic)
     add_link_options(-fprofile-generate=${BB_PGO_DIR})
     add_compile_definitions(BB_PGO_GENERATE)
+elseif (BB_PGO STREQUAL "use" AND CMAKE_CXX_COMPILER_ID MATCHES "Clang")
+    # bbport: clang (MSYS2 CLANG64 on Windows) reads one merged profile. It has no
+    # -fprofile-partial-training; -pgso=false keeps code the profile never ran from being
+    # optimized for size instead (the closest equivalent). Changed functions are compiled
+    # without profile data (warnings off).
+    add_compile_options(-fprofile-use=${BB_PGO_DIR}/default.profdata
+                        -Wno-profile-instr-missing -Wno-profile-instr-out-of-date
+                        -Wno-profile-instr-unprofiled -Wno-backend-plugin
+                        "SHELL:-mllvm -pgso=false")
 elseif (BB_PGO STREQUAL "use")
     # Partial training keeps unprofiled code optimized normally; counters from concurrent
     # threads can be slightly inconsistent (correction). Functions changed since the profile
@@ -139,6 +158,12 @@ add_host_shader(fs_tri.vert fs_tri_vert)
 add_host_shader(fsr.comp fsr_easu_comp SAMPLE_EASU=1)
 add_host_shader(fsr.comp fsr_rcas_comp SAMPLE_RCAS=1)
 add_host_shader(post_process.frag post_process_frag)
+add_host_shader(hdr_output.frag hdr_output_frag)
+add_host_shader(hdr_native.comp hdr_native_luma_comp LUMA=1)
+add_host_shader(hdr_native.comp hdr_native_stats_comp STATS=1)
+add_host_shader(hdr_native.comp hdr_native_snapshot_comp STATS=1 SNAPSHOT=1)
+add_host_shader(hdr_native.comp hdr_native_exposure_comp EXPOSURE=1)
+add_host_shader(hdr_native.comp hdr_native_gain_comp GAIN=1)
 add_host_shader(camera_motion.comp camera_motion_comp)
 add_host_shader(upscale_merge.comp upscale_merge_comp)
 add_host_shader(upscale_reactive.comp upscale_reactive_comp)
@@ -194,9 +219,13 @@ target_sources(bbgpu PRIVATE third_party/imgui/imgui.cpp third_party/imgui/imgui
     third_party/imgui/backends/imgui_impl_vulkan.cpp)
 target_include_directories(bbgpu PRIVATE third_party/imgui third_party/imgui/backends)
 target_compile_definitions(bbgpu PRIVATE IMGUI_IMPL_VULKAN_NO_PROTOTYPES
-    BB_FONT_PATH="${CMAKE_CURRENT_SOURCE_DIR}/third_party/fonts/DejaVuSans.ttf")
+    BB_FONT_PATH="${CMAKE_CURRENT_SOURCE_DIR}/third_party/fonts/DejaVuSans.ttf"
+    BB_KEYCAP_FONT_PATH="${CMAKE_CURRENT_SOURCE_DIR}/third_party/imgui/misc/fonts/Roboto-Medium.ttf")
 set_source_files_properties(shim/bbport_overlay.cpp PROPERTIES
     OBJECT_DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/third_party/fonts/DejaVuSans.ttf)
+# Keyboard prompts' keycaps (shim/engine/keycap_art.cpp): Roboto Medium (Apache License 2.0).
+set_source_files_properties(shim/engine/keycap_art.cpp PROPERTIES
+    OBJECT_DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/third_party/imgui/misc/fonts/Roboto-Medium.ttf)
 target_include_directories(bbgpu PRIVATE shim shadps4 ${SHADER_INCLUDE} third_party/gcn/include third_party/half/include)
 target_compile_definitions(bbgpu PRIVATE BOOST_ASIO_STANDALONE NDEBUG)
 target_compile_options(bbgpu PRIVATE -Wno-deprecated-declarations -Wno-missing-field-initializers)
@@ -212,6 +241,11 @@ if (WIN32)
     # Windows headers: no min/max macros, no winsock 1 clash; Windows 10+ APIs (SetThreadDescription).
     target_compile_definitions(bbgpu PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN _WIN32_WINNT=0x0A00)
     target_link_libraries(bbgpu PUBLIC xbyak::xbyak)
+    if (BB_PGO STREQUAL "generate")
+        # bbport: the instrumented static library needs the profile runtime in bb-probe.exe's
+        # link (add_link_options does not reach it): written into bbgpu_link.txt below.
+        target_link_options(bbgpu INTERFACE -fprofile-generate=${BB_PGO_DIR})
+    endif()
     # bb-probe.exe links libbbgpu.a with these (out/gpu/bbgpu_link.txt, one argument per line,
     # in link order): the static library's transitive dependencies.
     include(cmake/LinkClosure.cmake)
@@ -242,6 +276,18 @@ target_link_libraries(pipeline-archive-test PRIVATE fmt::fmt)
 add_executable(motion-history-test EXCLUDE_FROM_ALL ../tests/test_motion_history.cpp)
 target_compile_options(motion-history-test PRIVATE -UNDEBUG -Wall -Wextra -Werror)
 target_include_directories(motion-history-test PRIVATE ..)
+add_executable(occlusion-test EXCLUDE_FROM_ALL ../tests/test_occlusion.cpp)
+target_compile_options(occlusion-test PRIVATE -UNDEBUG -Wall -Wextra -Werror)
+target_include_directories(occlusion-test PRIVATE ..)
+# Pipeline compiles off the frame path (docs/pipeline_compiles.md); the draw pipe's waits run
+# with real threads (bbgpu: the platform and thread helpers).
+add_executable(pipeline-compile-test EXCLUDE_FROM_ALL ../tests/test_pipeline_compile.cpp ../tests/test_gpu_runtime_stubs.cpp)
+target_compile_options(pipeline-compile-test PRIVATE -UNDEBUG)
+target_include_directories(pipeline-compile-test PRIVATE shim shadps4 third_party/gcn/include)
+target_link_libraries(pipeline-compile-test PRIVATE bbgpu)
+if (WIN32)
+    target_link_libraries(pipeline-compile-test PRIVATE winmm ws2_32 psapi onecore)
+endif()
 add_executable(motion-shader-test EXCLUDE_FROM_ALL ../tests/test_motion_shaders.cpp ../tests/test_gpu_runtime_stubs.cpp)
 target_compile_options(motion-shader-test PRIVATE -UNDEBUG)
 target_include_directories(motion-shader-test PRIVATE shim shadps4 third_party/gcn/include)
@@ -252,7 +298,8 @@ endif()
 add_executable(ui-composition-test EXCLUDE_FROM_ALL ../tests/test_ui_composition.cpp)
 target_compile_options(ui-composition-test PRIVATE -UNDEBUG -Wall -Wextra -Werror)
 target_include_directories(ui-composition-test PRIVATE ..)
-add_executable(settings-test EXCLUDE_FROM_ALL ../tests/test_settings.cpp shim/bbport_settings.cpp)
+add_executable(settings-test EXCLUDE_FROM_ALL ../tests/test_settings.cpp shim/bbport_settings.cpp
+    shim/bbport_menu_i18n.cpp)
 target_compile_options(settings-test PRIVATE -UNDEBUG -Wall -Wextra -Werror)
 target_include_directories(settings-test PRIVATE .. shim)
 
@@ -278,9 +325,16 @@ target_compile_options(camera-motion-test PRIVATE -UNDEBUG -fPIC)
 target_link_libraries(camera-motion-test PRIVATE bbgpu)
 add_dependencies(camera-motion-test host_shaders)
 
+# bbport: native HDR output's shaders on a synthetic frame (docs/hdr.md); plain Vulkan, no bbgpu.
+add_executable(hdr-native-shader-test EXCLUDE_FROM_ALL ../tests/test_hdr_native.cpp)
+target_include_directories(hdr-native-shader-test PRIVATE ${SHADER_INCLUDE})
+target_compile_options(hdr-native-shader-test PRIVATE -UNDEBUG -Wall -Werror)
+target_link_libraries(hdr-native-shader-test PRIVATE Vulkan::Vulkan)
+add_dependencies(hdr-native-shader-test host_shaders)
+
 # bbport: FSR 4 benchmark outside the game (tools/fsr4_bench.cpp): ninja -C out/gpu fsr4-bench.
 add_executable(upscaler-support-test EXCLUDE_FROM_ALL ../tests/test_upscaler_support.cpp
-    shim/bbport_settings.cpp)
+    shim/bbport_settings.cpp shim/bbport_menu_i18n.cpp)
 target_include_directories(upscaler-support-test PRIVATE shim)
 target_compile_options(upscaler-support-test PRIVATE -UNDEBUG)
 
@@ -315,6 +369,7 @@ target_include_directories(pc-input-test PRIVATE shim)
 target_link_libraries(pc-input-test PRIVATE PkgConfig::SDL3)
 target_compile_options(pc-input-test PRIVATE -UNDEBUG -Wall -Wextra -Werror)
 add_executable(widescreen-test EXCLUDE_FROM_ALL ../tests/test_widescreen.cpp
-    shim/engine/widescreen.cpp shim/engine/engine_hooks.cpp shim/bbport_settings.cpp)
+    shim/engine/widescreen.cpp shim/engine/engine_hooks.cpp shim/bbport_settings.cpp
+    shim/bbport_menu_i18n.cpp)
 target_include_directories(widescreen-test PRIVATE shim)
 target_compile_options(widescreen-test PRIVATE -UNDEBUG -Wall -Wextra -Werror)

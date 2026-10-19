@@ -19,6 +19,10 @@ GAME_FOLDERS = {'action', 'chr', 'event', 'facegen', 'font', 'map', 'menu', 'mov
                 'obj', 'other', 'param', 'paramdef', 'parts', 'remo', 'script', 'sfx', 'shader',
                 'sound'}
 
+# Every retail serial (all run the same 1.09 game): mods wrap their files in any of them.
+SERIALS = ('CUSA00207', 'CUSA00208', 'CUSA00299', 'CUSA00900', 'CUSA01363', 'CUSA03014',
+           'CUSA03023', 'CUSA03173', 'CUSA03179')
+
 
 def child(folder, name):
     """`name` inside `folder`, matching an existing entry case-insensitively (mods made on
@@ -33,13 +37,14 @@ def child(folder, name):
 def content_root(folder):
     """(root, prefix): where a mod's files are and the game path they go to, or None.
 
-    Accepted layouts: <mod>/dvdroot_ps4, <mod>/app0/dvdroot_ps4, <mod>/CUSA03173/dvdroot_ps4,
-    one wrapper folder around any of these (an archive extracted into a folder of its name), and
-    the game's folders without dvdroot_ps4 (<mod>/chr, <mod>/parts, ...)."""
+    Accepted layouts: <mod>/dvdroot_ps4, <mod>/app0/dvdroot_ps4, <mod>/<serial>/dvdroot_ps4
+    (CUSA03173 or another retail serial), one wrapper folder around any of these (an archive
+    extracted into a folder of its name), and the game's folders without dvdroot_ps4 (<mod>/chr,
+    <mod>/parts, ...)."""
     folder = Path(folder)
     if not folder.is_dir():
         return None
-    for wrapper in ('', 'app0', 'CUSA03173'):
+    for wrapper in ('', 'app0') + SERIALS:
         base = child(folder, wrapper) if wrapper else folder
         dvdroot = child(base, 'dvdroot_ps4')
         if dvdroot.is_dir():
@@ -89,11 +94,15 @@ def mod_files(folder):
     root = root.resolve()
     for directory, folders, files in os.walk(root, followlinks=False):
         directory = Path(directory)
-        for name in [*folders, *files]:
-            if (directory / name).is_symlink():
-                raise ValueError(f'Mod symlinks are unsupported: {directory / name}')
+        # A link (shortcut-like entry) is left out, never followed: it could point anywhere (#34).
+        for name in [n for n in folders if (directory / n).is_symlink()]:
+            print(f'Mods: skipped the link {directory / name} (links are not followed)', file=sys.stderr)
+            folders.remove(name)
         for name in sorted(files):
             source = directory / name
+            if source.is_symlink():
+                print(f'Mods: skipped the link {source} (links are not followed)', file=sys.stderr)
+                continue
             relative = Path(prefix) / source.relative_to(root) if prefix else source.relative_to(root)
             # Readme/metadata stay outside the mounted game. This loader handles assets;
             # executable patches use the existing patch compiler, with address validation.
@@ -104,6 +113,50 @@ def mod_files(folder):
             if not source.is_file():
                 raise ValueError(f'Not a regular mod file: {source}')
             yield relative, source
+
+
+def app_version(folder):
+    """APP_VER of a game folder's sce_sys/param.sfo, or None."""
+    try:
+        from prepare import sfo
+        return sfo((Path(folder) / 'sce_sys' / 'param.sfo').read_bytes()).get('APP_VER')
+    except Exception:
+        return None
+
+
+def update_folder(game):
+    """The dumped game update beside the game, as shadPS4 keeps it (<game>-UPDATE or <game>-patch,
+    any case), when it holds an eboot.bin and the game is not already at its version: it is layered
+    over the game, which stays unchanged."""
+    game = Path(game)
+    for entry in (game.parent.iterdir() if game.parent.is_dir() else ()):
+        if entry.is_dir() and entry.name.casefold() in (f'{game.name}-update'.casefold(),
+                                                         f'{game.name}-patch'.casefold())                 and child(entry, 'eboot.bin').is_file():
+            version = app_version(entry)
+            if version and app_version(game) == version:
+                print(f'Game update: {entry.name} is already in the game ({version})', file=sys.stderr)
+                return None
+            return entry
+    return None
+
+
+def overlay_base(game, out):
+    """Where the overlay is built: `out`, or beside the game when `out` is on another drive (hard
+    links work within one volume only; across volumes every linked file was copied)."""
+    if WINDOWS and os.path.splitdrive(str(Path(out).resolve()))[0].casefold() !=             os.path.splitdrive(str(game))[0].casefold():
+        return game.parent / '.bbport-overlays'
+    return Path(out)
+
+
+def update_files(folder):
+    """(game path, source) of every file of a game update: executable and system files too."""
+    root = Path(folder).resolve()
+    for directory, folders, files in os.walk(root, followlinks=False):
+        directory = Path(directory)
+        for name in sorted(files):
+            source = directory / name
+            if source.is_file() and not source.is_symlink():
+                yield source.relative_to(root), source
 
 
 def is_link(path):
@@ -166,10 +219,31 @@ def expand(directory):
         directory.mkdir(exist_ok=True)
 
 
-def build_overlay(game, out, mods):
+def remove_stale_overlays(out):
+    """Deletes the overlays earlier starts left in `out`: run_windows.py removes its own when the
+    game ends, but not when the launcher's Stop (or its "still running" prompt) kills it with the
+    game. One still in use (an in-game restart's previous run, stopping) is left for the next start."""
+    for overlay in Path(out).glob('mod-game-*'):
+        if overlay.is_dir() and not is_link(overlay):
+            try:
+                remove_overlay(overlay)
+            except OSError:
+                pass
+
+
+def build_overlay(game, out, mods, update=None):
     game = Path(game).resolve(strict=True)
+    out = overlay_base(game, out)
+    if Path(out).is_dir():
+        remove_stale_overlays(out)
     replacements = []
     owners = {}
+    if update:
+        files = list(update_files(update))
+        for relative, source in files:
+            owners[relative.as_posix().casefold()] = Path(update).name
+            replacements.append((relative, source))
+        print(f'Game update: {Path(update).name}: {len(files)} files over the game', file=sys.stderr)
     for name, root in mods:
         count = 0
         for relative, source in mod_files(root):
@@ -235,7 +309,7 @@ def main():
         else:
             for name in selected(args.mods_dir, args.config):
                 layers.append((name, args.mods_dir / name))
-    print(build_overlay(args.game, args.out, layers))
+    print(build_overlay(args.game, args.out, layers, update_folder(args.game.resolve())))
 
 
 if __name__ == '__main__':

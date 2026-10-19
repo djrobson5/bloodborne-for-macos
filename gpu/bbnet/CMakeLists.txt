@@ -1,4 +1,5 @@
-# Network-only native bridge adapted from Supermedo/bloodborne_pc e076119.
+# Network-only native bridge: shadPS4 v.0.20.0's network, NP and shadNet sources
+# (529ceb32f5546b820588f194b903cc39d08015fe).
 # The renderer and the existing shared runtime shims stay authoritative.
 find_package(Protobuf CONFIG REQUIRED GLOBAL)
 find_package(nlohmann_json CONFIG REQUIRED GLOBAL)
@@ -13,9 +14,11 @@ add_custom_command(
             --cpp_out=${BBNET_PROTO_OUT} ${BBNET_VENDOR}/shadnet/shadnet.proto
     DEPENDS ${BBNET_VENDOR}/shadnet/shadnet.proto)
 file(GLOB_RECURSE BBNET_SOURCES CONFIGURE_DEPENDS
-    vendor/shadps4/core/libraries/network/*.cpp vendor/shadps4/core/libraries/np/*.cpp
+    vendor/shadps4/core/libraries/net/*.cpp vendor/shadps4/core/libraries/network/*.cpp
+    vendor/shadps4/core/libraries/np/*.cpp vendor/shadps4/core/net/*.cpp
     vendor/shadps4/shadnet/*.cpp)
-add_library(bbnet STATIC ${BBNET_SOURCES} ${BBNET_PROTO_OUT}/shadnet.pb.cc bbnet_glue.cpp)
+file(GLOB BBNET_THD_SOURCES CONFIGURE_DEPENDS thd/*.cpp)
+add_library(bbnet STATIC ${BBNET_SOURCES} ${BBNET_THD_SOURCES} ${BBNET_PROTO_OUT}/shadnet.pb.cc bbnet_glue.cpp)
 target_include_directories(bbnet PRIVATE include ../shim ${BBNET_VENDOR}
     ${BBNET_VENDOR}/shadnet ../shadps4 ${BBNET_PROTO_OUT} ../third_party/imgui third_party/httplib)
 target_compile_definitions(bbnet PRIVATE BOOST_ASIO_STANDALONE NDEBUG

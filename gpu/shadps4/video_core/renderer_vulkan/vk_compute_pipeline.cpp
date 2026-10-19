@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <boost/container/small_vector.hpp>
+#include <memory>
 #include <stdexcept>
 
 #include "common/serdes.h"
@@ -108,6 +109,29 @@ ComputePipeline::ComputePipeline(const Instance& instance, Scheduler& scheduler,
         .stage = shader_ci,
         .layout = *pipeline_layout,
     };
+    // bbport (BB_ASYNC_PIPELINES): as graphics pipelines (vk_graphics_pipeline.cpp); the stage
+    // info only points at its subgroup size and the module, which outlives the pipeline.
+    if (!preloading && AsyncPipelinesEnabled() && subgroup_size_ci.pNext == nullptr &&
+        shader_ci.pSpecializationInfo == nullptr) {
+        struct Pending {
+            vk::PipelineShaderStageRequiredSubgroupSizeCreateInfo subgroup_size;
+            vk::ComputePipelineCreateInfo info;
+        };
+        auto job = std::make_shared<Pending>();
+        job->subgroup_size = subgroup_size_ci;
+        job->info = compute_pipeline_ci;
+        job->info.stage.pNext = shader_ci.pNext ? &job->subgroup_size : nullptr;
+        ready.store(false, std::memory_order_relaxed);
+        SubmitPipelineJob(this, [this, job, device, cache = pipeline_cache, name = debug_str] {
+            auto [result, created] = device.createComputePipelineUnique(cache, job->info);
+            ASSERT_MSG(result == vk::Result::eSuccess, "Failed to create compute pipeline: {}",
+                       vk::to_string(result));
+            pipeline = std::move(created);
+            SetObjectName(device, *pipeline, "Compute Pipeline {}", name);
+            MarkReady();
+        });
+        return;
+    }
     auto [pipeline_result, pipe] =
         instance.GetDevice().createComputePipelineUnique(pipeline_cache, compute_pipeline_ci);
     if (preloading && pipeline_result != vk::Result::eSuccess) {
@@ -122,6 +146,8 @@ ComputePipeline::ComputePipeline(const Instance& instance, Scheduler& scheduler,
     SetObjectName(device, *pipeline, "Compute Pipeline {}", debug_str);
 }
 
-ComputePipeline::~ComputePipeline() = default;
+ComputePipeline::~ComputePipeline() {
+    WaitReady(); // bbport: a compile thread may still be creating it
+}
 
 } // namespace Vulkan

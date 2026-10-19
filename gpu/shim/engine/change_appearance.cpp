@@ -9,6 +9,9 @@
 #include "rebirth.h"
 #include "menu_memory.h"
 #include "graphics.h"
+#include "cheats.h"
+#include "online_fixes.h"
+#include "trophy_sync.h"
 #include "bbport_settings.h"
 #include "bbport_platform.h"
 #include <atomic>
@@ -159,6 +162,8 @@ std::int64_t __attribute__((sysv_abi)) FrameHook(std::uint64_t, const std::uint6
     BbInput::Tick();
     Camera::Tick();
     Widescreen::Tick();
+    Cheats::Tick();
+    TrophySync::Tick();
     return 0; // The established FPS++ implementation still runs, byte for byte.
 }
 } // namespace
@@ -168,7 +173,9 @@ void Install(std::uint8_t* image, std::size_t size) {
     const char* identity = std::getenv("BB_ENGINE_IMAGE_SHA256");
     const bool mirror = asset && *asset;
     const bool respec=std::getenv("BB_REBIRTH_ASSET");
-    if (!mirror && !respec && !BbSettings::Get().camera_controls && !BbSettings::Get().graphics_controls && !BbSettings::Get().pc_controls && !BbSettings::Get().widescreen) return;
+    // Cheats (cheats.cpp) are switched live from the overlay, so a verified executable always
+    // gets the frame hook; run_windows.py verifies it for any engine feature or cheat.
+    if (!identity && !mirror && !respec && !BbSettings::Get().camera_controls && !BbSettings::Get().graphics_controls && !BbSettings::Get().pc_controls && !BbSettings::Get().widescreen) return;
     if (!identity || std::strcmp(identity, "071df19c8880086d97182dbc057bc8cb37badaca57d9112683836b24a0444c0a")) {
         Log("mirror disabled: executable identity was not verified"); return;
     }
@@ -180,7 +187,6 @@ void Install(std::uint8_t* image, std::size_t size) {
         !std::filesystem::equivalent(resolved, std::filesystem::path(original) / "dvdroot_ps4/map/mapstudio/m21_00_00_00.msb.dcx", error))) {
         Log("mirror disabled: a user mod owns the Dream layout");
         asset = nullptr;
-        if (!respec && !BbSettings::Get().camera_controls && !BbSettings::Get().graphics_controls && !BbSettings::Get().pc_controls && !BbSettings::Get().widescreen) return;
     }
     Hook hooks[2];
     if (!Prepare(hooks[0], image, size, 0x1c1cce0, kStepPrologue, StepHook) ||
@@ -204,7 +210,9 @@ void Install(std::uint8_t* image, std::size_t size) {
         Log("mirror disabled: native editor memory budget differs");
     }
     const bool rebirth=menus && Rebirth::Install(image,size);
-    if (!g_frame_on && !camera && !rebirth && !menus && !graphics && !wide && !input) {
+    const bool cheats=Cheats::Install(image,size);
+    const bool online=OnlineFixes::Install(image,size);
+    if (!g_frame_on && !camera && !rebirth && !menus && !graphics && !wide && !input && !cheats && !online) {
         for (auto& hook : hooks) Discard(hook);
         Log("engine enhancements disabled: no compatible feature could be prepared"); return;
     }

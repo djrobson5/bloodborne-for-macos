@@ -97,7 +97,30 @@ public:
         return needs_hdr;
     }
 
+    /// bbport: HDR output (hdr in bbport.ini): the HDR format chosen at start (format
+    /// eUndefined: none, SDR only). The frame images, passes and overlay keep the SDR format
+    /// (GetSurfaceFormat); the presenter encodes into this one.
+    vk::SurfaceFormatKHR GetHdrFormat() const {
+        return hdr_format;
+    }
+
+    /// bbport: the current swapchain has the HDR format (it falls back to SDR while the
+    /// display offers no HDR format, e.g. Windows HDR switched off).
+    bool IsHdrOutput() const {
+        return hdr_output;
+    }
+
+    /// bbport: VK_EXT_hdr_metadata for the HDR swapchain (kept for the swapchains created later):
+    /// the display's peak, the brightest content (MaxCLL) and the frame average (MaxFALL).
+    void SetHdrMetadata(float max_nits, float content_nits, float frame_average_nits);
+
 private:
+    /// bbport: the surface's formats, queried with the full-screen-exclusive chain when enabled.
+    std::vector<vk::SurfaceFormatKHR> QuerySurfaceFormats() const;
+
+    /// bbport: applies the HDR metadata to the current swapchain.
+    void ApplyHdrMetadata();
+
     /// Selects the best available swapchain image format
     void FindPresentFormat();
 
@@ -105,7 +128,14 @@ private:
     void FindPresentMode();
 
     /// Sets the surface properties according to device capabilities
-    void SetSurfaceProperties();
+    /// (bbport: false when they cannot be queried, e.g. a lost surface)
+    bool SetSurfaceProperties();
+
+    /// bbport: vkDeviceWaitIdle under Scheduler::submit_mutex (the callers must not hold it).
+    void WaitIdle();
+
+    /// bbport: destroys the swapchain and the lost surface, and creates a new surface.
+    void RecreateSurface();
 
     /// Destroys current swapchain resources
     void Destroy();
@@ -138,8 +168,16 @@ private:
     u32 frame_index = 0;
     bool needs_recreation = true;
     bool zero_extent = false; ///< bbport: the surface was 0x0 (minimised) at the last Create
+    bool surface_lost = false; ///< bbport: VK_ERROR_SURFACE_LOST_KHR seen: Create makes a new one
     bool needs_hdr = false;    // The game requested HDR swapchain
     bool supports_hdr = false; // SC supports HDR output
+    // bbport: HDR output (GetHdrFormat, IsHdrOutput).
+    vk::SurfaceFormatKHR hdr_format{vk::Format::eUndefined, vk::ColorSpaceKHR::eSrgbNonlinear};
+    bool hdr_output = false;
+    bool hdr_unavailable_logged = false;
+    bool full_screen_exclusive = false; ///< VK_EXT_full_screen_exclusive: DISALLOWED chained
+    float hdr_max_nits = 0.0f, hdr_content_nits = 0.0f,
+          hdr_average_nits = 0.0f; ///< SetHdrMetadata; 0: not set
 };
 
 } // namespace Vulkan

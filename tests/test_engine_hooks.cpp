@@ -67,10 +67,32 @@ int main() {
     assert(reinterpret_cast<Floating>(image)(1.5,2.5) == 4.0);
     assert(floats[0] == 1.5 && floats[1] == 2.5);
     BbEngine::Discard(hook);
+
+    // A seventh argument on the stack, read as the game reads it ([rbp+0x10]):
+    // push rbp; mov rbp,rsp; mov rax,[rbp+0x10]; add rax,r9; pop rbp; ret
+    const std::uint8_t seventh[] = {0x55,0x48,0x89,0xe5,0x48,0x8b,0x45,0x10,0x4c,0x01,0xc8,0x5d,0xc3};
+    std::memcpy(image + 0x100, seventh, sizeof seventh);
+    assert(BbEngine::Call(reinterpret_cast<std::uint64_t>(image + 0x100), 1,2,3,4,5,6,70) == 76);
+
+    // A redirected tail call (the fog table's upload): its jmp rel32 goes to padding that jumps on
+    // to a stub, which calls the host and then the jump's target with the arguments intact.
+    calls = 0;
+    std::memcpy(image + 16, sum, sizeof sum);
+    auto* stub = BbEngine::TailStub(Observe, reinterpret_cast<std::uint64_t>(image + 16));
+    assert(stub);
+    std::uint8_t* p = image + 0x210; *p++ = 0x49; *p++ = 0xbb;  // movabs r11, stub; jmp r11
+    const auto target = reinterpret_cast<std::uint64_t>(stub);
+    std::memcpy(p, &target, 8); p += 8; *p++ = 0x41; *p++ = 0xff; *p = 0xe3;
+    image[0x200] = 0xe9;
+    const std::int32_t rel = 0x210 - (0x200 + 5);
+    std::memcpy(image + 0x201, &rel, 4);
+    assert(BbEngine::Call(reinterpret_cast<std::uint64_t>(image + 0x200), 1,2,3,4,5,6) == 21);
+    assert(calls == 1 && arguments == (std::array<std::uint64_t,6>{1,2,3,4,5,6}));
+    BbEngine::FreeStub(stub);
 #ifdef _WIN32
     VirtualFree(image, 0, MEM_RELEASE);
 #else
     munmap(image, 4096);
 #endif
-    std::puts("PASS: guest ABI arguments, XMM preservation, return slot, byte/range guards and staged hook installation");
+    std::puts("PASS: guest ABI arguments (seven with a stack argument), XMM preservation, return slot, byte/range guards, staged hook installation and a redirected tail call");
 }

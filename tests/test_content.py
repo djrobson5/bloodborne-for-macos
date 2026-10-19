@@ -36,5 +36,31 @@ class ContentTests(unittest.TestCase):
         r=self.run_case('--missing');self.assertEqual(r.returncode,21)
         self.assertIn('needs --content-profile',r.stderr)
 
+    def test_dumped_addons_are_reported_installed(self):
+        # The Old Hunters on base-game dumps: add-on folders in BB_DLC_DIR and <user>/addcont/<title id>,
+        # each label once (from param.sfo's CONTENT_ID, else the folder's name); a game is not one.
+        def sfo(entries):
+            keys=data=index=b''
+            for k,v in entries:
+                kb,vb=k.encode()+b'\0',v.encode()+b'\0'
+                index+=struct.pack('<HHIII',len(keys),0x0204,len(vb),len(vb),len(data)); keys+=kb; data+=vb
+            start=20+len(index)
+            return b'\0PSF'+struct.pack('<IIII',0x101,start,start+len(keys),len(entries))+index+keys+data
+        with tempfile.TemporaryDirectory() as tmp:
+            p=Path(tmp)
+            for folder,entries in [('dlc/SPEXPANSIONDLC03',None),
+                                   ('dlc/oldhunters',[('CATEGORY','ac'),('CONTENT_ID','UP9000-CUSA00207_00-SPEXPANSIONDLC03')]),
+                                   ('dlc/game',[('CATEGORY','gd'),('CONTENT_ID','UP9000-CUSA00207_00-BLOODBORNE0000000')]),
+                                   ('dlc/dvdroot_ps4',None),('user/addcont/CUSA00207/SOUNDTRACK01',None)]:
+                (p/folder/'sce_sys').mkdir(parents=True)
+                if entries: (p/folder/'sce_sys/param.sfo').write_bytes(sfo(entries))
+            r=subprocess.run([str(EXE.resolve()),'--addons'],capture_output=True,text=True,timeout=5,
+                             env={'BB_DLC_DIR':str(p/'dlc'),'TEST_USER_DIR':str(p/'user')})
+            self.assertEqual(r.returncode,0,r.stdout+r.stderr)
+            self.assertIn('hits 2',r.stdout)
+            self.assertIn('addon SPEXPANSIONDLC03 4',r.stdout)
+            self.assertIn('addon SOUNDTRACK01 4',r.stdout)
+            r=self.run_case('--addons');self.assertIn('hits 0',r.stdout)
+
     def test_other_modules_are_counted_independently(self):
         r=self.run_case('--unknown');self.assertEqual(r.returncode,0,r.stdout+r.stderr)

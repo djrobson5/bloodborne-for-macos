@@ -58,7 +58,7 @@ public:
 private:
     GpuProfiler(const Instance& instance, Scheduler& scheduler);
     void WriteTimestamp(u64 key);
-    void Collect(u32 slice);
+    bool Collect(u32 slice);
     void Print();
 
     static constexpr u32 NumSlices = 4;
@@ -73,6 +73,10 @@ private:
     std::array<std::vector<u64>, NumSlices> keys; ///< label of each timestamp but the last
     std::array<u32, NumSlices> used{};
     std::array<bool, NumSlices> pending{};
+    /// A slice whose results were not ready when its turn came (its timestamps may sit in a
+    /// submission not sent yet, during loads): not written again until they are read.
+    std::array<bool, NumSlices> held{};
+    u64 skipped_frames = 0;
     std::unordered_map<u64, std::string> described;
     struct Total {
         double ms = 0;

@@ -61,6 +61,32 @@ public:
         return 0;
     }
 
+    /// bbport (BB_DRAWREC_WORKERS, the lookahead thread): asks the cache for the page state
+    /// words a binding of the range reads (IsRegionModified, ForEachUploadRange); regions are
+    /// not created and nothing is read through them. Returns the cache lines requested.
+    u32 Prefetch(VAddr cpu_address, u64 size) const noexcept {
+        if (size == 0) {
+            return 0;
+        }
+        u32 lines = 0;
+        const std::size_t last = (cpu_address + size - 1) >> TRACKER_HIGHER_PAGE_BITS;
+        for (std::size_t page_index = cpu_address >> TRACKER_HIGHER_PAGE_BITS;
+             page_index <= last && page_index < top_tier.size(); ++page_index) {
+            const RegionManager* manager = top_tier[page_index];
+            if (!manager) {
+                continue;
+            }
+            const auto* cpu = reinterpret_cast<const char*>(&manager->GetRegionBits<Type::CPU>());
+            const auto* gpu = reinterpret_cast<const char*>(&manager->GetRegionBits<Type::GPU>());
+            for (std::size_t offset = 0; offset < sizeof(RegionBits); offset += 64) {
+                __builtin_prefetch(cpu + offset);
+                __builtin_prefetch(gpu + offset);
+                lines += 2;
+            }
+        }
+        return lines;
+    }
+
     /// Returns true if a region has been modified from the GPU
     bool IsRegionGpuModified(VAddr query_cpu_addr, u64 query_size) noexcept {
         return IteratePages<false>(

@@ -37,6 +37,11 @@ void FlushBatch();
 /// has finished.
 void WaitAsync();
 
+/// bbport: runs the oldest task passed to Async() that no copy thread has started yet, on the
+/// calling thread. False when there was none. A waiter helps with this instead of WaitAsync(),
+/// which also waits for copies issued after the one it needs.
+bool HelpOne();
+
 /// Starts the calling thread's batch and runs `callback` once every task passed to Async() so
 /// far has finished (at once when none is pending), on whichever thread finishes last.
 /// Callbacks run in the order they were registered.

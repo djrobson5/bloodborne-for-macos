@@ -156,6 +156,10 @@ inline std::atomic<std::uint64_t> gpu_frames{0};
 inline std::atomic<std::uint64_t> t_resident{0}, t_protect{0}, t_image_create{0}, t_refresh{0},
     t_staging{0}, t_host_wait{0}, t_copy{0}, copy_bytes{0}, t_read_faults{0}, read_faults{0},
     t_write_faults{0}, t_copy_cpu{0}, copy_sys_us{0}, copy_minflt{0};
+/// Where image creation and refresh time goes (ns): the format query and the allocation of
+/// Image(), and RefreshImage's hashes, source buffer and detiling.
+inline std::atomic<std::uint64_t> t_image_query{0}, t_image_alloc{0}, t_refresh_hash{0},
+    t_refresh_obtain{0}, t_refresh_detile{0};
 /// Diagnostics are collected only with BB_FRAME_STATS=1.
 inline const bool enabled = [] {
     const char* env = std::getenv("BB_FRAME_STATS");
@@ -226,4 +230,51 @@ inline std::atomic<std::uint64_t> gpu_signal_faults{0};
 /// Protection changes: calls and pages, those removing write access (TLB shootdowns) apart.
 inline std::atomic<std::uint64_t> protect_calls{0}, protect_pages{0}, protect_revoke_calls{0},
     protect_revoke_pages{0};
+/// bbport (BB_FRAME_STATS): protection changes by what they are for. On the draw recording thread
+/// (stage B): pages watched again after an upload, texture tracking, the rest (unwatching). Other
+/// threads together; bb:Protect (BB_DEFER_PROTECT) apart. Calls and ns.
+enum ProtectKind : unsigned {
+    ProtectUpload,
+    ProtectTexture,
+    ProtectOther,
+    ProtectDeferred,
+    ProtectKinds,
+};
+inline std::array<std::atomic<std::uint64_t>, ProtectKinds> stage_b_protect_calls{},
+    stage_b_protect_ns{};
+inline std::atomic<std::uint64_t> other_protect_calls{0}, other_protect_ns{0};
+/// BB_DEFER_PROTECT: pages whose write protection was deferred, protection changes that applied
+/// them (calls, ns), flushes a copy had to make itself (bb:Protect behind), deferred pages whose
+/// watch was dropped before they were protected (no system call at all).
+inline std::atomic<std::uint64_t> deferred_protect_pages{0}, deferred_protect_calls{0},
+    deferred_protect_ns{0}, copy_flushes{0}, deferred_cancelled_pages{0};
+/// Where host copies and deferred fences are waited for (Scheduler::WaitHostCopies,
+/// WaitDeferredSignals): waits that blocked, their ns, and fence waits found not needed
+/// (BB_FENCE_ORDER=ordered).
+enum WaitSite : unsigned {
+    WaitWriteData,
+    WaitDma,
+    WaitFlip,
+    WaitEos,
+    WaitEop,
+    WaitOther,
+    WaitSites,
+};
+inline constexpr const char* WaitSiteNames[WaitSites] = {"WriteData", "DMA", "flip", "EOS", "EOP",
+                                                         "other"};
+inline std::array<std::atomic<std::uint64_t>, WaitSites> signal_waits{}, signal_wait_ns{},
+    signal_waits_skipped{}, copy_waits{}, copy_wait_ns{};
+/// WaitRegMem met by a fence still deferred (a point the command processor would wait at).
+inline std::atomic<std::uint64_t> fence_barriers{0};
+/// DmaData into guest memory: stored by the CPU, or recorded for the GPU (no waits, BB_DMA_WAITS).
+inline std::atomic<std::uint64_t> dma_on_cpu{0}, dma_on_gpu{0};
+/// bbport BB_DRAWREC_WORKERS=1 (docs/parallel-stageb.md): the lookahead thread bb:DrawAhead walks
+/// the draw pipe ahead of the draw recording thread and asks the cache for what its next draws will
+/// read. Packets walked, draws it could prefetch for, cache lines requested, times it fell behind
+/// stage B (and caught up), times it waited for stage B (BB_DRAWREC_LOOKAHEAD packets ahead), the
+/// lead in packets summed over prefetched draws, cycles spent prefetching, faults recovered from
+/// (a packet stage B had already passed). Experiment bit 16 of BB_TOGGLE_FILE pauses it (A/B).
+inline std::atomic<std::uint64_t> lookahead_packets{0}, lookahead_draws{0}, lookahead_lines{0},
+    lookahead_behind{0}, lookahead_waits{0}, lookahead_lead{0}, lookahead_busy_cycles{0},
+    lookahead_recovered{0};
 } // namespace BbStats

@@ -6,6 +6,8 @@
 #include <bit>
 #include <cmath>
 #include <cstdint>
+#include <cstdio>
+#include <cstdlib>
 
 namespace Vulkan::UiComposition {
 
@@ -19,9 +21,31 @@ constexpr Background Choose(bool scaled, bool ui_draw, bool scene_ready, bool fs
     return scene_ready && fsr_active ? Background::Temporal : Background::Copy;
 }
 
-inline bool NativeViewport(float width, float height) {
-    return std::abs(std::abs(width) - 1920.0f) < 0.5f &&
-           std::abs(std::abs(height) - 1080.0f) < 0.5f;
+// The game's UI movie viewport: 1920x1080, or with Widescreen on a screen of another shape that
+// shape around it (2520x1080 at 21:9, 1920x1200 at 16:10; scripts/patches.py ui_size, passed as
+// BB_UI_SIZE). Scaleform then shows the 1920x1080 stage whole and centred, as bbhost's window
+// does, and what the game places past the stage's edges - the enemy gauges, co-op names and the
+// lock-on marker at the screen's sides (engine/widescreen.cpp) - stays inside the viewport
+// instead of being clipped at the 16:9 box.
+inline std::array<float, 2> ParseUiSize(const char* value) {
+    unsigned w = 0, h = 0;
+    if (value && std::sscanf(value, "%ux%u", &w, &h) == 2 && w >= 1920 && h >= 1080 &&
+        w <= 8192 && h <= 8192) {
+        return {float(w), float(h)};
+    }
+    return {1920.0f, 1080.0f};
+}
+inline std::array<float, 2> UiSize() {
+    static const auto size = ParseUiSize(std::getenv("BB_UI_SIZE"));
+    return size;
+}
+
+inline bool ViewportIs(float width, float height, std::array<float, 2> size) {
+    return std::abs(std::abs(width) - size[0]) < 0.5f && std::abs(std::abs(height) - size[1]) < 0.5f;
+}
+// A UI movie's viewport: the stage's 1920x1080, or the widened one.
+inline bool NativeViewport(float width, float height, std::array<float, 2> ui = UiSize()) {
+    return ViewportIs(width, height, {1920.0f, 1080.0f}) || ViewportIs(width, height, ui);
 }
 
 // Scaleform draws, including the first stencil/movie pass. A native-size viewport
@@ -39,9 +63,10 @@ constexpr bool ObserveDraw(uint32_t mrt_mask, uint64_t vs_hash, bool has_stencil
 }
 
 struct FitTransform {std::array<float,2> scale;std::array<float,2> offset;};
-inline FitTransform Fit(uint32_t w,uint32_t h) {
-    const float s=std::min(float(w)/1920,float(h)/1080);
-    return {{s,s},{(float(w)-1920*s)/2,(float(h)-1080*s)/2}};
+// A UI viewport of `ui` units shown whole, centred and unstretched in a w x h image.
+inline FitTransform Fit(uint32_t w,uint32_t h,std::array<float,2> ui={1920.0f,1080.0f}) {
+    const float s=std::min(float(w)/ui[0],float(h)/ui[1]);
+    return {{s,s},{(float(w)-ui[0]*s)/2,(float(h)-ui[1]*s)/2}};
 }
 inline std::array<float, 2> Scale(uint32_t guest_width, uint32_t guest_height,
                                 uint32_t output_width, uint32_t output_height,

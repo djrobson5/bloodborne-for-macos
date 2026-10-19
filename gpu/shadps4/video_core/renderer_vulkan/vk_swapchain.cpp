@@ -2,24 +2,55 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <algorithm>
+#include <array>
+#include <atomic>
+#include <cstdio>
 #include <limits>
+#include "bbport_settings.h"
 #include "common/assert.h"
 #include "common/logging/log.h"
 #include "core/emulator_settings.h"
 #include "imgui/renderer/imgui_core.h"
 #include "sdl_window.h"
 #include "video_core/renderer_vulkan/vk_instance.h"
+#include "video_core/renderer_vulkan/vk_platform.h"
+#include "video_core/renderer_vulkan/vk_scheduler.h"
 #include "video_core/renderer_vulkan/vk_swapchain.h"
 
 namespace Vulkan {
+
+/// bbport: display events (a lost surface, a failed swapchain) are reported a few times and the
+/// presenter skips frames until a new swapchain works; they ended the game (exit 23).
+static void NoteDisplayEvent(const char* what, vk::Result result) {
+    static std::atomic<u32> notes{0};
+    if (notes.fetch_add(1, std::memory_order_relaxed) < 16) {
+        std::printf("Display: %s: %s\n", what, vk::to_string(result).c_str());
+    }
+}
 
 static constexpr vk::SurfaceFormatKHR SURFACE_FORMAT_HDR = {
     .format = vk::Format::eA2B10G10R10UnormPack32,
     .colorSpace = vk::ColorSpaceKHR::eHdr10St2084EXT,
 };
 
+/// bbport: HDR output formats, in order of preference: HDR10 (BT.2020 primaries, PQ), then
+/// scRGB (linear BT.709 in FP16, 1.0 = 80 nits).
+static constexpr std::array HDR_OUTPUT_FORMATS = {
+    SURFACE_FORMAT_HDR,
+    vk::SurfaceFormatKHR{
+        .format = vk::Format::eR16G16B16A16Sfloat,
+        .colorSpace = vk::ColorSpaceKHR::eExtendedSrgbLinearEXT,
+    },
+};
+
 Swapchain::Swapchain(const Instance& instance_, const Frontend::WindowSDL& window_)
     : instance{instance_}, window{window_}, surface{CreateSurface(instance.GetInstance(), window)} {
+    // bbport: the swapchain never becomes exclusive fullscreen. A borderless window covering
+    // the screen was promoted to it by the driver, and Windows HDR switched off with it.
+    full_screen_exclusive = instance.IsFullScreenExclusiveEnabled();
+    if (full_screen_exclusive) {
+        std::printf("Display: exclusive fullscreen disallowed (VK_EXT_full_screen_exclusive)\n");
+    }
     FindPresentFormat();
     FindPresentMode();
 
@@ -37,9 +68,18 @@ void Swapchain::Create(u32 width_, u32 height_) {
     height = height_;
     needs_recreation = false;
 
+    // bbport: a lost surface (VK_ERROR_SURFACE_LOST_KHR: a display or driver reset) is made again
+    // on the same window before a swapchain can be created on it.
+    if (surface_lost) {
+        RecreateSurface();
+    }
+
     // bbport: a minimised window has a 0x0 surface (issue #31); no swapchain can have that extent.
     // The old one stays (presents are skipped) until the window is back.
-    SetSurfaceProperties();
+    if (!SetSurfaceProperties()) {
+        needs_recreation = true;
+        return;
+    }
     if (extent.width == 0 || extent.height == 0) {
         zero_extent = true;
         needs_recreation = true;
@@ -58,8 +98,22 @@ void Swapchain::Create(u32 width_, u32 height_) {
     const u32 queue_family_indices_count = exclusive ? 1u : 2u;
     const vk::SharingMode sharing_mode =
         exclusive ? vk::SharingMode::eExclusive : vk::SharingMode::eConcurrent;
-    const auto format = needs_hdr ? SURFACE_FORMAT_HDR : surface_format;
+    // bbport: HDR output while the display still offers the HDR format chosen at start
+    // (switching Windows HDR off removes it; the swapchain is SDR until it is back).
+    hdr_output = false;
+    if (!needs_hdr && hdr_format.format != vk::Format::eUndefined) {
+        const auto formats = QuerySurfaceFormats();
+        hdr_output = std::ranges::find(formats, hdr_format) != formats.end();
+        if (!hdr_output && !hdr_unavailable_logged) {
+            std::printf("HDR output: the display offers no HDR format now (is Windows HDR on?); "
+                        "SDR until it does\n");
+        }
+        hdr_unavailable_logged = !hdr_output;
+    }
+    const auto format = needs_hdr ? SURFACE_FORMAT_HDR : hdr_output ? hdr_format : surface_format;
+    view_format = format.format;
     const vk::SwapchainCreateInfoKHR swapchain_info = {
+        .pNext = FullScreenExclusiveDisallowed(full_screen_exclusive),
         .surface = surface,
         .minImageCount = image_count,
         .imageFormat = format.format,
@@ -79,12 +133,82 @@ void Swapchain::Create(u32 width_, u32 height_) {
     };
 
     auto [swapchain_result, chain] = instance.GetDevice().createSwapchainKHR(swapchain_info);
-    ASSERT_MSG(swapchain_result == vk::Result::eSuccess, "Failed to create swapchain: {}",
-               vk::to_string(swapchain_result));
+    if (swapchain_result != vk::Result::eSuccess) {
+        // bbport: no swapchain now (IsPresentable is false): presents are skipped and the next
+        // one tries again.
+        NoteDisplayEvent("creating the swapchain failed", swapchain_result);
+        surface_lost = swapchain_result == vk::Result::eErrorSurfaceLostKHR;
+        needs_recreation = true;
+        return;
+    }
     swapchain = chain;
 
     SetupImages();
     RefreshSemaphores();
+    // The new chain may have fewer images (AwesomeObserver b3164c1): start the indices over.
+    frame_index = image_index = 0;
+    ApplyHdrMetadata();
+}
+
+void Swapchain::SetHdrMetadata(float max_nits, float content_nits, float frame_average_nits) {
+    if (max_nits == hdr_max_nits && content_nits == hdr_content_nits &&
+        frame_average_nits == hdr_average_nits) {
+        return;
+    }
+    hdr_max_nits = max_nits;
+    hdr_content_nits = content_nits;
+    hdr_average_nits = frame_average_nits;
+    ApplyHdrMetadata();
+}
+
+void Swapchain::ApplyHdrMetadata() {
+    if (!hdr_output || !swapchain || hdr_max_nits <= 0.0f || !instance.IsHdrMetadataEnabled() ||
+        !VULKAN_HPP_DEFAULT_DISPATCHER.vkSetHdrMetadataEXT) {
+        return;
+    }
+    // The picture is the SDR frame: BT.709 primaries, D65 white, up to the peak set. bbport:
+    // MaxCLL is what the HDR mode can reach (Presenter::PresentHdr): with expand's lower
+    // ceiling the display has no reason to compress the highlights itself.
+    const vk::HdrMetadataEXT metadata{
+        .displayPrimaryRed = {0.640f, 0.330f},
+        .displayPrimaryGreen = {0.300f, 0.600f},
+        .displayPrimaryBlue = {0.150f, 0.060f},
+        .whitePoint = {0.3127f, 0.3290f},
+        .maxLuminance = hdr_max_nits,
+        .minLuminance = 0.0f,
+        .maxContentLightLevel = hdr_content_nits > 0.0f ? hdr_content_nits : hdr_max_nits,
+        .maxFrameAverageLightLevel = hdr_average_nits,
+    };
+    instance.GetDevice().setHdrMetadataEXT(1, &swapchain, &metadata);
+}
+
+std::vector<vk::SurfaceFormatKHR> Swapchain::QuerySurfaceFormats() const {
+    const vk::PhysicalDevice physical = instance.GetPhysicalDevice();
+    if (full_screen_exclusive) {
+        // The same chain as the swapchain's creation (VK_EXT_full_screen_exclusive).
+        const vk::PhysicalDeviceSurfaceInfo2KHR surface_info{
+            .pNext = FullScreenExclusiveDisallowed(true),
+            .surface = surface,
+        };
+        auto [formats2_result, formats2] = physical.getSurfaceFormats2KHR(surface_info);
+        if (formats2_result == vk::Result::eSuccess) {
+            std::vector<vk::SurfaceFormatKHR> formats;
+            formats.reserve(formats2.size());
+            for (const auto& format2 : formats2) {
+                formats.push_back(format2.surfaceFormat);
+            }
+            return formats;
+        }
+        LOG_WARNING(Render_Vulkan, "Failed to query surface formats (2): {}",
+                    vk::to_string(formats2_result));
+    }
+    auto [formats_result, formats] = physical.getSurfaceFormatsKHR(surface);
+    if (formats_result != vk::Result::eSuccess) {
+        LOG_ERROR(Render_Vulkan, "Failed to query surface formats: {}",
+                  vk::to_string(formats_result));
+        return {};
+    }
+    return std::move(formats);
 }
 
 void Swapchain::Recreate(u32 width_, u32 height_) {
@@ -98,11 +222,7 @@ void Swapchain::SetHDR(bool hdr) {
         return;
     }
 
-    auto result = instance.GetDevice().waitIdle();
-    if (result != vk::Result::eSuccess) {
-        LOG_WARNING(ImGui, "Failed to wait for Vulkan device idle on mode change: {}",
-                    vk::to_string(result));
-    }
+    WaitIdle();
 
     needs_hdr = hdr;
     Recreate(width, height);
@@ -111,6 +231,10 @@ void Swapchain::SetHDR(bool hdr) {
 }
 
 bool Swapchain::AcquireNextImage() {
+    if (!swapchain) {
+        needs_recreation = true; // the last Create failed
+        return false;
+    }
     vk::Device device = instance.GetDevice();
     vk::Result result =
         device.acquireNextImageKHR(swapchain, std::numeric_limits<u64>::max(),
@@ -120,15 +244,25 @@ bool Swapchain::AcquireNextImage() {
     case vk::Result::eSuccess:
         break;
     case vk::Result::eSuboptimalKHR:
+        // A suboptimal acquire still owns an image and signals the semaphore: present it in the
+        // normal submission, then recreate (Present() returns false). Dropping it left the
+        // semaphore signalled and never waited on. From AwesomeObserver b3164c1 (E. Doronin).
+        needs_recreation = true;
+        return true;
     case vk::Result::eErrorSurfaceLostKHR:
+        NoteDisplayEvent("acquiring a swapchain image", result);
+        surface_lost = true;
+        needs_recreation = true;
+        break;
     case vk::Result::eErrorOutOfDateKHR:
     case vk::Result::eErrorUnknown:
         needs_recreation = true;
         break;
     default:
-        LOG_CRITICAL(Render_Vulkan, "Swapchain acquire returned unknown result {}",
-                     vk::to_string(result));
-        UNREACHABLE();
+        // bbport: e.g. a timeout or a lost exclusive fullscreen: recreated like out-of-date
+        // (this was UNREACHABLE, exit 23).
+        NoteDisplayEvent("acquiring a swapchain image", result);
+        needs_recreation = true;
         break;
     }
 
@@ -147,6 +281,12 @@ bool Swapchain::Present() {
     auto result = instance.GetPresentQueue().presentKHR(present_info);
     if (result == vk::Result::eErrorOutOfDateKHR || result == vk::Result::eSuboptimalKHR) {
         needs_recreation = true;
+    } else if (result != vk::Result::eSuccess && result != vk::Result::eErrorDeviceLost) {
+        // bbport: a lost surface (display or driver reset) or another display event: recreated
+        // like out-of-date (this was an assertion, exit 23). A lost device still stops below.
+        NoteDisplayEvent("presenting", result);
+        surface_lost = result == vk::Result::eErrorSurfaceLostKHR;
+        needs_recreation = true;
     } else {
         ASSERT_MSG(result == vk::Result::eSuccess, "Swapchain presentation failed: {}",
                    vk::to_string(result));
@@ -158,20 +298,13 @@ bool Swapchain::Present() {
 }
 
 void Swapchain::FindPresentFormat() {
-    const auto [formats_result, formats] =
-        instance.GetPhysicalDevice().getSurfaceFormatsKHR(surface);
-    ASSERT_MSG(formats_result == vk::Result::eSuccess, "Failed to query surface formats: {}",
-               vk::to_string(formats_result));
+    const auto formats = QuerySurfaceFormats();
+    ASSERT_MSG(!formats.empty(), "Failed to query surface formats");
 
-    // Check if the device supports HDR formats. Here we care of Rec.2020 PQ only as it is expected
-    // game output. Other variants as e.g. linear Rec.2020 will require additional color space
-    // rotation
-    supports_hdr =
-        std::find_if(formats.begin(), formats.end(), [](const vk::SurfaceFormatKHR& format) {
-            return format == SURFACE_FORMAT_HDR;
-        }) != formats.end();
-    // Also make sure that user allowed us to use HDR
-    supports_hdr &= EmulatorSettings.IsHdrAllowed();
+    // bbport: the game's own HDR request (sceVideoOutConfigureOutputMode with BT.2020 PQ, which
+    // Bloodborne never makes) stays off: HDR output is the presenter's encode of the SDR
+    // picture (hdr in bbport.ini, below), and the per-flip SetHDR(false) must not touch it.
+    supports_hdr = false;
 
     // If there is a single undefined surface format, the device doesn't care, so we'll just use
     // RGBA sRGB.
@@ -181,24 +314,62 @@ void Swapchain::FindPresentFormat() {
         return;
     }
 
-    // Try to find a suitable format.
-    for (const vk::SurfaceFormatKHR& sformat : formats) {
-        vk::Format format = sformat.format;
-        if (format != vk::Format::eR8G8B8A8Unorm && format != vk::Format::eB8G8R8A8Unorm) {
-            continue;
-        }
+    // Try to find a suitable format. bbport: VK_EXT_swapchain_colorspace is always enabled now,
+    // so the same formats can be listed with other color spaces too: SRGB_NONLINEAR first.
+    const auto is_sdr_format = [](const vk::SurfaceFormatKHR& sformat) {
+        return sformat.format == vk::Format::eR8G8B8A8Unorm ||
+               sformat.format == vk::Format::eB8G8R8A8Unorm;
+    };
+    auto found = std::ranges::find_if(formats, [&](const vk::SurfaceFormatKHR& sformat) {
+        return is_sdr_format(sformat) && sformat.colorSpace == vk::ColorSpaceKHR::eSrgbNonlinear;
+    });
+    if (found == formats.end()) {
+        found = std::ranges::find_if(formats, is_sdr_format);
+    }
+    if (found == formats.end()) {
+        UNREACHABLE_MSG("Unable to find required swapchain format!");
+    }
+    surface_format.format = found->format;
+    surface_format.colorSpace = found->colorSpace;
 
-        surface_format.format = format;
-        surface_format.colorSpace = sformat.colorSpace;
+    // bbport: HDR output (hdr in bbport.ini, BB_HDR), chosen once.
+    const auto& settings = BbSettings::Get();
+    if (!settings.startup_hdr) {
         return;
     }
-
-    UNREACHABLE_MSG("Unable to find required swapchain format!");
+    for (const vk::SurfaceFormatKHR& candidate : HDR_OUTPUT_FORMATS) {
+        if (std::ranges::find(formats, candidate) != formats.end()) {
+            hdr_format = candidate;
+            break;
+        }
+    }
+    if (hdr_format.format == vk::Format::eUndefined) {
+        std::printf("HDR output: the display offers no HDR format (is Windows HDR on?)\n");
+        return;
+    }
+    // The presenter letterboxes the frame into an SDR image of the swapchain's size, draws the
+    // menu over it, and samples it in the encode pass.
+    constexpr vk::FormatFeatureFlags composite_features =
+        vk::FormatFeatureFlagBits::eSampledImage | vk::FormatFeatureFlagBits::eColorAttachment |
+        vk::FormatFeatureFlagBits::eColorAttachmentBlend | vk::FormatFeatureFlagBits::eBlitDst |
+        vk::FormatFeatureFlagBits::eTransferDst;
+    const vk::FormatFeatureFlags features =
+        instance.GetPhysicalDevice().getFormatProperties(surface_format.format).optimalTilingFeatures;
+    if ((features & composite_features) != composite_features) {
+        std::printf("HDR output: %s cannot hold the SDR picture for the encode; staying SDR\n",
+                    vk::to_string(surface_format.format).c_str());
+        hdr_format = {};
+        return;
+    }
+    std::printf("HDR output: %s, paper white %.0f nits, peak %.0f nits, highlight boost %.2f\n",
+                hdr_format == SURFACE_FORMAT_HDR ? "HDR10 PQ (BT.2020)" : "scRGB (FP16, linear BT.709)",
+                settings.hdr_paper_white.load(), settings.hdr_peak.load(),
+                settings.hdr_boost.load());
 }
 
 void Swapchain::FindPresentMode() {
-    const auto [modes_result, modes] =
-        instance.GetPhysicalDevice().getSurfacePresentModesKHR(surface);
+    const auto [modes_result, modes] = GetSurfacePresentModes(
+        instance.GetInstance(), instance.GetPhysicalDevice(), surface, full_screen_exclusive);
     if (modes_result != vk::Result::eSuccess) {
         LOG_ERROR(Render, "Failed to query available present modes, falling back to Fifo as "
                           "guaranteed supported option.");
@@ -211,6 +382,9 @@ void Swapchain::FindPresentMode() {
         present_mode = vk::PresentModeKHR::eMailbox;
     } else if (requested_mode == "Fifo") {
         present_mode = vk::PresentModeKHR::eFifo;
+    } else if (requested_mode == "FifoRelaxed") {
+        // bbport: the launcher offers it (VSync that tears instead of waiting when a frame is late).
+        present_mode = vk::PresentModeKHR::eFifoRelaxed;
     } else if (requested_mode == "Immediate") {
         present_mode = vk::PresentModeKHR::eImmediate;
     } else {
@@ -228,11 +402,31 @@ void Swapchain::FindPresentMode() {
     }
 }
 
-void Swapchain::SetSurfaceProperties() {
-    const auto [capabilities_result, capabilities] =
-        instance.GetPhysicalDevice().getSurfaceCapabilitiesKHR(surface);
-    ASSERT_MSG(capabilities_result == vk::Result::eSuccess,
-               "Failed to query surface capabilities: {}", vk::to_string(capabilities_result));
+bool Swapchain::SetSurfaceProperties() {
+    vk::SurfaceCapabilitiesKHR capabilities{};
+    vk::Result capabilities_result{};
+    if (full_screen_exclusive) {
+        // The same chain as the swapchain's creation (VK_EXT_full_screen_exclusive).
+        const vk::PhysicalDeviceSurfaceInfo2KHR surface_info{
+            .pNext = FullScreenExclusiveDisallowed(true),
+            .surface = surface,
+        };
+        const auto [result2, capabilities2] =
+            instance.GetPhysicalDevice().getSurfaceCapabilities2KHR(surface_info);
+        capabilities_result = result2;
+        capabilities = capabilities2.surfaceCapabilities;
+    } else {
+        const auto [result1, capabilities1] =
+            instance.GetPhysicalDevice().getSurfaceCapabilitiesKHR(surface);
+        capabilities_result = result1;
+        capabilities = capabilities1;
+    }
+    if (capabilities_result != vk::Result::eSuccess) {
+        // bbport: this was an assertion (exit 23); a lost surface is made again at the next try.
+        NoteDisplayEvent("querying the surface capabilities failed", capabilities_result);
+        surface_lost = capabilities_result == vk::Result::eErrorSurfaceLostKHR;
+        return false;
+    }
 
     extent = capabilities.currentExtent;
     if (capabilities.currentExtent.width == std::numeric_limits<u32>::max()) {
@@ -259,23 +453,41 @@ void Swapchain::SetSurfaceProperties() {
     if (!(capabilities.supportedCompositeAlpha & vk::CompositeAlphaFlagBitsKHR::eOpaque)) {
         composite_alpha = vk::CompositeAlphaFlagBitsKHR::eInherit;
     }
+    return true;
 }
 
-void Swapchain::Destroy() {
-    vk::Device device = instance.GetDevice();
-    const auto wait_result = device.waitIdle();
+void Swapchain::WaitIdle() {
+    // bbport: vkDeviceWaitIdle needs every queue of the device externally synchronized: the
+    // recording threads submit to the same queue under this lock (Scheduler::submit_mutex).
+    std::scoped_lock submit_lock{Scheduler::submit_mutex};
+    const auto wait_result = instance.GetDevice().waitIdle();
     if (wait_result != vk::Result::eSuccess) {
         LOG_WARNING(Render_Vulkan, "Failed to wait for device to become idle: {}",
                     vk::to_string(wait_result));
     }
+}
+
+void Swapchain::RecreateSurface() {
+    Destroy(); // a swapchain goes before its surface
+    instance.GetInstance().destroySurfaceKHR(surface);
+    surface = CreateSurface(instance.GetInstance(), window);
+    surface_lost = false;
+    std::printf("Display: the window's surface was lost; created again\n");
+}
+
+void Swapchain::Destroy() {
+    vk::Device device = instance.GetDevice();
+    WaitIdle();
 
     for (auto& image_view : images_view) {
         device.destroyImageView(image_view);
     }
     images_view.clear();
+    images.clear();
 
     if (swapchain) {
         device.destroySwapchainKHR(swapchain);
+        swapchain = nullptr; // bbport: a failed Create leaves none (IsPresentable)
     }
 
     for (const auto& sem : image_acquired) {
@@ -329,7 +541,7 @@ void Swapchain::SetupImages() {
         auto [im_view_result, im_view] = device.createImageView(vk::ImageViewCreateInfo{
             .image = images[i],
             .viewType = vk::ImageViewType::e2D,
-            .format = needs_hdr ? SURFACE_FORMAT_HDR.format : surface_format.format,
+            .format = view_format, // bbport: the format Create chose (SDR, game HDR, HDR output)
             .subresourceRange =
                 {
                     .aspectMask = vk::ImageAspectFlagBits::eColor,

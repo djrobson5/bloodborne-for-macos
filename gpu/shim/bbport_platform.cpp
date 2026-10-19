@@ -5,6 +5,7 @@
 #include <algorithm>
 #include <bit>
 #include <cstdio>
+#include <cstdlib>
 #include <thread>
 #include <windows.h>
 #include <psapi.h>
@@ -33,6 +34,25 @@ bool GetUsage(bool thread, Usage& out) {
             out.minor_faults = counters.PageFaultCount;
         }
     }
+    return true;
+}
+
+bool GetMemory(Memory& out) {
+    PROCESS_MEMORY_COUNTERS_EX counters{};
+    MEMORYSTATUSEX status{};
+    status.dwLength = sizeof(status);
+    if (!GetProcessMemoryInfo(GetCurrentProcess(),
+                              reinterpret_cast<PROCESS_MEMORY_COUNTERS*>(&counters),
+                              sizeof(counters)) ||
+        !GlobalMemoryStatusEx(&status)) {
+        return false;
+    }
+    out.private_bytes = counters.PrivateUsage;
+    out.working_set = counters.WorkingSetSize;
+    out.peak_working_set = counters.PeakWorkingSetSize;
+    out.free_phys = status.ullAvailPhys;
+    out.total_phys = status.ullTotalPhys;
+    out.commit_left = status.ullAvailPageFile;
     return true;
 }
 
@@ -96,6 +116,31 @@ unsigned Available() {
 
 void MakeBackground() {
     SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_IDLE);
+}
+
+// The game runs dozens of threads at normal priority (cloth, character, Havok, job pools); on
+// 12 or fewer hardware threads Windows gives a ready thread of equal priority a core only when
+// another one's quantum ends (tens of ms), so a render-chain thread queued behind them delays
+// the frame. Its idle spins are bounded (BB_GPU_SPIN_US, BB_PIPE_SPIN_US, recording: 200 us)
+// before it sleeps, so the higher priority takes no lasting time from the game's threads.
+namespace {
+bool Raising() {
+    static const bool enabled = [] {
+        const char* env = std::getenv("BB_GPU_THREAD_PRIORITY");
+        return !(env && env[0] == '0');
+    }();
+    return enabled;
+}
+} // namespace
+
+void MakeCritical(bool bulk) {
+    if (Raising() && (!bulk || Available() >= 16)) {
+        SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_ABOVE_NORMAL);
+    }
+}
+
+unsigned CapSpinUs(unsigned wanted) {
+    return Raising() && Available() < 16 ? std::min(wanted, 50u) : wanted;
 }
 
 } // namespace BbThreads

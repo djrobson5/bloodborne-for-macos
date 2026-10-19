@@ -58,10 +58,38 @@ WindowSDL::WindowSDL(s32 width_, s32 height_, const char* title) : width{width_}
     if (!SDL_InitSubSystem(SDL_INIT_VIDEO | SDL_INIT_GAMEPAD)) {
         UNREACHABLE_MSG("Failed to initialize SDL video: {}", SDL_GetError());
     }
+    // bbport: SDL makes a focused fullscreen window topmost, which put the launcher's trophy
+    // notification (a topmost window of its own) under the game: its sound played, nothing showed.
+    SDL_SetHint(SDL_HINT_WINDOW_ALLOW_TOPMOST, "0");
     SDL_PropertiesID props = SDL_CreateProperties();
     SDL_SetStringProperty(props, SDL_PROP_WINDOW_CREATE_TITLE_STRING, title);
     SDL_SetNumberProperty(props, SDL_PROP_WINDOW_CREATE_X_NUMBER, SDL_WINDOWPOS_CENTERED);
     SDL_SetNumberProperty(props, SDL_PROP_WINDOW_CREATE_Y_NUMBER, SDL_WINDOWPOS_CENTERED);
+    // The launcher resolves the saved Windows monitor on every launch. Select it before
+    // creating the HWND and Vulkan surface, so fullscreen and HDR start on that display.
+    if (const char* selection = std::getenv("BB_MONITOR_BOUNDS"); selection && *selection) {
+        int x, y, w, h;
+        char trailing;
+        if (SDL_sscanf(selection, "%d,%d,%d,%d%c", &x, &y, &w, &h, &trailing) == 4 &&
+            x >= -100000 && x <= 100000 && y >= -100000 && y <= 100000 &&
+            w > 0 && w <= 100000 && h > 0 && h <= 100000) {
+            SDL_Point point{x + w / 2, y + h / 2};
+            const SDL_DisplayID selected = SDL_GetDisplayForPoint(&point);
+            SDL_Rect bounds{};
+            if (selected && SDL_GetDisplayBounds(selected, &bounds) &&
+                bounds.x == x && bounds.y == y && bounds.w == w && bounds.h == h) {
+                SDL_SetNumberProperty(props, SDL_PROP_WINDOW_CREATE_X_NUMBER, SDL_WINDOWPOS_CENTERED_DISPLAY(selected));
+                SDL_SetNumberProperty(props, SDL_PROP_WINDOW_CREATE_Y_NUMBER, SDL_WINDOWPOS_CENTERED_DISPLAY(selected));
+                const char* label = std::getenv("BB_MONITOR_LABEL");
+                SDL_Log("Monitor selection: %s; SDL display %u (%d,%d %dx%d)",
+                        label ? label : "selected monitor", static_cast<unsigned>(selected), x, y, w, h);
+            } else {
+                SDL_Log("Monitor selection: display disconnected; using primary monitor");
+            }
+        } else {
+            SDL_Log("Monitor selection: invalid bounds; using primary monitor");
+        }
+    }
     SDL_SetNumberProperty(props, SDL_PROP_WINDOW_CREATE_WIDTH_NUMBER, width_);
     SDL_SetNumberProperty(props, SDL_PROP_WINDOW_CREATE_HEIGHT_NUMBER, height_);
     SDL_SetBooleanProperty(props, SDL_PROP_WINDOW_CREATE_RESIZABLE_BOOLEAN, true);
@@ -169,6 +197,18 @@ bool WindowSDL::PollEvents() {
             UpdateTextTitle();
             continue;
         }
+        // The controller finishes the text dialog too: Cross (South) accepts, Circle (East)
+        // cancels. From Supermedo/bloodborne_pc 1d34202.
+        if (text_active && event.type == SDL_EVENT_GAMEPAD_BUTTON_DOWN &&
+            (event.gbutton.button == SDL_GAMEPAD_BUTTON_SOUTH ||
+             event.gbutton.button == SDL_GAMEPAD_BUTTON_EAST)) {
+            std::scoped_lock lock{text_mutex};
+            text_state = event.gbutton.button == SDL_GAMEPAD_BUTTON_SOUTH ? 1 : 2;
+            text_active = false;
+            SDL_StopTextInput(window);
+            UpdateTextTitle();
+            continue;
+        }
         if (BbOverlay::HandleEvent(event)) {
             continue;
         }
@@ -196,26 +236,25 @@ bool WindowSDL::PollEvents() {
         }
     }
     BbInput::Pump(window,text_active);
-    if (!BbInput::Enabled()) UpdateCursor();
+    UpdateCursor();
     return is_open;
 }
 
-// Issue #3: the OS cursor over the game. Hidden in fullscreen, and in a window after 3 s without
-// moving the mouse; always shown while the settings menu is open.
+// Issue #3: the OS cursor over the game. bbport: with hide_cursor (Settings, on by default) it
+// goes 2 s after the mouse last moved and comes back when it moves - a controller player never
+// sees it, a mouse player in the menus has it while using it - and it is always shown while the
+// settings menu is open. The mouse camera (relative mode) hides it itself (input/input.cpp).
 void WindowSDL::UpdateCursor() {
-#ifdef _WIN32
-    // Keep the established Windows cursor behaviour while the 0.4 loading/input
-    // regression is isolated. The upstream auto-hide path was validated on Linux.
-    return;
-#else
-    const bool fullscreen = (SDL_GetWindowFlags(window) & SDL_WINDOW_FULLSCREEN) != 0;
-    const bool hide = !BbOverlay::MenuOpen() &&
-                      (fullscreen || SDL_GetTicks() - last_mouse_motion_ms > 3000);
+    if (SDL_GetWindowRelativeMouseMode(window)) {
+        cursor_hidden = false; // input.cpp shows it again when the mouse camera ends
+        return;
+    }
+    const bool hide = BbSettings::Get().hide_cursor && !BbOverlay::MenuOpen() &&
+                      SDL_GetTicks() - last_mouse_motion_ms > 2000;
     if (hide != cursor_hidden) {
         cursor_hidden = hide;
         hide ? SDL_HideCursor() : SDL_ShowCursor();
     }
-#endif
 }
 
 } // namespace Frontend

@@ -60,6 +60,7 @@ static int initialized, opened, sdl_ready;
 static SDL_Gamepad *gamepad;
 static size_t reads;
 static uint8_t connected_count;
+static int gamepad_type; /* runtime_pad_type: read without the lock */
 
 static uint64_t now_us(void) { return host_monotonic_ns()/1000u; }
 static uint8_t axis(int16_t v) { int x=(v+32768)>>8; return (uint8_t)(x<0 ? 0 : x>255 ? 255 : x); }
@@ -86,6 +87,52 @@ static int is_preferred(SDL_JoystickID id, const char *want) {
     const char *name=SDL_GetGamepadNameForID(id);
     return !SDL_strcasecmp(guid,want) || (name && SDL_strcasestr(name,want));
 }
+/* bbport: several gamepads at once (also one pad behind a 2.4 GHz receiver that shows as two):
+ * without a chosen one, the pad being used takes over, checked five times a second. */
+#define MAX_OTHER_PADS 4
+static SDL_Gamepad *other_pads[MAX_OTHER_PADS];
+static SDL_JoystickID other_pad_ids[MAX_OTHER_PADS];
+static int pad_active(SDL_Gamepad *p) {
+    for (int b=0;b<SDL_GAMEPAD_BUTTON_COUNT;++b) if (SDL_GetGamepadButton(p,(SDL_GamepadButton)b)) return 1;
+    for (int a=0;a<SDL_GAMEPAD_AXIS_COUNT;++a) {
+        const int v=SDL_GetGamepadAxis(p,(SDL_GamepadAxis)a);
+        if (v>20000 || v<-20000) return 1;
+    }
+    return 0;
+}
+static void follow_active_pad(void) {
+    static uint64_t last;
+    const uint64_t now=now_us();
+    if (now-last<200000) return;
+    last=now;
+    for (int s=0;s<MAX_OTHER_PADS;++s)
+        if (other_pads[s] && !SDL_GamepadConnected(other_pads[s])) { SDL_CloseGamepad(other_pads[s]); other_pads[s]=NULL; }
+    int count=0;
+    SDL_JoystickID *ids=SDL_GetGamepads(&count);
+    if (!ids) return;
+    for (int i=0;count>1 && i<count;++i) {
+        if (gamepad && SDL_GetGamepadID(gamepad)==ids[i]) continue;
+        int slot=-1, free_slot=-1;
+        for (int s=0;s<MAX_OTHER_PADS;++s) {
+            if (other_pads[s] && other_pad_ids[s]==ids[i]) slot=s;
+            else if (!other_pads[s] && free_slot<0) free_slot=s;
+        }
+        if (slot<0 && free_slot>=0 && (other_pads[free_slot]=SDL_OpenGamepad(ids[i]))) {
+            other_pad_ids[free_slot]=ids[i];
+            slot=free_slot;
+        }
+        if (slot>=0 && pad_active(other_pads[slot])) {
+            SDL_Gamepad *previous=gamepad;
+            gamepad=other_pads[slot];
+            other_pads[slot]=previous;
+            other_pad_ids[slot]=previous ? SDL_GetGamepadID(previous) : 0;
+            printf("Runtime: gamepad in use: %s\n",SDL_GetGamepadName(gamepad));
+            break;
+        }
+    }
+    SDL_free(ids);
+}
+
 /* The chosen gamepad, else the first while it is not connected (checked again every second, it
  * is taken as soon as it connects); called under lock. */
 static SDL_Gamepad *current_gamepad(void) {
@@ -116,6 +163,14 @@ static SDL_Gamepad *current_gamepad(void) {
             }
         }
         SDL_free(ids);
+    }
+    if (!want) follow_active_pad();
+    static SDL_JoystickID typed;
+    const SDL_JoystickID id=gamepad ? SDL_GetGamepadID(gamepad) : 0;
+    if (id!=typed) {
+        typed=id;
+        __atomic_store_n(&gamepad_type,gamepad ? (int)SDL_GetGamepadType(gamepad) : (int)SDL_GAMEPAD_TYPE_UNKNOWN,
+                         __ATOMIC_RELAXED);
     }
     return gamepad;
 }
@@ -168,6 +223,10 @@ enum { PAD_LEFT_TRIGGER=SDL_GAMEPAD_BUTTON_COUNT, PAD_RIGHT_TRIGGER }; /* trigge
 typedef struct { int key_count, pad_count; SDL_Scancode keys[MAX_BIND]; int pad[MAX_BIND]; } Binding;
 static Binding bindings[IN_COUNT];
 static int bindings_ready;
+/* bbport: stick options (bbport.ini): pad_swap_sticks=1 moves with the right stick and looks with
+ * the left; pad_invert_look_x / pad_invert_look_y=1 invert the camera stick; pad_deadzone=N
+ * (percent, 0-50) ignores small stick movement (worn sticks that drift). */
+static int pad_swap_sticks, pad_invert_look_x, pad_invert_look_y, pad_deadzone;
 
 static void bind_defaults(void) {
     static const struct { int input; SDL_Scancode key; } keys[]={
@@ -216,6 +275,14 @@ static void load_bindings(void) {
     while (fgets(line,sizeof line,f)) {
         const int keyboard=!strncmp(line,"key.",4), pad=!strncmp(line,"pad.",4);
         char *eq=strchr(line,'=');
+        if (!strncmp(line,"pad_",4) && eq) {
+            const int value=atoi(eq+1);
+            if (!strncmp(line,"pad_swap_sticks=",16)) pad_swap_sticks=value!=0;
+            else if (!strncmp(line,"pad_invert_look_x=",18)) pad_invert_look_x=value!=0;
+            else if (!strncmp(line,"pad_invert_look_y=",18)) pad_invert_look_y=value!=0;
+            else if (!strncmp(line,"pad_deadzone=",13)) pad_deadzone=value<0 ? 0 : value>50 ? 50 : value;
+            continue;
+        }
         if ((!keyboard && !pad) || !eq) continue;
         *eq=0;
         int input=-1;
@@ -296,6 +363,17 @@ static void sample_host(PadData *d) {
         }
         d->left_x=axis(SDL_GetGamepadAxis(g,SDL_GAMEPAD_AXIS_LEFTX)); d->left_y=axis(SDL_GetGamepadAxis(g,SDL_GAMEPAD_AXIS_LEFTY));
         d->right_x=axis(SDL_GetGamepadAxis(g,SDL_GAMEPAD_AXIS_RIGHTX)); d->right_y=axis(SDL_GetGamepadAxis(g,SDL_GAMEPAD_AXIS_RIGHTY));
+        if (pad_deadzone) {
+            const int dz=pad_deadzone*128/100;
+            uint8_t *sticks[4]={&d->left_x,&d->left_y,&d->right_x,&d->right_y};
+            for (int s=0;s<4;++s) if (*sticks[s]-128<dz && 128-*sticks[s]<dz) *sticks[s]=128;
+        }
+        if (pad_swap_sticks) {
+            uint8_t t=d->left_x; d->left_x=d->right_x; d->right_x=t;
+            t=d->left_y; d->left_y=d->right_y; d->right_y=t;
+        }
+        if (pad_invert_look_x) d->right_x=(uint8_t)(255-d->right_x);
+        if (pad_invert_look_y) d->right_y=(uint8_t)(255-d->right_y);
         if (SDL_GetNumGamepadTouchpads(g)>0) {
             const int fingers=SDL_GetNumGamepadTouchpadFingers(g,0);
             for (int finger=0;finger<fingers && d->touch_count<2;++finger) {
@@ -456,13 +534,21 @@ static void touch_ids(PadData *d) {
     else if (!since) since=d->timestamp;
     d->touch_held_time=d->touch_count ? (uint32_t)(d->timestamp-since) : 0;
 }
+/* After the menu or the text dialog closes, buttons still held (the Cross that accepted a
+ * name, the button that closed the menu) stay hidden until all are released: the game would
+ * take them as a new press. From Supermedo/bloodborne_pc 1d34202 (hold_after_capture). */
+static int hold_after_capture;
 static void sample(PadData *d) {
     sample_host(d);
-    if (bbgpu_overlay_captures_input()) return;
+    if (bbgpu_overlay_captures_input()) { hold_after_capture=1; return; }
     record_sample(d);
     read_inject();
     replay_sample(d);
     d->buttons|=injected.buttons;
+    if (hold_after_capture) {
+        if (d->buttons) { d->buttons=0; d->l2=d->r2=0; }
+        else hold_after_capture=0;
+    }
     if (injected.touch_side>=0) touch_click(d,injected.touch_side);
     else if ((d->buttons & BTN_TOUCHPAD) && !d->touch_count) touch_click(d,0);
     if (injected.buttons & BTN_L2) d->l2=255;
@@ -538,5 +624,27 @@ static const RuntimeExport exports[]={
     {"scePadSetAngularVelocityDeadbandState",pad_ok_handle_flag}, {"scePadSetTiltCorrectionState",pad_ok_handle_flag},
     {"scePadSetMotionSensorState",pad_ok_handle_flag},
 };
+int runtime_pad_type(void) { return __atomic_load_n(&gamepad_type,__ATOMIC_RELAXED); }
+/* The first bound button the gamepad in use has (Touchpad: Back, then a DualShock's touchpad). */
+int runtime_pad_button(uint32_t ps_button, int right_side) {
+    int input=-1, found=-1;
+    if (ps_button==BTN_TOUCHPAD) input=right_side ? IN_TOUCHPAD_RIGHT : IN_TOUCHPAD;
+    else for (int i=IN_CROSS;i<=IN_RIGHT && input<0;++i) if (input_buttons[i]==ps_button) input=i;
+    if (input<0) return -1;
+    host_lock(&lock);
+    if (!bindings_ready) { load_bindings(); bindings_ready=1; }
+    const Binding *b=&bindings[input];
+    for (int i=0;i<b->pad_count && found<0;++i) {
+        const int p=b->pad[i];
+        const int has=!gamepad ? 1
+            : p==PAD_LEFT_TRIGGER ? SDL_GamepadHasAxis(gamepad,SDL_GAMEPAD_AXIS_LEFT_TRIGGER)
+            : p==PAD_RIGHT_TRIGGER ? SDL_GamepadHasAxis(gamepad,SDL_GAMEPAD_AXIS_RIGHT_TRIGGER)
+            : SDL_GamepadHasButton(gamepad,(SDL_GamepadButton)p);
+        if (has) found=p;
+    }
+    if (found<0 && b->pad_count) found=b->pad[0];
+    host_unlock(&lock);
+    return found;
+}
 uintptr_t runtime_pad_resolve(const char *name) { return RUNTIME_LOOKUP(exports,name); }
 void runtime_pad_report(void) { printf("Runtime: pad reads=%zu, gamepad=%s\n",reads,gamepad ? SDL_GetGamepadName(gamepad) : "none"); }

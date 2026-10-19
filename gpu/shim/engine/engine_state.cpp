@@ -14,7 +14,7 @@ template<typename T> bool Read(std::uint64_t at,T* out) { return at && host_read
 std::uint64_t Pointer(std::uint64_t at) { std::uint64_t p=0;Read(at,&p);return p; }
 std::uint64_t Slot(std::uint64_t bn) { return slide+(bn-kPreferredGuestSlide); }
 struct Stat { const char* name; std::uint32_t offset; };
-constexpr Stat stats[]={{"hp",0x14},{"vitality",0x40},{"endurance",0x48},{"strength",0x58},{"skill",0x60},{"bloodtinge",0x68},{"arcane",0x70},{"level",0x90},{"echoes",0x94}};
+constexpr Stat stats[]={{"hp",0x14},{"vitality",0x40},{"endurance",0x48},{"strength",0x58},{"skill",0x60},{"bloodtinge",0x68},{"arcane",0x70},{"insight",0x84},{"level",0x90},{"echoes",0x94}};
 std::uint64_t Record() { auto m=Pointer(Slot(0x593b130)); return m?Pointer(m+8):0; }
 struct Watch { std::uint64_t type=0;const char16_t* name=nullptr;std::atomic<std::uint64_t> made{0}; };
 Watch watches[8]; int count;
@@ -23,6 +23,7 @@ struct Safe { template<typename T> bool operator()(std::uint64_t at,T* out) cons
 bool host_read_safe(const void* p,void* out,std::size_t n) { return p && BbPlatform::ReadProcessMemory(p,out,n); }
 void host_log(const char* format,...) { std::fputs("Engine: ",stdout);va_list a;va_start(a,format);std::vprintf(format,a);va_end(a);std::putchar('\n'); }
 void StateInitialize(std::uint64_t image) { slide=image; }
+std::uint64_t player_record() { return Record(); }
 bool player_stat_get(const char* name,std::int64_t* value) {
     auto record=Record(); if (!record) return false;
     for (const auto& s:stats) if (!std::strcmp(name,s.name)) { std::int32_t v=0;if (!Read(record+s.offset,&v)) return false;*value=v;return true; }
@@ -85,6 +86,44 @@ void* params_row(const char* wanted,std::uint32_t id,std::size_t* size) {
         }
     }
     return nullptr;
+}
+// The same walk as params_row, keeping the first table of that name for row-by-row access.
+bool params_table(const char* wanted,ParamTable* out) {
+    const auto repo=Pointer(Slot(0x5940340)); if (!repo || !wanted || !out) return false;
+    for (unsigned s=0;s<63;++s) {
+        const auto entry=repo+0x70+s*0x48;std::int32_t n=0;if (!Read(entry,&n) || n<=0) continue;
+        for (unsigned k=0;k<static_cast<unsigned>(n) && k<8;++k) {
+            const auto cap=Pointer(entry+8+8*k);std::uint64_t capacity=0;if (!cap || !Read(cap+0x30,&capacity)) continue;
+            const auto name=capacity<8?cap+0x18:Pointer(cap+0x18);
+            bool same=true; unsigned c=0;
+            for (;c<64;++c) { char16_t ch=0;if (!Read(name+2*c,&ch) || ch!=static_cast<unsigned char>(wanted[c])) { same=false;break; }if (!ch) break; }
+            if (!same || c==64) continue;
+            ParamTable t;t.cap=cap;t.file=params_table_file(cap);
+            if (!t.file || !Read(t.file+0xa,&t.rows) || !t.rows || !Read(t.file+0x2d,&t.format) || !Read(t.file+0x2e,&t.flags)) continue;
+            *out=t;return true;
+        }
+    }
+    return false;
+}
+std::uint64_t params_table_file(std::uint64_t cap) { const auto holder=cap?Pointer(cap+0x70):0;return holder?Pointer(holder+0x70):0; }
+// Every record in one read (the records params_row reads one at a time): id and row address.
+bool params_records(const ParamTable& t,std::vector<ParamRecord>* out) {
+    if (!t.file || !t.rows || !out) return false;
+    const bool wide=t.format>3 && (t.flags&2);
+    const std::size_t stride=wide?0x18:0xc;
+    std::vector<std::uint8_t> bytes(stride*t.rows);
+    if (!host_read_safe(reinterpret_cast<const void*>(t.file+(t.format==2?0x34:0x40)),bytes.data(),bytes.size())) return false;
+    out->clear();out->reserve(t.rows);
+    for (std::size_t i=0;i<t.rows;++i) {
+        const std::uint8_t* r=bytes.data()+stride*i;
+        std::uint32_t id=0,off32=0;std::uint64_t offset=0;
+        std::memcpy(&id,r,4);
+        if (wide) std::memcpy(&offset,r+8,8);
+        else { std::memcpy(&off32,r+4,4);offset=off32; }
+        if (offset<0x34 || offset>64*1024*1024) return false;
+        out->push_back({id,t.file+offset});
+    }
+    return true;
 }
 int menu_steps_watch(std::uint64_t type,const char16_t* name) {
     if (count>=8 || !name) return -1;const int w=count++;watches[w].type=type;watches[w].name=name;return w;

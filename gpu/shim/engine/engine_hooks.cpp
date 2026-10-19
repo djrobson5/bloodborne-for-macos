@@ -142,6 +142,39 @@ bool Prepare(Hook& hook, std::uint8_t* image, std::size_t size, std::size_t offs
     return true;
 }
 
+std::uint8_t* TailStub(Callback callback, std::uint64_t resume) {
+    if (!callback || !resume) return nullptr;
+#ifdef _WIN32
+    auto* page = static_cast<std::uint8_t*>(VirtualAlloc(nullptr, 4096, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE));
+    if (!page) return nullptr;
+#else
+    auto* page = static_cast<std::uint8_t*>(mmap(nullptr, 4096, PROT_READ | PROT_WRITE,
+        MAP_PRIVATE | MAP_ANONYMOUS, -1, 0));
+    if (page == MAP_FAILED) return nullptr;
+#endif
+    EmitPrologueStub(page, 0, reinterpret_cast<void*>(callback), resume, nullptr, 0, false);
+#ifdef _WIN32
+    DWORD previous = 0;
+    if (!VirtualProtect(page, 4096, PAGE_EXECUTE_READ, &previous) ||
+        !FlushInstructionCache(GetCurrentProcess(), page, 4096)) {
+        FreeStub(page); return nullptr;
+    }
+#else
+    if (mprotect(page, 4096, PROT_READ | PROT_EXEC)) { FreeStub(page); return nullptr; }
+    __builtin___clear_cache(reinterpret_cast<char*>(page), reinterpret_cast<char*>(page + 4096));
+#endif
+    return page;
+}
+
+void FreeStub(std::uint8_t* stub) {
+    if (!stub) return;
+#ifdef _WIN32
+    VirtualFree(stub, 0, MEM_RELEASE);
+#else
+    munmap(stub, 4096);
+#endif
+}
+
 void Discard(Hook& hook) {
     if (hook.stub) {
 #ifdef _WIN32

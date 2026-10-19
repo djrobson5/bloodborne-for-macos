@@ -13,6 +13,7 @@
 #include <thread>
 #include <unordered_set>
 #include <boost/container/small_vector.hpp>
+#include <deque>
 #include <queue>
 #include <tsl/robin_map.h>
 
@@ -25,6 +26,7 @@
 #include "video_core/texture_cache/image_view.h"
 #include "video_core/texture_cache/sampler.h"
 #include "video_core/texture_cache/tile_manager.h"
+#include "video_core/texture_cache/watched_pages.h"
 
 namespace AmdGpu {
 struct Liverpool;
@@ -38,6 +40,19 @@ namespace VideoCore {
 
 class BufferCache;
 class PageManager;
+
+/// bbport BB_REFRESH_TRACE=1 (diagnostics): the kind of write behind an invalidation, named by
+/// the rasterizer around its calls, printed with the large images it marks dirty.
+inline thread_local const char* invalidate_reason = "other";
+struct InvalidateReason {
+    const char* previous;
+    explicit InvalidateReason(const char* reason) : previous{invalidate_reason} {
+        invalidate_reason = reason;
+    }
+    ~InvalidateReason() {
+        invalidate_reason = previous;
+    }
+};
 
 class TextureCache {
     // Default values for garbage collection
@@ -104,12 +119,50 @@ public:
         slot_images[image_id].tick_accessed_last = scheduler.CurrentTick();
     }
 
+    /// bbport: whether FindImage's result `image_id` for `info` is an exact match: the
+    /// registered image with the same address, size, extent, format, type, resources and
+    /// layout (FindImage's own memo test, with equal resources). Images register once, their
+    /// descriptions never change and later images come after them in the page table, so a new
+    /// search finds that image first again for as long as it stays registered: a lookup
+    /// remembered with it outlives other images' (un)registration (IsRegisteredImage).
+    [[nodiscard]] bool IsExactMatch(ImageId image_id, const ImageInfo& info) const;
+
+    /// bbport: whether `image_id` is still the registered image `uid` (see IsExactMatch).
+    [[nodiscard]] bool IsRegisteredImage(ImageId image_id, u64 uid) const {
+        if (!image_id || !slot_images.is_allocated(image_id)) {
+            return false;
+        }
+        const Image& image = slot_images[image_id];
+        return image.image_uid == uid && True(image.flags & ImageFlagBits::Registered);
+    }
+
+    /// bbport: the unique id of an image (slot ids are reused, these are not).
+    [[nodiscard]] u64 ImageUid(ImageId image_id) const {
+        return slot_images[image_id].image_uid;
+    }
+
+    /// bbport (BB_DRAWREC_WORKERS): where the image with this id would be, for a prefetch from
+    /// the lookahead thread; the slot may be free or reused, nothing is read through it.
+    [[nodiscard]] const void* ImageSlotAddress(ImageId image_id) const noexcept {
+        return slot_images.SlotAddress(image_id);
+    }
+
     TileManager& GetTileManager() noexcept {
         return tile_manager;
     }
 
     /// Invalidates any image in the logical page range.
     void InvalidateMemory(VAddr addr, size_t size);
+
+    /// bbport: uploads the game's button icons again when what they show changed (keyboard and
+    /// mouse prompts, engine/key_prompts.h). Once a frame, without the lock.
+    void UpdateKeyPrompts();
+
+    /// bbport: whether a tracked image protects a page of the range; without the lock, from any
+    /// thread (Rasterizer::OnWriteFault: a write fault elsewhere leaves this cache alone).
+    [[nodiscard]] bool WatchesPages(VAddr addr, size_t size) const noexcept {
+        return watched_pages.Any(addr, size);
+    }
 
     /// Marks an image as dirty if it exists at the provided address.
     void InvalidateMemoryFromGPU(VAddr address, size_t max_size);
@@ -217,7 +270,24 @@ public:
     /// extra_lod_bias: bbport, added to the S#'s bias (reduced scene rendering).
     [[nodiscard]] vk::Sampler GetSampler(const AmdGpu::Sampler& sampler,
                                          AmdGpu::BorderColorBuffer border_color_base,
-                                         bool is_depth, float extra_lod_bias = 0.0f);
+                                         bool is_depth, float extra_lod_bias = 0.0f,
+                                         size_t* lru_id = nullptr);
+
+    /// bbport (sampler memo of the draw recording thread): a sampler GetSampler returned stays
+    /// alive while this is unchanged (the collector frees samplers only in RunGarbageCollector,
+    /// never while textures are bound: the GPU command thread with the draw pipe drained, or the
+    /// recording thread between packets; it bumps it then), provided the caller touches it once
+    /// per GC period (TouchSampler) as GetSampler does.
+    [[nodiscard]] u64 SamplerGeneration() const noexcept {
+        return sampler_generation;
+    }
+    [[nodiscard]] u64 GcTick() const noexcept {
+        return gc_tick;
+    }
+    void TouchSampler(size_t lru_id) {
+        std::scoped_lock lock{samplers_mutex};
+        sampler_lru_cache.Touch(lru_id, gc_tick);
+    }
 
     /// Retrieves the image with the specified id.
     Image* TryGetImage(ImageId id, u64 uid) {
@@ -365,6 +435,12 @@ private:
     /// Copies image memory back to CPU.
     void DownloadImageMemory(ImageId image_id, bool sync = false);
 
+    /// bbport (image write-back GC): synchronously writes a GPU-modified tiled image back to
+    /// guest memory, re-tiled, so the collector can free it. False (nothing freed, guest memory
+    /// untouched or the image still the only complete copy) when the write-back is unsupported
+    /// for this image or could not be completed.
+    bool WriteBackTiledImage(ImageId image_id);
+
     /// Thread function for copying downloaded images out to CPU memory.
     void DownloadedImagesThread(const std::stop_token& token);
 
@@ -387,11 +463,28 @@ private:
     void UntrackImageHead(ImageId image_id);
     void UntrackImageTail(ImageId image_id);
 
+    /// bbport: the page manager's write watchers of an image's pages, and watched_pages with
+    /// them: counted before the pages are protected, uncounted after they are unprotected.
+    void WatchPages(VAddr addr, u64 size);
+    void UnwatchPages(VAddr addr, u64 size);
+
     void MarkAsMaybeDirty(ImageId image_id, Image& image);
     static u64 MaybeDirtyHash(const Image& image);
 
+    /// bbport: for an image with the game's button icons, its data with keycaps over them in
+    /// `data`; false when there is none to draw (engine/key_prompts.h).
+    bool KeyPromptData(const Image& image, std::vector<u8>& data);
+
     /// Removes the image and any views/surface metas that reference it.
     void DeleteImage(ImageId image_id);
+
+    /// bbport (GPU hang guard): destroys the image and its views once the GPU is past the
+    /// current tick (DeleteImage, directly or after BB_IMAGE_FREE_DELAY_FRAMES).
+    void ReclaimImage(ImageId image_id);
+
+    /// bbport (GPU hang guard): hands images unregistered at least BB_IMAGE_FREE_DELAY_FRAMES
+    /// frames ago to ReclaimImage (RunGarbageCollector, once a frame).
+    void FlushImageGraveyard();
 
     /// Touch the image in the LRU cache.
     void TouchImage(const Image& image);
@@ -420,6 +513,9 @@ private:
     std::unordered_set<ImageId> download_images;
     u64 total_used_memory = 0;
     u64 gc_evictions = 0, gc_downloads = 0; ///< bbport: pressure report
+    /// bbport (image write-back GC): tiled images written back / kept (write-back refused or
+    /// failed) since the last pressure report.
+    u64 gc_tiled_written = 0, gc_tiled_kept = 0;
     std::chrono::steady_clock::time_point gc_report_time{};
     /// bbport: gc_tick at each of the last 64 seconds (GarbageCollectImages).
     std::array<u64, 64> gc_tick_at_second{};
@@ -427,16 +523,37 @@ private:
     u64 trigger_gc_memory = 0;
     u64 pressure_gc_memory = 0;
     u64 critical_gc_memory = 0;
+    /// bbport: shadPS4's marks from the startup budget, the floor of the discrete-GPU rule
+    /// (GarbageCollectImages), and the second the driver's budget was last asked for.
+    u64 static_pressure_gc_memory = 0;
+    u64 static_critical_gc_memory = 0;
+    u64 gc_budget_second = ~0ull;
     u64 total_used_samplers = 0;
+    u64 sampler_generation = 0; ///< bbport: samplers freed so far (SamplerGeneration)
     u64 trigger_gc_samplers = 0;
     u64 pressure_gc_samplers = 0;
     u64 critical_gc_samplers = 0;
     u64 gc_tick = 0;
+    /// bbport (GPU hang guard): scheduler.CurrentTick() at each of the last 64 collector passes
+    /// (one a frame, indexed by gc_tick), for "used in the last N frames" in submission ticks.
+    std::array<u64, 64> sched_tick_at_gc{};
+    /// bbport (GPU hang guard): unregistered images whose Vulkan objects are kept for a few more
+    /// frames (DeleteImage): the gc_tick they were deleted at. Slots are not reused meanwhile.
+    struct GraveImage {
+        u64 gc_tick;
+        ImageId image_id;
+    };
+    std::deque<GraveImage> image_graveyard;
+    std::mutex graveyard_mutex;
+    u64 gc_recent_kept = 0; ///< bbport: images kept because used in the last frames
     Common::LeastRecentlyUsedCache<ImageId, u64> lru_cache;
     Common::LeastRecentlyUsedCache<u64, u64> sampler_lru_cache;
     const bool readback_linear_images;
     PageTable page_table;
     std::mutex mutex;
+    /// bbport: the pages tracked images protect, readable without `mutex` (WatchesPages);
+    /// changed with `mutex` held, through WatchPages and UnwatchPages.
+    WatchedPages watched_pages;
     // bbport: FindImage results for unchanged image registrations (guarded by `mutex`).
     struct FindImageCacheEntry {
         VAddr address = 0;
@@ -457,6 +574,9 @@ private:
     std::array<FindImageCacheEntry, 1024> find_image_cache{};
     std::atomic<u64> registry_generation{0};
     std::mutex samplers_mutex;
+    /// bbport: where the game's button icons are (KeyPromptData), for UpdateKeyPrompts.
+    std::mutex key_icons_mutex;
+    std::vector<std::pair<VAddr, u32>> key_icons;
     std::mutex download_images_mutex;
     std::atomic<bool> downloads_queued{false}; ///< download_images may be non-empty (checked without the lock)
     struct MetaDataInfo {

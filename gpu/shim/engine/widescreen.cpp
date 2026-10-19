@@ -87,7 +87,7 @@ void Tick() {
     if(!installed)return;
     const auto& settings=BbSettings::Get();
     const auto index=std::clamp(BbSettings::ResolutionNeedsRestart()?settings.startup_output_res:settings.output_res.load(),0,BbSettings::OutputCount-1);
-    const float want=settings.widescreen?float(BbSettings::OutputWidths[index])/BbSettings::OutputHeights[index]:original_aspect;
+    const float want=settings.widescreen?float(BbSettings::OutputWidth(index))/BbSettings::OutputHeight(index):original_aspect;
     static float applied=0;if(want==applied)return;
     previous_aspect=aspect.load();aspect=want;
     const float rx=std::max(1.0f,want/original_aspect),ry=std::max(1.0f,original_aspect/want);

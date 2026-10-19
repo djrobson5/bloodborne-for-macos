@@ -54,6 +54,20 @@ public:
     template <bool track, bool is_read = false>
     void UpdatePageWatchersForRegion(VAddr base_addr, RegionBits& mask) const;
 
+    /// bbport BB_DEFER_PROTECT (=1; off by default; experiment bit 4 while the game runs): like
+    /// UpdatePageWatchersForRegion<true> for pages the buffer cache has just uploaded, whose copies
+    /// are queued after this call: the counts change now, the write protection is applied by
+    /// bb:Protect or by the first copy that reads the pages (FlushDeferredProtects).
+    void DeferPageWatchersForRegion(VAddr base_addr, RegionBits& mask) const;
+    /// Whether uploads defer their write protection now.
+    [[nodiscard]] bool DeferringProtects() const;
+    /// Before an upload copy reads guest memory (BufferCache::RunGuestCopy, UploadCopies): applies
+    /// the deferred write protections. Any thread; one atomic load when none is pending.
+    static void FlushDeferredProtects();
+    /// Set by the buffer cache: whether its memory model allows deferral (page protection, no
+    /// in-place guest memory, no GPU write twins, readbacks not precise).
+    void AllowDeferredProtects(bool allowed);
+
     /// Returns page aligned address.
     static constexpr VAddr GetPageAddr(VAddr addr) {
         return Common::AlignDown(addr, PM_PAGE_SIZE);

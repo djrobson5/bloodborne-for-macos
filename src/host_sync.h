@@ -67,6 +67,10 @@ typedef uint64_t HostThreadId;
 static inline HostThreadId host_thread_id(void) { return GetCurrentThreadId(); }
 static inline int host_thread_equal(HostThreadId a, HostThreadId b) { return a == b; }
 static inline void host_yield(void) { SwitchToThread(); }
+/* The calling thread above the others (1) or back at normal priority (0). */
+static inline void host_thread_set_high_priority(int high) {
+    SetThreadPriority(GetCurrentThread(), high ? THREAD_PRIORITY_HIGHEST : THREAD_PRIORITY_NORMAL);
+}
 typedef HANDLE HostThread;
 #else
 #include <pthread.h>
@@ -105,6 +109,8 @@ typedef pthread_t HostThreadId;
 static inline HostThreadId host_thread_id(void) { return pthread_self(); }
 static inline int host_thread_equal(HostThreadId a, HostThreadId b) { return pthread_equal(a, b); }
 static inline void host_yield(void) { sched_yield(); }
+/* Raising a thread's priority needs privileges on Linux: left to the scheduler. */
+static inline void host_thread_set_high_priority(int high) { (void)high; }
 typedef pthread_t HostThread;
 #endif
 

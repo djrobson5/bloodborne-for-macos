@@ -161,7 +161,9 @@ public:
             bits.UnsetRange(start_page, end_page);
             if constexpr (type == Type::CPU) {
                 KeepHotPagesModified(start_page, end_page);
-                UpdateProtection<true, false>();
+                // bbport: the caller copies these pages next (ForEachUploadRange): their write
+                // protection may wait for that copy (BB_DEFER_PROTECT).
+                UpdateProtection<true, false, true>();
             } else if (EmulatorSettings.GetReadbacksMode() != GpuReadbacksMode::Disabled) {
                 UpdateProtection<false, true>();
             }
@@ -229,8 +231,10 @@ private:
      * @param new_bits     New state of the word
      *
      * @tparam track True when the tracker should start tracking the new pages
+     * @tparam defer bbport: the pages are copied next; the tracker may defer their write
+     * protection to that copy (PageManager::DeferPageWatchersForRegion)
      */
-    template <bool track, bool is_read>
+    template <bool track, bool is_read, bool defer = false>
     void UpdateProtection() {
         RENDERER_TRACE;
         RegionBits mask = is_read ? (~gpu ^ readable) : (cpu ^ writeable);
@@ -241,6 +245,12 @@ private:
             readable = ~gpu;
         } else {
             writeable = cpu;
+        }
+        if constexpr (defer && track && !is_read) {
+            if (tracker->DeferringProtects()) {
+                tracker->DeferPageWatchersForRegion(cpu_addr, mask);
+                return;
+            }
         }
         tracker->UpdatePageWatchersForRegion<track, is_read>(cpu_addr, mask);
     }

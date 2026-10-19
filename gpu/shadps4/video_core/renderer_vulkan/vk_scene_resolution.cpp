@@ -199,6 +199,19 @@ void SceneTargets::Copy(Entry& e, VideoCore::Image& original, bool to_native) {
                               s32(std::max(1u, original.info.size.height >> e.level)), 1};
     const vk::Offset3D reduced{s32(e.image.image_ci.extent.width),
                                s32(e.image.image_ci.extent.height), 1};
+    // bbport: a resolve of color is a bilinear upscale where the format filters linearly (never
+    // integer formats): native-size passes after the upscaler read these images (effects,
+    // post-processing), and nearest made them blocky. Fills to the proxy and depth/stencil stay
+    // nearest. BB_SCENE_LINEAR_RESOLVE=0 (or experiment bit 1): nearest throughout, as before.
+    static const bool linear_resolve = [] {
+        const char* env = std::getenv("BB_SCENE_LINEAR_RESOLVE");
+        return !(env && env[0] == '0');
+    }();
+    const bool linear =
+        linear_resolve && !BbToggle::Experiment(2) && to_native &&
+        original.aspect_mask == vk::ImageAspectFlags{vk::ImageAspectFlagBits::eColor} &&
+        bool(Features(original.backing->image.image_ci.format) &
+             vk::FormatFeatureFlagBits::eSampledImageFilterLinear);
     for (auto aspect : {vk::ImageAspectFlagBits::eColor, vk::ImageAspectFlagBits::eDepth,
                         vk::ImageAspectFlagBits::eStencil}) {
         if (!(original.aspect_mask & aspect)) continue;
@@ -210,9 +223,10 @@ void SceneTargets::Copy(Entry& e, VideoCore::Image& original, bool to_native) {
         };
         // Nearest preserves depth/stencil and avoids assuming linear blit support for
         // integer G-buffer formats. FSR reconstructs color at the HDR scene boundary.
-        scheduler.Record([src,dst,region](vk::CommandBuffer cmd) {
+        const vk::Filter filter = linear ? vk::Filter::eLinear : vk::Filter::eNearest;
+        scheduler.Record([src,dst,region,filter](vk::CommandBuffer cmd) {
             cmd.blitImage(src, vk::ImageLayout::eTransferSrcOptimal, dst,
-                          vk::ImageLayout::eTransferDstOptimal, region, vk::Filter::eNearest);
+                          vk::ImageLayout::eTransferDstOptimal, region, filter);
         });
     }
     if (to_native) e.state.Resolved(); else e.state.CopiedToProxy();

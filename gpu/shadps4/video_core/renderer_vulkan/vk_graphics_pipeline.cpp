@@ -2,15 +2,27 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <algorithm>
+#include <condition_variable>
+#include <cstdlib>
+#include <deque>
+#include <functional>
+#include <memory>
+#include <mutex>
 #include <stdexcept>
+#include <string>
+#include <thread>
 #include <utility>
 #include <boost/container/small_vector.hpp>
+#include <boost/container/static_vector.hpp>
 
+#include "bbport_threads.h"
+#include "common/thread.h"
 #include "common/serdes.h"
 #include "common/assert.h"
 #include "shader_recompiler/backend/spirv/emit_spirv_discard_frag.h"
 #include "shader_recompiler/backend/spirv/emit_spirv_quad_rect.h"
 #include "video_core/renderer_vulkan/liverpool_to_vk.h"
+#include "video_core/renderer_vulkan/pipeline_compile_queue.h"
 #include "video_core/renderer_vulkan/vk_graphics_pipeline.h"
 #include "video_core/renderer_vulkan/vk_instance.h"
 #include "video_core/renderer_vulkan/vk_object_motion.h"
@@ -20,6 +32,101 @@
 namespace Vulkan {
 
 using Shader::Backend::SPIRV::AuxShaderType;
+
+/// bbport: pipelines first created during play go to compile threads (BB_ASYNC_PIPELINES=0:
+/// on the GPU command thread, as before). Pipelines loaded from the cache at startup are
+/// always created at once.
+bool AsyncPipelinesEnabled() {
+    static const bool enabled = [] {
+        const char* env = std::getenv("BB_ASYNC_PIPELINES");
+        return !(env && env[0] == '0');
+    }();
+    return enabled;
+}
+
+namespace {
+/// A graphics pipeline's create info with everything it points to owned by the job.
+struct PendingPipeline {
+    vk::GraphicsPipelineCreateInfo info;
+    boost::container::static_vector<vk::PipelineShaderStageCreateInfo, MaxShaderStages> stages;
+    vk::PipelineShaderStageRequiredSubgroupSizeCreateInfo subgroup_size;
+    VertexInputs<vk::VertexInputBindingDescription> bindings;
+    VertexInputs<vk::VertexInputAttributeDescription> attributes;
+    VertexInputs<vk::VertexInputBindingDivisorDescriptionEXT> divisors;
+    vk::PipelineVertexInputDivisorStateCreateInfo divisor_state;
+    vk::PipelineVertexInputStateCreateInfo vertex_input;
+    vk::PipelineInputAssemblyStateCreateInfo input_assembly;
+    vk::PipelineTessellationStateCreateInfo tessellation;
+    vk::PipelineViewportDepthClipControlCreateInfoEXT clip_control;
+    vk::PipelineViewportStateCreateInfo viewport;
+    vk::PipelineRasterizationStateCreateInfo raster;
+    vk::PipelineRasterizationProvokingVertexStateCreateInfoEXT provoking;
+    vk::PipelineRasterizationDepthClipStateCreateInfoEXT depth_clip;
+    vk::PipelineMultisampleStateCreateInfo multisample;
+    vk::PipelineDepthStencilStateCreateInfo depth_stencil;
+    std::array<vk::PipelineColorBlendAttachmentState, AmdGpu::NUM_COLOR_BUFFERS> attachments;
+    vk::PipelineColorBlendStateCreateInfo color_blend;
+    boost::container::static_vector<vk::DynamicState, 32> dynamic_states;
+    vk::PipelineDynamicStateCreateInfo dynamic;
+    std::array<vk::Format, Shader::IR::NumRenderTargets> color_formats;
+    std::array<vk::SampleCountFlagBits, AmdGpu::NUM_COLOR_BUFFERS> color_samples;
+    vk::AttachmentSampleCountInfoAMD mixed_samples;
+    vk::PipelineRenderingCreateInfo rendering;
+};
+
+/// Compile threads (BB_PIPELINE_THREADS, default a third of the hardware threads, 1-4), first
+/// in, first out: the draw that needs a pipeline first gets it first. Never stopped: pipelines
+/// destroyed at exit wait for their job (Pipeline::WaitReady).
+class PipelineCompiler {
+public:
+    static PipelineCompiler& Get() {
+        static auto* compiler = new PipelineCompiler();
+        return *compiler;
+    }
+
+    PipelineJobQueue queue;
+    u32 threads = 0;
+
+private:
+    PipelineCompiler() {
+        threads = std::clamp<u32>(BbThreads::Available() / 3, 1, 4);
+        if (const char* env = std::getenv("BB_PIPELINE_THREADS"); env && env[0]) {
+            threads = std::clamp(std::atoi(env), 1, 16);
+        }
+        for (u32 i = 0; i < threads; ++i) {
+            std::thread([this, i] {
+                Common::SetCurrentThreadName(("bb:Pipeline" + std::to_string(i)).c_str());
+                for (;;) {
+                    queue.Pop()();
+                }
+            }).detach();
+        }
+    }
+};
+
+} // namespace
+
+void SubmitPipelineJob(const void* owner, std::function<void()> job) {
+    pipeline_compile_stats.background.fetch_add(1, std::memory_order_relaxed);
+    PipelineCompiler::Get().queue.Push(owner, std::move(job));
+}
+
+std::function<void()> TakePipelineJob(const void* owner) {
+    // bbport: BB_PIPELINE_TAKE=0: a thread that needs a queued pipeline waits for a compile
+    // thread to get to it, as before.
+    static const bool enabled = [] {
+        const char* env = std::getenv("BB_PIPELINE_TAKE");
+        return !(env && env[0] == '0');
+    }();
+    if (!enabled) {
+        return {};
+    }
+    return PipelineCompiler::Get().queue.Take(owner);
+}
+
+u32 PipelineCompileThreads() {
+    return PipelineCompiler::Get().threads;
+}
 
 static constexpr std::array LogicalStageToStageBit = {
     vk::ShaderStageFlagBits::eFragment,
@@ -428,6 +535,105 @@ GraphicsPipeline::GraphicsPipeline(
         .layout = *pipeline_layout,
     };
 
+    // bbport (BB_ASYNC_PIPELINES): a pipeline first seen during play is created by a compile
+    // thread; the draw recording thread waits for it only when it records the bind (Handle).
+    // Meanwhile the GPU command thread decodes on and starts the next new pipelines, so a burst
+    // of compiles (area loads: 50-90 at once, 0.5-1.3 s on one thread) runs in parallel.
+    if (!preloading && AsyncPipelinesEnabled()) {
+        auto job = std::make_shared<PendingPipeline>();
+        auto& j = *job;
+        bool ok = true;
+        j.stages.assign(shader_stages.begin(), shader_stages.end());
+        j.subgroup_size = subgroup_size_ci;
+        ok &= subgroup_size_ci.pNext == nullptr;
+        for (auto& s : j.stages) {
+            ok &= s.pNext == nullptr || s.pNext == &subgroup_size_ci;
+            s.pNext = s.pNext ? &j.subgroup_size : nullptr;
+        }
+        j.bindings = sdata.vertex_bindings;
+        j.attributes = sdata.vertex_attributes;
+        j.divisors = sdata.divisors;
+        j.divisor_state = divisor_state;
+        ok &= divisor_state.pNext == nullptr &&
+              divisor_state.pVertexBindingDivisors == sdata.divisors.data();
+        j.divisor_state.pVertexBindingDivisors = j.divisors.data();
+        j.vertex_input = vertex_input_info;
+        ok &= vertex_input_info.pNext == nullptr || vertex_input_info.pNext == &divisor_state;
+        j.vertex_input.pNext = vertex_input_info.pNext ? &j.divisor_state : nullptr;
+        j.vertex_input.pVertexBindingDescriptions = j.bindings.data();
+        j.vertex_input.pVertexAttributeDescriptions = j.attributes.data();
+        j.input_assembly = input_assembly;
+        j.tessellation = tessellation_state;
+        j.clip_control = clip_control;
+        j.viewport = viewport_info;
+        ok &= viewport_info.pNext == nullptr || viewport_info.pNext == &clip_control;
+        j.viewport.pNext = viewport_info.pNext ? &j.clip_control : nullptr;
+        // The rasterization chain, linked again in the same order without unlinked parts.
+        j.raster = raster_chain.get<vk::PipelineRasterizationStateCreateInfo>();
+        j.provoking = raster_chain.get<vk::PipelineRasterizationProvokingVertexStateCreateInfoEXT>();
+        j.depth_clip = raster_chain.get<vk::PipelineRasterizationDepthClipStateCreateInfoEXT>();
+        {
+            const void** next = &j.raster.pNext;
+            if (instance.IsProvokingVertexSupported()) {
+                *next = &j.provoking;
+                next = &j.provoking.pNext;
+            }
+            if (instance.IsDepthClipEnableSupported()) {
+                *next = &j.depth_clip;
+                next = &j.depth_clip.pNext;
+            }
+            *next = nullptr;
+        }
+        j.multisample = sdata.multisampling;
+        ok &= sdata.multisampling.pNext == nullptr && sdata.multisampling.pSampleMask == nullptr;
+        j.depth_stencil = depth_stencil_info;
+        j.attachments = attachments;
+        j.color_blend = color_blending;
+        ok &= color_blending.pNext == nullptr;
+        j.color_blend.pAttachments = j.attachments.data();
+        j.dynamic_states.assign(dynamic_states.begin(), dynamic_states.end());
+        j.dynamic = dynamic_info;
+        j.dynamic.pDynamicStates = j.dynamic_states.data();
+        j.color_formats = color_formats;
+        j.color_samples = color_samples;
+        j.mixed_samples = mixed_samples;
+        j.mixed_samples.pColorAttachmentSamples = j.color_samples.data();
+        j.rendering = pipeline_rendering_ci;
+        ok &= pipeline_rendering_ci.pNext == nullptr || pipeline_rendering_ci.pNext == &mixed_samples;
+        j.rendering.pNext = pipeline_rendering_ci.pNext ? &j.mixed_samples : nullptr;
+        j.rendering.pColorAttachmentFormats = j.color_formats.data();
+        j.info = pipeline_info;
+        ok &= input_assembly.pNext == nullptr && tessellation_state.pNext == nullptr &&
+              clip_control.pNext == nullptr && dynamic_info.pNext == nullptr &&
+              mixed_samples.pNext == nullptr && pipeline_info.pRasterizationState == &raster_chain.get() &&
+              pipeline_info.pMultisampleState == &sdata.multisampling;
+        j.info.pNext = &j.rendering;
+        j.info.stageCount = static_cast<u32>(j.stages.size());
+        j.info.pStages = j.stages.data();
+        j.info.pVertexInputState = pipeline_info.pVertexInputState ? &j.vertex_input : nullptr;
+        j.info.pInputAssemblyState = &j.input_assembly;
+        j.info.pTessellationState = &j.tessellation;
+        j.info.pViewportState = &j.viewport;
+        j.info.pRasterizationState = &j.raster;
+        j.info.pMultisampleState = &j.multisample;
+        j.info.pDepthStencilState = pipeline_info.pDepthStencilState ? &j.depth_stencil : nullptr;
+        j.info.pColorBlendState = &j.color_blend;
+        j.info.pDynamicState = &j.dynamic;
+        // Anything this copy does not know how to own (a chain added later): created here.
+        if (ok) {
+            ready.store(false, std::memory_order_relaxed);
+            SubmitPipelineJob(this, [this, job, device, cache = pipeline_cache, name = debug_str] {
+                auto [result, created] = device.createGraphicsPipelineUnique(cache, job->info);
+                ASSERT_MSG(result == vk::Result::eSuccess,
+                           "Failed to create graphics pipeline: {}", vk::to_string(result));
+                pipeline = std::move(created);
+                SetObjectName(device, *pipeline, "Graphics Pipeline {}", name);
+                MarkReady();
+            });
+            return;
+        }
+    }
+
     auto [pipeline_result, pipe] =
         device.createGraphicsPipelineUnique(pipeline_cache, pipeline_info);
     if (preloading && pipeline_result != vk::Result::eSuccess) {
@@ -442,7 +648,10 @@ GraphicsPipeline::GraphicsPipeline(
     SetObjectName(device, *pipeline, "Graphics Pipeline {}", debug_str);
 }
 
-GraphicsPipeline::~GraphicsPipeline() = default;
+GraphicsPipeline::~GraphicsPipeline() {
+    // bbport: the compile thread may still be creating it (its job points at this object).
+    WaitReady();
+}
 
 template <typename Attribute, typename Binding>
 void GraphicsPipeline::GetVertexInputs(

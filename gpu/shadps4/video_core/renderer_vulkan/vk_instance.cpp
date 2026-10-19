@@ -1,6 +1,7 @@
 // SPDX-FileCopyrightText: Copyright 2024 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <cstdio>
 #include <boost/container/static_vector.hpp>
 #include <fmt/format.h>
 #include <fmt/ranges.h>
@@ -13,6 +14,8 @@
 #include "video_core/renderer_vulkan/liverpool_to_vk.h"
 #include "bbport_toggles.h"
 #include "video_core/renderer_vulkan/vk_instance.h"
+#include "video_core/renderer_vulkan/vk_fsr4vk.h"
+#include "video_core/renderer_vulkan/vk_occlusion.h"
 #include "video_core/renderer_vulkan/vk_platform.h"
 
 #include <vk_mem_alloc.h>
@@ -220,7 +223,9 @@ bool Instance::CreateDevice() {
         vk::PhysicalDeviceImage2DViewOf3DFeaturesEXT, vk::PhysicalDeviceShaderClockFeaturesKHR,
         vk::PhysicalDeviceComputeShaderDerivativesFeaturesKHR,
         vk::PhysicalDeviceShaderMixedFloatDotProductFeaturesVALVE,
-        vk::PhysicalDeviceCooperativeMatrixFeaturesKHR, vk::PhysicalDeviceShaderFloat8FeaturesEXT>();
+        vk::PhysicalDeviceCooperativeMatrixFeaturesKHR, vk::PhysicalDeviceShaderFloat8FeaturesEXT,
+        vk::PhysicalDeviceMutableDescriptorTypeFeaturesEXT,
+        vk::PhysicalDeviceDescriptorBufferFeaturesEXT>();
     features = feature_chain.get().features;
 
     const vk::StructureChain properties_chain = physical_device.getProperties2<
@@ -238,7 +243,7 @@ bool Instance::CreateDevice() {
         return false;
     }
 
-    boost::container::static_vector<const char*, 48> enabled_extensions;
+    boost::container::static_vector<const char*, 64> enabled_extensions;
     const auto add_extension = [&](std::string_view extension) -> bool {
         const auto result =
             std::find_if(available_extensions.begin(), available_extensions.end(),
@@ -392,6 +397,19 @@ bool Instance::CreateDevice() {
     }
     const bool calibrated_timestamps =
         TRACY_GPU_ENABLED ? add_extension(VK_EXT_CALIBRATED_TIMESTAMPS_EXTENSION_NAME) : false;
+    // bbport: HDR output (vk_swapchain.cpp): the display's luminance for the HDR swapchain.
+    hdr_metadata = add_extension(VK_EXT_HDR_METADATA_EXTENSION_NAME);
+    // bbport (Windows): BB_EXCLUSIVE_FULLSCREEN=0 keeps the swapchain from ever becoming
+    // exclusive fullscreen (vk_swapchain.cpp), so a driver cannot switch Windows HDR off for an
+    // SDR image. Off by default: the driver's exclusive mode has the lowest latency and keeps
+    // G-SYNC "fullscreen only" working, HDR output keeps HDR on by itself, and the launcher turns
+    // Windows HDR back on after the game.
+    const char* exclusive = std::getenv("BB_EXCLUSIVE_FULLSCREEN");
+    if (const char* fse = FullScreenExclusiveExtensionName();
+        fse && exclusive && exclusive[0] == '0' &&
+        IsInstanceExtensionEnabled(VK_KHR_GET_SURFACE_CAPABILITIES_2_EXTENSION_NAME)) {
+        full_screen_exclusive = add_extension(fse);
+    }
 
     const auto family_properties = physical_device.getQueueFamilyProperties();
     if (family_properties.empty()) {
@@ -444,6 +462,37 @@ bool Instance::CreateDevice() {
     const auto vk11_features = feature_chain.get<vk::PhysicalDeviceVulkan11Features>();
     vk12_features = feature_chain.get<vk::PhysicalDeviceVulkan12Features>();
     vk13_features = feature_chain.get<vk::PhysicalDeviceVulkan13Features>();
+    // bbport: FSR 4.1.1 through the fsr4vk provider DLL (vk_fsr4vk.cpp). Its device requirements
+    // (provider/INTEGRATION-CONTRACT.md) are standard features and two extensions; they are
+    // requested only when the DLL is installed and the device has all of them, so nothing changes
+    // for other paths.
+    const auto extension_available = [&](std::string_view extension) {
+        return std::find(available_extensions.begin(), available_extensions.end(), extension) !=
+               available_extensions.end();
+    };
+    fsr4vk = Fsr4Vk::FilesPresent() && features.shaderInt16 &&
+             features.shaderStorageImageReadWithoutFormat &&
+             features.shaderStorageImageWriteWithoutFormat && vk12_features.shaderFloat16 &&
+             vk12_features.shaderInt8 && vk12_features.storageBuffer8BitAccess &&
+             vk12_features.runtimeDescriptorArray &&
+             vk12_features.descriptorBindingVariableDescriptorCount &&
+             vk12_features.bufferDeviceAddress && vk13_features.synchronization2 &&
+             vk13_features.shaderIntegerDotProduct && compute_shader_derivatives &&
+             compute_shader_derivatives_features.computeDerivativeGroupLinear &&
+             feature_chain.get<vk::PhysicalDeviceMutableDescriptorTypeFeaturesEXT>()
+                 .mutableDescriptorType &&
+             feature_chain.get<vk::PhysicalDeviceDescriptorBufferFeaturesEXT>().descriptorBuffer &&
+             extension_available(VK_EXT_MUTABLE_DESCRIPTOR_TYPE_EXTENSION_NAME) &&
+             extension_available(VK_EXT_DESCRIPTOR_BUFFER_EXTENSION_NAME);
+    if (fsr4vk) {
+        add_extension(VK_EXT_MUTABLE_DESCRIPTOR_TYPE_EXTENSION_NAME);
+        add_extension(VK_EXT_DESCRIPTOR_BUFFER_EXTENSION_NAME);
+        LOG_INFO(Render_Vulkan, "fsr4vk: {} found, its device features are enabled",
+                 Fsr4Vk::LibraryPathUtf8());
+        std::printf("Upscaler: fsr4vk found (%s): FSR 4.1.1 available\n", Fsr4Vk::LibraryPathUtf8().c_str());
+    } else if (Fsr4Vk::FilesPresent()) {
+        std::printf("Upscaler: fsr4vk found, but this GPU lacks a Vulkan feature it needs: no FSR 4.1.1\n");
+    }
     vk::StructureChain device_chain = {
         vk::DeviceCreateInfo{
             .queueCreateInfoCount = queue_info_count,
@@ -469,11 +518,15 @@ bool Instance::CreateDevice() {
                 .wideLines = features.wideLines,
                 .multiViewport = features.multiViewport,
                 .samplerAnisotropy = features.samplerAnisotropy,
+                // bbport: the game asks for exact counts (PERFECT_ZPASS_COUNTS), vk_occlusion.
+                .occlusionQueryPrecise = features.occlusionQueryPrecise && Occlusion::Wanted(),
                 .vertexPipelineStoresAndAtomics = features.vertexPipelineStoresAndAtomics,
                 .fragmentStoresAndAtomics = features.fragmentStoresAndAtomics,
                 .shaderImageGatherExtended = features.shaderImageGatherExtended,
                 .shaderStorageImageExtendedFormats = features.shaderStorageImageExtendedFormats,
                 .shaderStorageImageMultisample = features.shaderStorageImageMultisample,
+                // bbport: fsr4vk (vk_fsr4vk.cpp) only.
+                .shaderStorageImageReadWithoutFormat = fsr4vk,
                 // bbport: required by the FSR 3 accumulate shaders (vk_temporal_upscaler).
                 .shaderStorageImageWriteWithoutFormat =
                     features.shaderStorageImageWriteWithoutFormat,
@@ -497,6 +550,9 @@ bool Instance::CreateDevice() {
             .shaderSharedInt64Atomics = vk12_features.shaderSharedInt64Atomics,
             .shaderFloat16 = vk12_features.shaderFloat16,
             .shaderInt8 = vk12_features.shaderInt8,
+            // bbport: fsr4vk (vk_fsr4vk.cpp) only.
+            .descriptorBindingVariableDescriptorCount = fsr4vk,
+            .runtimeDescriptorArray = fsr4vk,
             .scalarBlockLayout = vk12_features.scalarBlockLayout,
             .uniformBufferStandardLayout = vk12_features.uniformBufferStandardLayout,
             .separateDepthStencilLayouts = vk12_features.separateDepthStencilLayouts,
@@ -607,6 +663,12 @@ bool Instance::CreateDevice() {
             .shaderFloat8 = true,
             .shaderFloat8CooperativeMatrix = true,
         },
+        vk::PhysicalDeviceMutableDescriptorTypeFeaturesEXT{
+            .mutableDescriptorType = true,
+        },
+        vk::PhysicalDeviceDescriptorBufferFeaturesEXT{
+            .descriptorBuffer = true,
+        },
     };
 
     if (!custom_border_color) {
@@ -669,6 +731,10 @@ bool Instance::CreateDevice() {
     }
     if (!shader_float8) {
         device_chain.unlink<vk::PhysicalDeviceShaderFloat8FeaturesEXT>();
+    }
+    if (!fsr4vk) {
+        device_chain.unlink<vk::PhysicalDeviceMutableDescriptorTypeFeaturesEXT>();
+        device_chain.unlink<vk::PhysicalDeviceDescriptorBufferFeaturesEXT>();
     }
 
     auto [device_result, dev] = physical_device.createDeviceUnique(device_chain.get());

@@ -43,5 +43,16 @@ int main() {
     assert(Fit(1920,1080).offset==(std::array<float,2>{0,0}));
     assert(std::abs(Fit(3440,1440).offset[0]-440)<.01f);
     assert(std::abs(Fit(5120,1440).offset[0]-1280)<.01f);
+    // Widescreen on a 21:9 or 16:10 screen: the widened UI viewport fills the image unstretched,
+    // and the stage's own 1920x1080 inside it lands where the centred fit puts it.
+    const auto wide = ParseUiSize("2520x1080");
+    assert(wide[0] == 2520 && wide[1] == 1080);
+    assert(ParseUiSize(nullptr)[0] == 1920 && ParseUiSize("800x600")[0] == 1920 && ParseUiSize("junk")[1] == 1080);
+    assert(NativeViewport(2520, -1080, wide) && NativeViewport(1920, 1080, wide) && !NativeViewport(2560, 1080, wide));
+    const auto w = Fit(3360, 1440, wide);
+    assert(w.scale[0] == w.scale[1] && std::abs(w.offset[0]) < .01f && std::abs(w.offset[1]) < .01f);
+    assert(std::abs((300 * w.scale[0] + w.offset[0]) - Fit(3360, 1440).offset[0]) < .01f);
+    const auto t = Fit(1920, 1200, ParseUiSize("1920x1200"));
+    assert(t.scale[0] == 1 && t.offset[1] == 0);
     std::puts("UI composition: PASS (menu without camera, HUD, FSR off, viewport scaling)");
 }

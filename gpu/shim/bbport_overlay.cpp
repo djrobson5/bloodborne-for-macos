@@ -12,12 +12,16 @@
 
 #include <SDL3/SDL.h>
 #include "bbport_settings.h"
+#include "bbport_usage.h"
+#include "engine/cheats.h"
+#include "engine/graphics.h"
 #include "imgui.h"
 #include "imgui_impl_vulkan.h"
 #include "video_core/renderer_vulkan/vk_instance.h"
 #include "video_core/renderer_vulkan/vk_scheduler.h"
 
-// DejaVu Sans (Cyrillic), embedded (third_party/fonts, Bitstream Vera license).
+// DejaVu Sans (Latin with Latin Extended, Greek, Cyrillic), embedded (third_party/fonts, Bitstream
+// Vera license).
 #ifdef _WIN32
 // PE/COFF assemblers have no .hidden/.previous: the compiler embeds the file (#embed, a GCC
 // extension in C++).
@@ -156,10 +160,44 @@ void Checkbox(const char* label, std::atomic<bool>& value) {
     Store(value, v, changed);
 }
 
-void Slider(const char* label, std::atomic<float>& value, float lo, float hi) {
+bool Slider(const char* label, std::atomic<float>& value, float lo, float hi,
+            const char* format = "%.2f", ImGuiSliderFlags flags = ImGuiSliderFlags_None) {
     float v = value;
-    const bool changed = ImGui::SliderFloat(label, &v, lo, hi, "%.2f");
+    const bool changed = ImGui::SliderFloat(label, &v, lo, hi, format, flags);
     Store(value, v, changed);
+    return changed;
+}
+
+// The amounts Custom starts from (the last one chosen in this session).
+int custom_vials = 20, custom_bullets = 20;
+
+// A cheat (engine/cheats.cpp): Off / Infinite / Custom, and the amount for Custom; live.
+void Cheat(const char* label, std::atomic<int>& value, BbEngine::Cheats::Which which, int& custom) {
+    ImGui::PushID(label);
+    const char* modes[] = {BbSettings::MenuText("Off", "Выкл."),
+                           BbSettings::MenuText("Infinite", "Бесконечно"),
+                           BbSettings::MenuText("Custom", "Своё количество")};
+    const int current = value;
+    int mode = current == BbSettings::CheatOff ? 0 : current == BbSettings::CheatInfinite ? 1 : 2;
+    if (current > 0) {
+        custom = current;
+    }
+    if (ImGui::Combo(label, &mode, modes, 3)) {
+        Store(value, mode == 0 ? BbSettings::CheatOff : mode == 1 ? BbSettings::CheatInfinite : custom, true);
+    }
+    if (mode == 2) {
+        int amount = std::clamp(custom, 1, BbSettings::CheatMaxAmount);
+        const bool changed = ImGui::SliderInt(BbSettings::MenuText("Amount", "Количество"), &amount, 1,
+                                              BbSettings::CheatMaxAmount, "%d", ImGuiSliderFlags_AlwaysClamp);
+        if (changed) {
+            custom = std::clamp(amount, 1, BbSettings::CheatMaxAmount);
+            Store(value, custom, true);
+        }
+    }
+    if (const char* why = BbEngine::Cheats::Unavailable(which)) {
+        ImGui::TextDisabled("%s: %s", BbSettings::MenuText("Unavailable", "Недоступно"), why);
+    }
+    ImGui::PopID();
 }
 
 void Hint(const char* text) {
@@ -171,6 +209,208 @@ void Hint(const char* text) {
         ImGui::PopTextWrapPos();
         ImGui::EndTooltip();
     }
+}
+
+void CheatUnavailable(BbEngine::Cheats::Which which) {
+    if (const char* why = BbEngine::Cheats::Unavailable(which)) {
+        ImGui::TextDisabled("%s: %s", BbSettings::MenuText("Unavailable", "Недоступно"), why);
+    }
+}
+
+// An on/off cheat (engine/cheats.cpp); live.
+void CheatToggle(const char* label, std::atomic<bool>& value, BbEngine::Cheats::Which which, const char* hint) {
+    ImGui::PushID(label);
+    Checkbox(label, value);
+    Hint(hint);
+    CheatUnavailable(which);
+    ImGui::PopID();
+}
+
+// A cheat with a few levels, the first the game's own; live.
+template <std::size_t N>
+void CheatLevels(const char* label, std::atomic<int>& value, const int (&levels)[N], const char* const (&names)[N],
+                 BbEngine::Cheats::Which which, const char* hint) {
+    ImGui::PushID(label);
+    const int current = value;
+    int index = 0;
+    for (std::size_t i = 0; i < N; ++i) {
+        if (levels[i] == current) {
+            index = int(i);
+        }
+    }
+    if (ImGui::Combo(label, &index, names, int(N))) {
+        Store(value, levels[index], true);
+    }
+    Hint(hint);
+    CheatUnavailable(which);
+    ImGui::PopID();
+}
+
+// Adds Blood Echoes / Insight to the character in the world (applied by the engine's frame hook).
+void CheatStats() {
+    const bool off = BbEngine::Cheats::Unavailable(BbEngine::Cheats::Echoes) != nullptr;
+    ImGui::BeginDisabled(off);
+    ImGui::TextUnformatted(BbSettings::MenuText("Blood Echoes", "Отголоски крови"));
+    for (int amount : {1000, 10000, 100000}) {
+        char label[32];
+        std::snprintf(label, sizeof(label), "+%d,%03d", amount / 1000, 0);
+        ImGui::SameLine();
+        if (ImGui::Button(label)) {
+            BbEngine::Cheats::AddEchoes(amount);
+        }
+    }
+    ImGui::SameLine();
+    if (ImGui::Button(BbSettings::MenuText("+1 Insight", "+1 озарение"))) {
+        BbEngine::Cheats::AddInsight(1);
+    }
+    ImGui::EndDisabled();
+    Hint(BbSettings::MenuText(
+        "Added to the character in the world, up to the game's limits (999,999,999 Blood Echoes, 99 Insight). "
+        "They are saved with your character: turning cheats off does not take them back.",
+        "Добавляются персонажу в игре, до пределов игры (999 999 999 отголосков, 99 озарения). Они "
+        "сохраняются вместе с персонажем: выключение читов их не отнимает."));
+    CheatUnavailable(BbEngine::Cheats::Echoes);
+}
+
+// HDR output (bbport.ini hdr*): on/off on restart; paper white, peak and boost live.
+void HdrSection() {
+    auto& s = BbSettings::Get();
+    ImGui::SeparatorText(BbSettings::MenuText("HDR output", "Вывод HDR"));
+    Checkbox(BbSettings::MenuText("HDR output (restart required)", "Вывод HDR (после перезапуска)"),
+             s.hdr);
+    Hint(BbSettings::MenuText(
+        "Shows the game's SDR picture on an HDR display without washed-out colors, with optional "
+        "highlight expansion. Windows HDR must be on (Settings > Display > Use HDR). Turning it "
+        "on or off applies after restarting the game.",
+        "Показывает SDR-картинку игры на HDR-дисплее без блёклых цветов, с необязательным "
+        "расширением светлых участков. В Windows должен быть включён HDR (Параметры > Дисплей > "
+        "Использовать HDR). Включение и выключение применяются после перезапуска игры."));
+    const int output = s.hdr_output.load();
+    if (output == BbSettings::HdrOutputOff) {
+        if (s.startup_hdr) {
+            ImGui::PushTextWrapPos();
+            ImGui::TextColored(ImVec4(1.0f, 0.5f, 0.3f, 1.0f), "%s",
+                               BbSettings::MenuText(
+                                   "Not active: the display offers no HDR format (is Windows HDR on?)",
+                                   "Не активен: дисплей не предлагает HDR-формат (включён ли HDR "
+                                   "в Windows?)"));
+            ImGui::PopTextWrapPos();
+        }
+        return;
+    }
+    ImGui::TextDisabled("%s", output == BbSettings::HdrOutputScRgb
+                                  ? BbSettings::MenuText("Active: scRGB (FP16)", "Активен: scRGB (FP16)")
+                                  : BbSettings::MenuText("Active: HDR10 (PQ, BT.2020)",
+                                                         "Активен: HDR10 (PQ, BT.2020)"));
+    // bbport: hdr_mode, live (docs/hdr.md).
+    const char* modes[BbSettings::HdrModeCount] = {
+        BbSettings::MenuText("Native (from the game's HDR scene)", "Нативный (из HDR-сцены игры)"),
+        BbSettings::MenuText("Expand (from the SDR picture)", "Расширение (из SDR-картинки)"),
+    };
+    int mode = std::clamp(s.hdr_mode.load(), 0, BbSettings::HdrModeCount - 1);
+    const bool mode_changed = ImGui::Combo(BbSettings::MenuText("HDR mode", "Режим HDR"), &mode,
+                                           modes, BbSettings::HdrModeCount);
+    Store(s.hdr_mode, mode, mode_changed);
+    Hint(BbSettings::MenuText(
+        "Native: the brightness of lamps, fire, the moon and other highlights comes from the "
+        "game's own HDR scene, before its tonemap clipped it to SDR white. Midtones, colours and "
+        "the UI stay as in the SDR picture. Menus, loading screens and movies (no scene) use "
+        "Expand. Expand: the SDR picture's brightest parts are stretched towards the peak.",
+        "Нативный: яркость ламп, огня, луны и других светлых мест берётся из собственной "
+        "HDR-сцены игры, до того как тонмаппинг обрезал её до белого SDR. Средние тона, цвета и "
+        "интерфейс остаются как в SDR-картинке. В меню, на загрузках и в видеороликах (без сцены) "
+        "работает «Расширение». Расширение: самые яркие места SDR-картинки растягиваются к пику."));
+    Slider(BbSettings::MenuText("Paper white (nits)", "Белый SDR (нит)"), s.hdr_paper_white,
+           BbSettings::HdrPaperWhiteMin, BbSettings::HdrPaperWhiteMax, "%.0f",
+           ImGuiSliderFlags_AlwaysClamp);
+    Slider(BbSettings::MenuText("Peak brightness (nits)", "Пиковая яркость (нит)"), s.hdr_peak,
+           BbSettings::HdrPeakMin, BbSettings::HdrPeakMax, "%.0f",
+           ImGuiSliderFlags_AlwaysClamp | ImGuiSliderFlags_Logarithmic);
+    Slider(BbSettings::MenuText("Highlight boost", "Усиление светлых участков"), s.hdr_boost, 0.0f,
+           1.0f, "%.2f", ImGuiSliderFlags_AlwaysClamp);
+    if (mode == BbSettings::HdrModeNative) {
+        Slider(BbSettings::MenuText("UI brightness", "Яркость интерфейса"), s.hdr_ui_brightness,
+               BbSettings::HdrUiBrightnessMin, BbSettings::HdrUiBrightnessMax, "%.2f", ImGuiSliderFlags_AlwaysClamp);
+        Slider(BbSettings::MenuText("UI colour", "Цвета интерфейса"), s.hdr_ui_color, 0.0f, 1.0f, "%.2f",
+               ImGuiSliderFlags_AlwaysClamp);
+        Hint(BbSettings::MenuText(
+            "Native mode only: the game's HUD, menus, subtitles and loading screens. UI brightness: their "
+            "white, times paper white. UI colour: 0 shows their exact sRGB colours, 1 the wider colours a "
+            "wide-gamut monitor shows SDR with (the usual look; exact sRGB can look washed out next to "
+            "it). Live.",
+            "Только в нативном режиме: интерфейс игры, меню, субтитры и экраны загрузки. Яркость "
+            "интерфейса: его белый, умноженный на белый SDR. Цвета интерфейса: 0 — точные цвета sRGB, "
+            "1 — более насыщенные, как на мониторе с широким охватом в SDR (привычный вид; точный sRGB "
+            "рядом с ним может казаться блёклым). Меняются сразу."));
+    }
+    Hint(BbSettings::MenuText(
+        "Paper white: how bright the game's white (and this menu) is; about 200 suits a dim room. "
+        "Peak: your display's peak brightness (its HDR specs, or the Windows HDR Calibration app). "
+        "Highlight boost: 0 shows the SDR picture as it is; higher values let the brightest parts "
+        "(lamps, fire, the moon) rise towards the peak. In Native mode it is how much of the "
+        "scene's own highlight range is shown: 0.25 about half, 1 all of it (up to the peak). "
+        "Changes apply live. Ctrl+click a slider to type an exact value.",
+        "Белый SDR: яркость белого в игре (и этого меню); около 200 подходит для неяркой комнаты. "
+        "Пиковая яркость: максимум вашего дисплея (в его характеристиках HDR или в приложении "
+        "«Калибровка HDR» Windows). Усиление светлых участков: 0 — SDR-картинка как есть; больше — "
+        "самые яркие места (лампы, огонь, луна) поднимаются к пику. В нативном режиме — какая "
+        "доля собственного диапазона светлых мест сцены показывается: 0.25 — около половины, "
+        "1 — весь (до пика). Меняются сразу. Ctrl+клик по ползунку — ввести точное значение."));
+}
+
+// The game's own picture for each area (engine/graphics.cpp), live: Picture tuning too.
+void PictureSection() {
+    auto& s = BbSettings::Get();
+    ImGui::SeparatorText(BbSettings::MenuText("Picture", "Изображение"));
+    const bool live = BbEngine::Graphics::Enabled();
+    if (!live) {
+        ImGui::TextDisabled("%s", BbSettings::MenuText("Unavailable: the game's code differs from version 1.09.",
+                                                       "Недоступно: код игры отличается от версии 1.09."));
+    }
+    ImGui::BeginDisabled(!live);
+    Checkbox(BbSettings::MenuText("Picture tuning", "Настройка изображения"), s.graphics_controls);
+    // A moved setting turns Picture tuning on: it gates them all.
+    const bool vignette = s.graphics_vignette;
+    // The useful range on the slider; Ctrl+click types any value (bbport_settings.cpp keeps it
+    // within wide limits).
+    bool moved = Slider(BbSettings::MenuText("Brightness", "Яркость"), s.graphics_brightness, 0.0f, 3.0f);
+    moved |= Slider(BbSettings::MenuText("Contrast", "Контраст"), s.graphics_contrast, 0.8f, 1.2f, "%.3f");
+    moved |= Slider(BbSettings::MenuText("Saturation", "Насыщенность"), s.graphics_saturation, 0.0f, 3.0f);
+    moved |= Slider(BbSettings::MenuText("Hue", "Оттенок"), s.graphics_hue, -180.0f, 180.0f, "%.0f");
+    moved |= Slider(BbSettings::MenuText("Fog", "Туман"), s.graphics_fog, 0.0f, 3.0f);
+    moved |= Slider("Bloom", s.graphics_bloom, 0.0f, 3.0f);
+    Checkbox(BbSettings::MenuText("Vignette", "Виньетка"), s.graphics_vignette);
+    moved |= vignette != s.graphics_vignette;
+    moved |= Slider(BbSettings::MenuText("Ambient occlusion strength", "Сила затенения (AO)"), s.graphics_ao_strength,
+                    0.0f, 3.0f);
+    moved |= Slider(BbSettings::MenuText("Shadow distance", "Дальность теней"), s.graphics_shadow_scale, 0.5f, 4.0f);
+    if (moved && !s.graphics_controls) {
+        Store(s.graphics_controls, true, true);
+    }
+    if (ImGui::Button(BbSettings::MenuText("Game's own picture", "Как в игре"))) {
+        Store(s.graphics_brightness, 1.0f, true);
+        Store(s.graphics_contrast, 1.0f, true);
+        Store(s.graphics_saturation, 1.0f, true);
+        Store(s.graphics_hue, 0.0f, true);
+        Store(s.graphics_fog, 1.0f, true);
+        Store(s.graphics_bloom, 1.0f, true);
+        Store(s.graphics_vignette, true, true);
+        Store(s.graphics_ao_strength, 1.0f, true);
+        Store(s.graphics_shadow_scale, 1.0f, true);
+    }
+    ImGui::EndDisabled();
+    Hint(BbSettings::MenuText(
+        "Changes apply live, Picture tuning too, to the game's own colour, fog and lighting of each area "
+        "(the HUD and menus keep theirs). Moving one turns Picture tuning on; off: the game's own picture. 1.00 and Hue 0 are the game's. Fog 0 clears the haze over distant streets. The "
+        "same settings are in the game's System menu (PC Graphics, PC Effects, PC Colour) and the "
+        "launcher. Ctrl+click a slider to type any value, beyond its ends too (brightness, saturation and fog "
+        "up to 5, contrast 0.5-1.5, hue -180-180, bloom up to 10, shadow distance 0.25-8).",
+        "Меняются сразу, как и сама настройка: собственные цвет, туман и освещение каждой области "
+        "(интерфейс и меню не меняются). Выкл. — картинка игры. 1.00 и оттенок 0 — как в игре. Туман 0 убирает дымку над дальними улицами. Те же "
+        "настройки есть в системном меню игры (PC Graphics, PC Effects, PC Colour) и в лаунчере. "
+        "Ctrl+клик по ползунку — ввести любое значение, в том числе за его краями (яркость, "
+        "насыщенность и туман до 5, контраст 0.5-1.5, оттенок -180-180, bloom до 10, дальность теней "
+        "0.25-8)."));
 }
 
 void Menu() {
@@ -185,6 +425,18 @@ void Menu() {
         pos.y = viewport->WorkPos.y +
                 std::clamp(s.menu_y * viewport->WorkSize.y, 0.0f, std::max(viewport->WorkSize.y - margin, 0.0f));
     }
+    // The contents are taller than a 1080p screen: the window ends above the screen's bottom edge
+    // wherever its top is, so its scroll bar and resize corner stay in reach, and it opens as tall
+    // as that allows (the contents' own height when they fit).
+    static int last_frame = -2;
+    static float window_top = 0.0f;
+    const float min_height = 240.0f * base_scale;
+    const float bottom = viewport->WorkPos.y + viewport->WorkSize.y - 8.0f * base_scale;
+    pos.y = std::min(pos.y, std::max(viewport->WorkPos.y, bottom - min_height));
+    const bool appearing = ImGui::GetFrameCount() != last_frame + 1;
+    const float top = appearing ? pos.y : window_top;
+    ImGui::SetNextWindowSizeConstraints(ImVec2(360.0f * base_scale, min_height),
+                                        ImVec2(FLT_MAX, std::max(min_height, bottom - top)));
     ImGui::SetNextWindowPos(pos, ImGuiCond_Appearing);
     ImGui::SetNextWindowSize(ImVec2(620.0f * base_scale, 0.0f), ImGuiCond_Appearing);
     bool keep_open = true;
@@ -195,6 +447,8 @@ void Menu() {
         ImGui::End();
         return;
     }
+    last_frame = ImGui::GetFrameCount();
+    window_top = ImGui::GetWindowPos().y;
     // Moved: remembered (saved with the settings when the menu closes).
     if (!ImGui::IsWindowAppearing() && viewport->WorkSize.x > 0.0f && viewport->WorkSize.y > 0.0f) {
         const ImVec2 at = ImGui::GetWindowPos();
@@ -206,12 +460,15 @@ void Menu() {
             dirty = true;
         }
     }
-    // Always readable, even when the rest of the menu is in Russian.
-    static const char* languages[] = {"English", "Русский"};
-    int language = s.menu_language == BbSettings::MenuLanguage::Russian ? 1 : 0;
-    if (ImGui::Combo("Language", &language, languages, 2)) {
+    // Always readable, whatever language the rest of the menu is in: each language by its own
+    // name, in MenuLanguage order.
+    static const char* languages[] = {"English",  "Русский",  "Español", "Português (Brasil)",
+                                      "Français", "Deutsch",  "Italiano", "Polski", "Türkçe"};
+    static_assert(std::size(languages) == BbSettings::MenuLanguageCount);
+    int language = int(s.menu_language.load());
+    if (ImGui::Combo("Language", &language, languages, BbSettings::MenuLanguageCount)) {
         s.menu_language =
-            language == 1 ? BbSettings::MenuLanguage::Russian : BbSettings::MenuLanguage::English;
+            BbSettings::MenuLanguage(std::clamp(language, 0, BbSettings::MenuLanguageCount - 1));
         BbSettings::Save();
     }
     ImGui::Text(BbSettings::MenuText("%.0f FPS  (%.1f ms)", "%.0f FPS  (%.1f мс)"),
@@ -303,8 +560,8 @@ void Menu() {
                 label, sizeof(label),
                 BbSettings::MenuText("%s (x%.1f, render %dx%d)", "%s (x%.1f, рендер %dx%d)"),
                 BbSettings::PresetName(i), scale,
-                int(std::lround(BbSettings::OutputWidths[output] / scale / 2) * 2),
-                int(std::lround(BbSettings::OutputHeights[output] / scale / 2) * 2));
+                int(std::lround(BbSettings::OutputWidth(output) / scale / 2) * 2),
+                int(std::lround(BbSettings::OutputHeight(output) / scale / 2) * 2));
             if (ImGui::Selectable(label, i == preset)) {
                 Store(s.preset, i, true);
             }
@@ -389,7 +646,8 @@ void Menu() {
 
     ImGui::SeparatorText(BbSettings::MenuText("Output resolution", "Разрешение вывода"));
     static const char* outputs[] = {"1280 x 720", "1920 x 1080", "2560 x 1440", "3840 x 2160",
-        "2560 x 1080", "3440 x 1440", "3840 x 1600", "3840 x 1080", "5120 x 1440", "5120 x 2160"};
+        "2560 x 1080", "3440 x 1440", "3840 x 1600", "3840 x 1080", "5120 x 1440", "5120 x 2160",
+        "7680 x 2160", "Display (auto)"};
     static_assert(std::size(outputs)==BbSettings::OutputCount);
     int output = s.output_res;
     if (ImGui::BeginCombo(BbSettings::MenuText("Output resolution", "Разрешение вывода"),
@@ -439,6 +697,8 @@ void Menu() {
         "остаётся в 1080p — на Steam Deck и старых видеокартах это заметно медленнее. "
         "Выключена: всё рисуется в разрешении пресета, смена — через перезапуск. Авто включает "
         "её на мощных дискретных видеокартах. Применяется после перезапуска игры."));
+    HdrSection();
+    PictureSection();
     ImGui::SeparatorText(BbSettings::MenuText("Game effects (restart required)",
                                               "Эффекты игры (после перезапуска)"));
     const char* lods[] = {BbSettings::MenuText("Highest (-2)", "Максимальная (-2)"),
@@ -478,7 +738,8 @@ void Menu() {
 
     bool restart =
         s.object_motion != s.startup_object_motion || s.model_lod != s.startup_model_lod ||
-        s.live_resolution != s.startup_live_resolution || BbSettings::ResolutionNeedsRestart();
+        s.live_resolution != s.startup_live_resolution || s.hdr != s.startup_hdr ||
+        BbSettings::ResolutionNeedsRestart();
     for (int e = 0; e < BbSettings::EffectCount; ++e) {
         restart |= s.effects[e] != s.startup_effects[e];
     }
@@ -499,12 +760,115 @@ void Menu() {
     Slider("Camera distance scale", s.camera_distance_scale, 0.5f, 1.5f);
     Slider("Camera height scale", s.camera_height_scale, 0.5f, 1.5f);
 
+    ImGui::SeparatorText(BbSettings::MenuText("Cheats", "Читы"));
+    Cheat(BbSettings::MenuText("Blood Vials", "Флаконы крови"), s.cheat_vials, BbEngine::Cheats::Vials,
+          custom_vials);
+    Cheat(BbSettings::MenuText("Quicksilver Bullets", "Ртутные пули"), s.cheat_bullets,
+          BbEngine::Cheats::Bullets, custom_bullets);
+    Hint(BbSettings::MenuText(
+        "Changes apply live. Infinite: kept full at the normal carry limit, even from none. Custom: the count is "
+        "refilled to the amount and never lowered. Off restores the game's item data and keeps the "
+        "counts you have. While a cheat is on, the counts it gives are saved with your character. "
+        "Do not play online with cheats on.",
+        "Применяются сразу. Бесконечно: запас всегда полный, даже если предметов не было. Своё "
+        "количество: запас пополняется до него и никогда не уменьшается. Выкл. возвращает данные "
+        "предметов игры, а имеющееся количество остаётся. Пока чит включён, полученные предметы "
+        "сохраняются вместе с персонажем. Не играйте по сети с включёнными читами."));
+    CheatToggle(BbSettings::MenuText("Infinite stamina", "Бесконечная выносливость"), s.cheat_stamina,
+                BbEngine::Cheats::Stamina,
+                BbSettings::MenuText("Your stamina stays full (enemies are not affected). Off: nothing to restore.",
+                                     "Ваша выносливость всегда полная (на врагов не действует). Выкл.: "
+                                     "восстанавливать нечего."));
+    CheatToggle(BbSettings::MenuText("Stealth", "Скрытность"), s.cheat_stealth, BbEngine::Cheats::Stealth,
+                BbSettings::MenuText("Enemies neither see nor hear you: the game's debug flags Player Hide and "
+                                     "Player Silence. Off puts the flags back as they were.",
+                                     "Враги вас не видят и не слышат: отладочные флаги игры Player Hide и Player "
+                                     "Silence. Выкл. возвращает флаги как были."));
+    {
+        static const char* const ranges[] = {"Off", "150%", "200%", "300%"};
+        const char* const names[] = {BbSettings::MenuText(ranges[0], "Выкл."), ranges[1], ranges[2], ranges[3]};
+        CheatLevels(BbSettings::MenuText("Firearm range", "Дальность огнестрела"), s.cheat_gun_range,
+                    BbSettings::CheatGunRanges, names, BbEngine::Cheats::GunRange,
+                    BbSettings::MenuText(
+                        "Bullets of the pistols, rifles, blunderbusses, cannons, Gatling Gun and the trick "
+                        "weapons' guns fly farther. Not Rosmarinus, the Flamesprayer, arcane or hunter tools. "
+                        "Off restores the game's bullet data.",
+                        "Пули пистолетов, ружей, мушкетонов, пушек, пулемёта и огнестрела трансформируемого "
+                        "оружия летят дальше. Не Розмарин, огнемёт, тайные и охотничьи инструменты. Выкл. "
+                        "возвращает данные пуль игры."));
+    }
+    CheatToggle(BbSettings::MenuText("Keep Blood Echoes on death", "Не терять отголоски при смерти"),
+                s.cheat_keep_echoes, BbEngine::Cheats::KeepEchoes,
+                BbSettings::MenuText("Dying keeps your Blood Echoes; the bloodstain holds none. Off restores the "
+                                     "game's code. Echoes you kept stay in your save.",
+                                     "При смерти отголоски остаются у вас, в пятне крови их нет. Выкл. "
+                                     "возвращает код игры. Сохранённые отголоски остаются в сохранении."));
+    {
+        static const char* const multipliers[] = {"x1", "x2", "x5", "x10"};
+        const char* const names[] = {BbSettings::MenuText("x1 (off)", "x1 (выкл.)"), multipliers[1], multipliers[2],
+                                     multipliers[3]};
+        CheatLevels(BbSettings::MenuText("Blood Echo multiplier", "Множитель отголосков"), s.cheat_echo_multiplier,
+                    BbSettings::CheatEchoMultipliers, names, BbEngine::Cheats::EchoMultiplier,
+                    BbSettings::MenuText(
+                        "Blood Echoes from enemies and bosses times this. An enemy already loaded may give the "
+                        "normal amount until the area loads again. x1 restores the game's data; echoes gained "
+                        "stay in your save.",
+                        "Отголоски за врагов и боссов умножаются. Уже загруженный враг может дать обычное "
+                        "количество, пока область не загрузится заново. x1 возвращает данные игры; полученные "
+                        "отголоски остаются в сохранении."));
+    }
+    CheatToggle(BbSettings::MenuText("No weapon wear", "Оружие не изнашивается"), s.cheat_no_durability,
+                BbEngine::Cheats::NoDurability,
+                BbSettings::MenuText("Equipped weapons are kept at full durability. Off stops it; durability is "
+                                     "saved as it is.",
+                                     "Экипированное оружие всегда с полной прочностью. Выкл. прекращает это; "
+                                     "прочность сохраняется как есть."));
+    CheatToggle(BbSettings::MenuText("Infinite consumables", "Бесконечные расходники"), s.cheat_consumables,
+                BbEngine::Cheats::Consumables,
+                BbSettings::MenuText(
+                    "Molotovs, knives, pebbles, oil urns, antidotes, sedatives, elixirs, papers, Numbing Mist, "
+                    "Shining Coins and similar tools are not used up. Not Blood Vials or Quicksilver Bullets "
+                    "(above), key items, materials, or Insight and Blood Echo items. Off restores the item data.",
+                    "Коктейли Молотова, ножи, камешки, масло, антидоты, успокоительное, эликсиры, бумага, "
+                    "онемляющий туман, блестящие монеты и подобные инструменты не расходуются. Не флаконы крови и "
+                    "ртутные пули (выше), не ключевые предметы, материалы, предметы озарения и отголосков. Выкл. "
+                    "возвращает данные предметов."));
+    CheatStats();
+
     ImGui::SeparatorText(BbSettings::MenuText("Other", "Прочее"));
     Checkbox(BbSettings::MenuText("FPS counter in corner", "Счётчик FPS в углу"), s.show_fps);
+    if (s.show_fps) {
+        ImGui::Indent();
+        Checkbox(BbSettings::MenuText("Frame rate", "Частота кадров"), s.show_fps_rate);
+        Checkbox(BbSettings::MenuText("Frame time", "Время кадра"), s.show_fps_frame_time);
+        Checkbox(BbSettings::MenuText("Upscaler", "Апскейлер"), s.show_fps_upscaler);
+        Checkbox(BbSettings::MenuText("CPU usage", "Загрузка ЦП"), s.show_fps_cpu);
+        Checkbox(BbSettings::MenuText("GPU usage", "Загрузка ГП"), s.show_fps_gpu);
+        ImGui::Unindent();
+    }
+    Checkbox(BbSettings::MenuText("Hide mouse cursor", "Скрывать курсор мыши"), s.hide_cursor);
+    Hint(BbSettings::MenuText("Hidden 2 seconds after the mouse stops moving; moving it brings it back.",
+                              "Скрывается через 2 секунды после остановки мыши; движение возвращает его."));
 
     ImGui::Spacing();
     if (ImGui::Button(BbSettings::MenuText("Close", "Закрыть"))) {
         keep_open = false;
+    }
+    // Quit (issue #21): the same clean exit as closing the window, so a controller player need not
+    // force-close the game. Asks once more before quitting; the game's own save is untouched.
+    static bool quit_armed = false;
+    ImGui::SameLine();
+    if (ImGui::Button(quit_armed ? BbSettings::MenuText("Press again to quit", "Нажмите ещё раз")
+                                 : BbSettings::MenuText("Quit game", "Выйти из игры"))) {
+        if (quit_armed) {
+            SDL_Event quit{};
+            quit.type = SDL_EVENT_QUIT;
+            SDL_PushEvent(&quit);
+        }
+        quit_armed = !quit_armed;
+    }
+    if (quit_armed && !ImGui::IsItemHovered() && !ImGui::IsItemFocused()) {
+        quit_armed = false;
     }
     ImGui::SameLine();
     ImGui::TextDisabled("%s", BbSettings::MenuText("Settings are saved to bbport.ini",
@@ -516,6 +880,33 @@ void Menu() {
 }
 
 void FpsCounter() {
+    // What it shows (the menu's checkboxes under the counter); nothing chosen: no window.
+    const auto& s = BbSettings::Get();
+    char text[128];
+    int n = 0;
+    if (s.show_fps_rate) {
+        n += std::snprintf(text + n, sizeof(text) - n, "%.0f FPS",
+                           frame_ms_avg > 0.0f ? 1000.0f / frame_ms_avg : 0.0f);
+    }
+    if (s.show_fps_frame_time) {
+        n += std::snprintf(text + n, sizeof(text) - n, "%s%.1f ms", n ? "  " : "", frame_ms_avg);
+    }
+    if (s.show_fps_upscaler) {
+        n += std::snprintf(text + n, sizeof(text) - n, "%s%s", n ? "  " : "",
+                           BbSettings::UpscalerName(s.upscaler));
+    }
+    if (s.show_fps_cpu || s.show_fps_gpu) {
+        const BbUsage::Sample use = BbUsage::Get(s.show_fps_cpu, s.show_fps_gpu);
+        if (s.show_fps_cpu && use.cpu >= 0.0f) {
+            n += std::snprintf(text + n, sizeof(text) - n, "%sCPU %.0f%%", n ? "  " : "", use.cpu);
+        }
+        if (s.show_fps_gpu && use.gpu >= 0.0f) {
+            n += std::snprintf(text + n, sizeof(text) - n, "%sGPU %.0f%%", n ? "  " : "", use.gpu);
+        }
+    }
+    if (n == 0) {
+        return;
+    }
     const ImGuiViewport* viewport = ImGui::GetMainViewport();
     const float pad = 12.0f * base_scale;
     ImGui::SetNextWindowPos(
@@ -526,9 +917,7 @@ void FpsCounter() {
                  ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_AlwaysAutoResize |
                      ImGuiWindowFlags_NoInputs | ImGuiWindowFlags_NoNav |
                      ImGuiWindowFlags_NoFocusOnAppearing);
-    const auto& s = BbSettings::Get();
-    ImGui::Text("%.0f FPS  %.1f ms  %s", frame_ms_avg > 0.0f ? 1000.0f / frame_ms_avg : 0.0f,
-                frame_ms_avg, BbSettings::UpscalerName(s.upscaler));
+    ImGui::TextUnformatted(text);
     ImGui::End();
 }
 
@@ -587,6 +976,9 @@ void Init(const Vulkan::Instance& instance, vk::Format format, u32 image_count) 
     style.GrabRounding = 4.0f;
     style.Colors[ImGuiCol_WindowBg].w = 0.92f;
 
+    // No GlyphRanges: the Vulkan backend has ImGuiBackendFlags_RendererHasTextures (ImGui 1.92), so
+    // the atlas loads each glyph of the font when first drawn (Cyrillic, ñ ç ü ß ą ł ş ğ ı, —).
+    // Ranges would only limit that.
     ImFontConfig font_config;
     font_config.FontDataOwnedByAtlas = false;
     io.Fonts->AddFontFromMemoryTTF(const_cast<unsigned char*>(bb_font_ttf),

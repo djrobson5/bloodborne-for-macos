@@ -36,6 +36,11 @@ void runtime_mutex_report(void);
 uintptr_t runtime_memory_resolve(const char *name);
 void runtime_memory_report(void);
 int runtime_memory_is_mapped(uintptr_t address, uint64_t size);
+/* Guest memory whose guest protection allows writing, all of the range. */
+int runtime_memory_guest_writable(uintptr_t address, uint64_t size);
+/* Fault handler, last resort: gives a page GPU tracking left protected the guest's protection back
+ * (1: retry the access; 0: a real fault). context: the handler's (EXCEPTION_POINTERS, ucontext). */
+int runtime_memory_restore_access(void *context, uintptr_t address, int repeated);
 /* The CPU is about to write the range outside guest code (a file read): tells the GPU side. */
 void runtime_memory_note_write(uintptr_t address, uint64_t size);
 void runtime_memory_note_cpu_write(uintptr_t address, uint64_t size);
@@ -57,6 +62,8 @@ uintptr_t runtime_thread_resolve(const char *name);
 void runtime_thread_report(void);
 void runtime_set_main_tls(const void *data, uint64_t filesz, uint64_t memsz, uint64_t align);
 void runtime_thread_attach_main(void);
+/* The calling thread runs guest code (it has a guest thread record). */
+int runtime_thread_has_record(void);
 int32_t *runtime_errno(void);
 uintptr_t runtime_sema_resolve(const char *name);
 void runtime_sema_report(void);

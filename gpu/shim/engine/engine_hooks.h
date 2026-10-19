@@ -17,6 +17,10 @@ struct Hook {
 bool Prepare(Hook& hook, std::uint8_t* image, std::size_t size, std::size_t offset,
              std::span<const std::uint8_t> expected, Callback callback);
 void Discard(Hook& hook);
+// A stub that calls `callback` and then jumps to `resume` (no displaced bytes): for a tail call
+// redirected to it. Null when no page could be had.
+std::uint8_t* TailStub(Callback callback, std::uint64_t resume);
+void FreeStub(std::uint8_t* stub);
 void Commit(std::span<Hook> hooks);
 bool WriteCode(void* address, const void* bytes, std::size_t size);
 
@@ -27,11 +31,19 @@ template <typename T> std::int64_t Argument(T value) {
     else return static_cast<std::int64_t>(value);
 }
 template <typename... A> std::int64_t Call(std::uint64_t fn, A... args) {
-    static_assert(sizeof...(A) <= 6);
-    using GuestFn = std::int64_t (__attribute__((sysv_abi)) *)(std::int64_t, std::int64_t,
-        std::int64_t, std::int64_t, std::int64_t, std::int64_t);
-    std::int64_t values[7] = {0, Argument(args)...};
-    return reinterpret_cast<GuestFn>(fn)(values[1], values[2], values[3], values[4], values[5], values[6]);
+    static_assert(sizeof...(A) <= 7);
+    std::int64_t values[8] = {0, Argument(args)...};
+    if constexpr (sizeof...(A) <= 6) {
+        using GuestFn = std::int64_t (__attribute__((sysv_abi)) *)(std::int64_t, std::int64_t,
+            std::int64_t, std::int64_t, std::int64_t, std::int64_t);
+        return reinterpret_cast<GuestFn>(fn)(values[1], values[2], values[3], values[4], values[5], values[6]);
+    } else {
+        // The seventh argument goes on the stack ([rsp] at the call, [rbp+0x10] in the callee).
+        using GuestFn7 = std::int64_t (__attribute__((sysv_abi)) *)(std::int64_t, std::int64_t,
+            std::int64_t, std::int64_t, std::int64_t, std::int64_t, std::int64_t);
+        return reinterpret_cast<GuestFn7>(fn)(values[1], values[2], values[3], values[4], values[5], values[6],
+                                              values[7]);
+    }
 }
 void Install(std::uint8_t* image, std::size_t size);
 } // namespace BbEngine

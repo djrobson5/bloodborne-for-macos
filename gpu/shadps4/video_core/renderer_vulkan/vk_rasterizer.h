@@ -36,6 +36,7 @@ class MemoryManager;
 namespace Vulkan {
 
 class GraphicsPipeline;
+class Occlusion;
 class Runtime;
 
 class Rasterizer {
@@ -56,6 +57,11 @@ public:
         return *upscaler;
     }
 
+    /// bbport: native HDR output's gain maps (vk_hdr_native.h), taken by the presenter.
+    [[nodiscard]] HdrNative& GetHdrNative() noexcept {
+        return *hdr_native;
+    }
+
     [[nodiscard]] VideoCore::TextureCache& GetTextureCache() noexcept {
         return texture_cache;
     }
@@ -71,6 +77,17 @@ public:
 
     void DispatchDirect();
     void DispatchIndirect(VAddr address, u32 offset, u32 size);
+
+    /// bbport (GPU command thread): a ZPASS_DONE dump of `pipes` DBs to `va`, handed to the
+    /// recording side in order; false when the real counts are off (the caller writes the fake).
+    bool OcclusionDump(VAddr va, u32 pipes);
+    /// bbport (GPU command thread): SET_PREDICATION (its two body words); false when off.
+    bool OcclusionPredication(const u32* body);
+    /// bbport (GPU command thread): a guest submission starts: a predication region left open
+    /// by the previous one is closed.
+    void OcclusionSubmissionStart();
+    /// bbport (GPU command thread, drained): dumps wait for the submission being recorded.
+    bool OcclusionUnsubmitted() const;
 
     void ScopeMarker(fmt::string_view fmt, fmt::format_args args, auto&& func) {
         if (host_markers_enabled) {
@@ -88,11 +105,26 @@ public:
     void ScopedMarkerInsertColor(const std::string_view& str, const u32 color,
                                  bool from_guest = false);
 
-    void FillBuffer(VAddr address, u32 num_bytes, u32 value, bool is_gds);
-    void CopyBuffer(VAddr dst, VAddr src, u32 num_bytes, bool dst_gds, bool src_gds);
+    /// bbport: `waited` false: the caller (RunDmaData) skipped the waits a CPU store needs, as
+    /// DmaWritesOnCpu said the GPU writes it; should the store be made on the CPU after all,
+    /// they are made here first.
+    void FillBuffer(VAddr address, u32 num_bytes, u32 value, bool is_gds, bool waited = true);
+    void CopyBuffer(VAddr dst, VAddr src, u32 num_bytes, bool dst_gds, bool src_gds,
+                    bool waited = true);
     /// bbport: whether FillBuffer/CopyBuffer into guest memory at `dst` may write it on the CPU
     /// now (otherwise the GPU writes it, in stream order).
     [[nodiscard]] bool DmaMayWriteOnCpu(VAddr dst, u32 num_bytes);
+    /// bbport (BB_DMA_WAITS, default: only when needed; =all: every DMA into memory waits as
+    /// before): whether a DMA into guest memory at `dst` will store with the CPU: the same tests
+    /// FillBuffer (`fill`) and CopyBuffer make. Recorded for the GPU it writes no guest memory now
+    /// and lands after the submission, which goes out after the copies and fences before it: it
+    /// needs neither WaitHostCopiesFor nor WaitDeferredSignals. Stage B owns what it tests.
+    [[nodiscard]] bool DmaWritesOnCpu(VAddr dst, u32 num_bytes, bool fill, VAddr src,
+                                      bool src_gds);
+    /// bbport: what a DMA stored by the CPU into [dst, dst + num_bytes) waits for first: host
+    /// copies still reading it, and the deferred fences it must follow (reading [src, src +
+    /// src_size) for a copy).
+    void WaitBeforeDmaStore(VAddr dst, u32 num_bytes, VAddr src, u32 src_size);
     u32 ReadDataFromGds(u32 gsd_offset);
     bool InvalidateMemory(VAddr addr, u64 size, bool assume_locks = false);
     /// bbport: data written into GPU memory by a path we hear of (file reads, the game's resource
@@ -122,22 +154,23 @@ public:
     /// over pages the caches watch (no write tracking): what a write fault did.
     void OnCpuWrite(VAddr addr, u64 size);
     /// GPU thread, before a write the guest can observe (see Scheduler::WaitHostCopies).
-    void WaitHostCopies() {
+    /// `site`: the caller (BbStats::WaitSite, frame statistics).
+    void WaitHostCopies(u32 site = BbStats::WaitOther) {
         DrainDrawPipe();
-        scheduler.WaitHostCopies();
+        scheduler.WaitHostCopies(site);
     }
     /// Before a write into [address, address + size): waits only when a host copy may still read
     /// it (Scheduler::WaitHostCopiesFor). BB_HOST_COPY_WAITS=all: always (the old behaviour).
-    void WaitHostCopiesFor(VAddr address, u64 size) {
+    void WaitHostCopiesFor(VAddr address, u64 size, u32 site = BbStats::WaitOther) {
         DrainDrawPipe();
         static const bool all = [] {
             const char* env = std::getenv("BB_HOST_COPY_WAITS");
             return env && std::string_view{env} == "all";
         }();
         if (all) {
-            scheduler.WaitHostCopies();
+            scheduler.WaitHostCopies(site);
         } else {
-            scheduler.WaitHostCopiesFor(address, size);
+            scheduler.WaitHostCopiesFor(address, size, site);
         }
     }
     /// Notes the guest memory a host copy issued now reads (see Scheduler::NoteHostCopySource).
@@ -156,8 +189,10 @@ public:
     /// Returns true when the task was handed to the recording thread (not run yet).
     /// `reads_guest_memory`: the task may read guest memory (a CPU write on stage A over memory
     /// waits for it, WaitForPendingReads); false for fences, flips and signals.
+    /// `name`: the task in the "stage B tasks" statistics (BB_SECTIONS).
     bool RunInOrder(OrderedTask task, const void* data, u32 size,
-                    u64 toggle = BbToggle::PipelinedTasks, bool reads_guest_memory = true);
+                    u64 toggle = BbToggle::PipelinedTasks, bool reads_guest_memory = true,
+                    const char* name = nullptr);
     /// Stage A: the draw pipe position after the last handed-over packet, and whether the
     /// recording thread has run everything before a position.
     [[nodiscard]] u64 DrawPipeHead() const {
@@ -179,13 +214,31 @@ public:
     /// Stage A: guest memory the recording thread will read for the next packet (buffer bindings).
     void NotePendingRead(VAddr address, u64 size);
     /// Before a guest-visible write: fences deferred earlier are written first.
-    void WaitDeferredSignals() {
-        scheduler.WaitDeferredSignals();
+    void WaitDeferredSignals(u32 site = BbStats::WaitOther) {
+        scheduler.WaitDeferredSignals(site);
     }
+    /// bbport: before a CPU write of the command processor (WriteData, DMA): only the deferred
+    /// fences it must follow (Scheduler::WaitDeferredSignalsFor, BB_FENCE_ORDER).
+    void WaitDeferredSignalsFor(u32 site, VAddr address, u64 size, VAddr src = 0,
+                                u64 src_size = 0) {
+        scheduler.WaitDeferredSignalsFor(site, address, size, src, src_size);
+    }
+    /// bbport (stage A): a WaitRegMem was met by a fence still deferred: the command processor
+    /// would have waited for it here (Scheduler::NoteSignalBarrier, in order on stage B).
+    void NoteFenceBarrier();
     /// Runs `signal` after the guest memory copies issued so far, without waiting here.
-    void SignalAfterHostCopies(std::function<void()> signal) {
-        scheduler.SignalAfterHostCopies(std::move(signal));
+    /// `kick` false: another one is queued right after (Scheduler::SignalAfterHostCopies).
+    /// `label`, `label_size`: the guest memory it writes (none: unknown).
+    template <typename Func>
+    void SignalAfterHostCopies(Func&& signal, bool kick = true, VAddr label = 0,
+                               u32 label_size = 0) {
+        scheduler.SignalAfterHostCopies(std::forward<Func>(signal), kick, label, label_size);
     }
+    /// Stage B, running a packet: whether the next one is already committed and is ordered
+    /// task `task` (it runs right after this one).
+    [[nodiscard]] bool NextPacketIsTask(OrderedTask task) const;
+    /// Stage B: fences handed to the recording threads together with the next one (statistics).
+    std::atomic<u64> merged_fence_kicks{0};
     /// bbport BB_HONEST_LABELS=1: runs `signal` once the GPU has finished every command recorded
     /// before this call (the submission of the current tick), in call order, on a thread that
     /// waits on the work semaphore: fences the guest sees when the work is done, not when it is
@@ -231,6 +284,9 @@ public:
     /// A guest write hit a protected page.
     /// `guest_rip`: the guest instruction that wrote (0: unknown), see BufferCache::NoteCpuWrite.
     bool OnWriteFault(VAddr addr, bool assume_locks, u64 guest_rip = 0);
+    /// bbport: write faults on pages no tracked image watches skip the texture cache
+    /// (BB_FAULT_SKIP_TEXTURES=0: they take its lock as before).
+    static bool FaultSkipsTextureCache();
     bool ReadMemory(VAddr addr, u64 size, bool assume_locks = false);
     void ProcessDownloadImages();
     bool IsMapped(VAddr addr, u64 size);
@@ -292,8 +348,23 @@ private:
         u32 scene_size = 0;
         std::array<float, 2> target_scale{};
         std::array<float,2> target_offset{};
+        std::array<u32, 2> ui_full_scissor{};
+        /// The targets' images as memoized (signature.ids): after other images were
+        /// (un)registered the memo still holds while each is the same registered image with
+        /// the same backing (RevalidateBeginMemo).
+        std::array<u64, AmdGpu::NUM_COLOR_BUFFERS + 1> uids{};
+        std::array<const void*, AmdGpu::NUM_COLOR_BUFFERS + 1> backings{};
+        u64 scene_generation = 0; ///< SceneTargets::Generation (proxy attachments)
     } begin_memo;
     u64 begin_memo_hits = 0, begin_memo_misses = 0;
+    u64 begin_memo_revalidated = 0; ///< hits after a registry generation change
+    /// Takes begin_memo into `signature`'s registry generation when nothing else differs and
+    /// its targets are unchanged.
+    bool RevalidateBeginMemo(const BeginSignature& signature);
+    void RememberBeginTargets();
+    /// bbport: BB_MEMO_REVALIDATE=0 drops memoized texture/target lookups on every image
+    /// (un)registration as before, instead of revalidating them (IsExactMatch).
+    static bool MemoRevalidation();
     void Resolve();
     void DepthStencilCopy(bool is_depth, bool is_stencil);
     void EliminateFastClear();
@@ -331,6 +402,14 @@ private:
                   const IndirectDraw* indirect = nullptr);
     /// Everything of a direct dispatch after the pipeline selection (GPU thread or stage B).
     void DispatchRecord(const ComputePipeline* pipeline);
+    /// bbport (docs/pipeline_compiles.md): whether the direct draw being recorded, whose
+    /// pipeline is still compiling, is left out: scene geometry, for a bounded time.
+    bool SkipUncompiledDraw(const GraphicsPipeline* pipeline);
+    /// bbport: for a pipeline still compiling, records its bind as a command of its own, which a
+    /// recording thread runs once the pipeline is there (it waits for it): returns null, the
+    /// draw or dispatch command binds nothing. Recording on this thread: waits here and returns
+    /// the handle.
+    vk::Pipeline BindWhenCompiled(const Pipeline* pipeline, vk::PipelineBindPoint bind_point);
     /// The compute registers of the dispatch being recorded.
     const AmdGpu::ComputeProgram& CsRegs() const;
     static void RunDrawPacket(void* rasterizer, const u8* packet, u32 size);
@@ -350,14 +429,38 @@ private:
     void BindTextures(const Shader::Info& stage, const PreparedStage* prepared,
                       Shader::Backend::Bindings& binding, u32& write_index, bool& barrier,
                       bool on_helper = false);
+    /// BB_SECTIONS: a full texture lookup over 0.3 ms, per texture (BindTextures' timestamps).
+    void ReportSlowTextureBind(const Shader::Info& stage, u64 start, std::span<const u64> pass1,
+                               std::span<const u64> pass2);
     bool BindResources(const Pipeline* pipeline);
     void ForceAnisotropy(AmdGpu::Sampler& sharp, bool is_depth) const;
     void BindSamplers(const Shader::Info& stage, const PreparedStage* prepared,
                       Shader::Backend::Bindings& binding, u32& write_index);
+    /// bbport: whether stage reads reduced scene proxies through their native images instead:
+    /// it has a point-filtered sampler and its pass is at the native size (BindTextures).
+    bool PointReadsNative(const Shader::Info& stage, const PreparedStage* prepared) const;
+    /// bbport (SamplerMemo): TextureCache::GetSampler hashed, locked and looked the sampler up
+    /// for every sampler of every draw. Direct-mapped by the S# (after ForceAnisotropy), the
+    /// depth flag and the extra bias: what GetSampler returned for them, while no sampler was
+    /// freed since (SamplerGeneration), touched for the collector once per GC period. Only the
+    /// thread binding textures uses it (stage B, or the bind helper while stage B waits for it).
+    /// BB_SAMPLER_MEMO=0: GetSampler every time.
+    struct SamplerMemoEntry {
+        std::array<u64, 2> sharp{};
+        u64 variant = ~0ull; ///< is_depth << 32 | the extra bias's bits
+        vk::Sampler handle{};
+        size_t lru_id = 0;
+        u64 generation = ~0ull;   ///< TextureCache::SamplerGeneration when looked up
+        u64 touched_tick = ~0ull; ///< TextureCache::GcTick of the last LRU touch
+    };
+    std::array<SamplerMemoEntry, 1024> sampler_memo{};
+    u64 sampler_memo_hits = 0, sampler_memo_misses = 0;
+    vk::Sampler CachedSampler(const AmdGpu::Sampler& sharp, bool is_depth, float lod_bias);
     /// bbport: a stage's resolved textures remembered by its prepared T# hashes
     /// (TextureSetMemo): a hit only redoes the per-draw effects (binding flags, transitions).
     struct TextureSetEntry {
         VideoCore::ImageId id{}; ///< after the depth redirect; null descriptor when invalid
+        VideoCore::ImageId found{}; ///< what FindImage returned (before the depth redirect)
         vk::ImageView view;
         const void* backing = nullptr;
         VideoCore::SubresourceRange range;
@@ -369,18 +472,33 @@ private:
         u64 generation = ~0ull;
         u64 scene_generation = 0; ///< SceneTargets::Generation of the proxy views
         u32 count = 0;
+        /// Every lookup was an exact match (TextureCache::IsExactMatch) and every null
+        /// descriptor a null T#: the set survives other images' (un)registration while its
+        /// images stay registered (RevalidateTextureSet).
+        bool exact = false;
         static constexpr u32 MaxImages = 16; ///< larger sets are not memoized
         std::array<u64, MaxImages> hashes{};
         std::array<TextureSetEntry, MaxImages> entries{};
+        std::array<u64, MaxImages> found_uids{}; ///< image uids of entries[].found
     };
     std::array<TextureSet, 32768> texture_sets{};
     u64 texture_set_hits = 0, texture_set_misses = 0;
     std::array<u64, 4> texture_set_why{}; ///< misses: other key, generation, image check, new
+    /// bbport: stages that did not try the set: unprepared, no images, over MaxImages, a storage
+    /// image or mip override, memo off (toggle, frame capture).
+    std::array<u64, 5> texture_set_skip{};
+    /// Hits after a registry generation change: texture sets, and single texture lookups
+    /// (ImageDescCacheEntry) outside them.
+    u64 texture_set_revalidated = 0, texture_lookups_revalidated = 0;
+    bool RevalidateTextureSet(TextureSet& set, u64 generation);
     /// Returns true when the stage's images were bound from the memo.
     bool BindTexturesFromSet(const Shader::Info& stage, const PreparedStage* prepared,
                              u32 first_image_idx, bool& barrier, TextureSet*& slot);
     /// The prepared sharps of `stage` in the current prepared draw, if they fit it.
     const PreparedStage* FindPreparedStage(const Shader::Info& stage) const;
+    /// The same for any prepared draw (the lookahead thread).
+    static const PreparedStage* FindPreparedStage(const PreparedDraw* prepared,
+                                                  const Shader::Info& stage);
     /// Whether the helper may bind textures for this pipeline at all (fixed descriptor layout,
     /// no storage writes that invalidate cached images).
     bool HelperEligible(const Pipeline* pipeline) const;
@@ -428,14 +546,19 @@ private:
     std::unique_ptr<CameraMotion> camera_motion; // bbport: motion vectors (docs/upscaler.md)
     std::unique_ptr<SceneTargets> scene_targets;
     bool scene_started = false;
+    /// bbport: the scene depth of the frame before (SkipUncompiledDraw).
+    VideoCore::ImageId previous_scene_depth{};
     std::unique_ptr<ObjectMotion> object_motion;
     bool motion_draw = false;
     u64 motion_geometry{};    ///< vertex-stream identity of the current direct draw
     bool gbuffer_draw = false;
+    std::unique_ptr<HdrNative> hdr_native; // bbport: native HDR output (docs/hdr.md); before
+                                           // the upscaler, which uses it
     std::unique_ptr<TemporalUpscaler> upscaler; // bbport: FSR (docs/upscaler.md)
     std::array<float, 2> draw_jitter{};         ///< viewport offset of the current draw, pixels
     std::array<float,2> target_offset{};
     std::array<float, 2> target_scale{1.0f, 1.0f}; ///< pass drawn into the upscaler's output-size images
+    std::array<u32, 2> ui_full_scissor{}; ///< widened UI pass: a scissor this large (guest) is the whole image
     const bool host_markers_enabled;
     const bool guest_markers_enabled;
 
@@ -470,6 +593,11 @@ private:
         // Memoized FindImage for bindings without mip overrides (TextureBindingMemo).
         u64 found_generation = ~0ULL;
         VideoCore::ImageId found_id{};
+        /// found_id was an exact match (TextureCache::IsExactMatch, found_desc unchanged by
+        /// FindImage): the memo outlives other images' (un)registration while image found_uid
+        /// stays registered (LookupMemoized).
+        bool found_exact = false;
+        u64 found_uid = 0;
         VideoCore::TextureCache::ImageDesc found_desc;
         u64 pinned = 0; ///< bind_epoch of the BindTextures call referencing found_desc
         u64 last_use = 0;
@@ -486,11 +614,15 @@ private:
     u64 bind_epoch = 0;
     // bbport: render/depth target lookups memoized by their raw register bytes while image
     // registrations are unchanged (the descriptions depend only on those registers).
+    // An exact match (TextureCache::IsExactMatch, description unchanged by FindImage) outlives
+    // other images' (un)registration while image `uid` stays registered (RevalidateTarget).
     struct TargetMemo {
         std::array<u8, 256> key{};
         u32 key_size = 0;
         u64 generation = ~0ULL;
         VideoCore::ImageId image_id{};
+        bool exact = false;
+        u64 uid = 0;
         VideoCore::TextureCache::ImageDesc desc;
     };
     std::array<TargetMemo, 64> target_memo{};
@@ -499,10 +631,15 @@ private:
     struct LastTarget {
         std::array<u8, 256> key{};
         u32 key_size = 0;
-        u64 generation = ~0ULL;
+        u64 generation = ~0ULL; ///< ~0: invalid (FindImage may have rewritten the description)
         VideoCore::ImageId image_id{};
+        bool exact = false;
+        u64 uid = 0;
     };
     std::array<LastTarget, AmdGpu::NUM_COLOR_BUFFERS + 1> last_targets{}; ///< CBs, then DB
+    u64 target_lookups_revalidated = 0;
+    template <typename Memo>
+    bool RevalidateTarget(Memo& memo, u64 generation);
     template <typename... Parts>
     VideoCore::ImageId FindTargetMemoized(VideoCore::TextureCache::ImageDesc& desc,
                                           LastTarget& last, auto&& make_desc,
@@ -512,6 +649,9 @@ private:
     /// `hash` is ImageDescHash(sharp, res), computed by a draw-preparation worker or here.
     ImageDescCacheEntry& CachedImageDescEntry(const AmdGpu::Image& sharp,
                                               const Shader::ImageResource& res, u64 hash);
+    /// Whether the entry's FindImage memo holds in registry generation `generation`: memoized
+    /// in it, or an exact match still registered (then taken into it).
+    bool LookupMemoized(ImageDescCacheEntry& entry, u64 generation);
     ImageDescCacheEntry& CachedImageDescEntry(const AmdGpu::Image& sharp,
                                               const Shader::ImageResource& res) {
         return CachedImageDescEntry(sharp, res, ImageDescHash(sharp, res));
@@ -650,7 +790,22 @@ private:
     std::unique_ptr<ConstantRing> constant_ring;
     /// Submissions (prepared draws) kept alive until stage B reaches the position.
     std::deque<std::pair<u64, std::shared_ptr<const void>>> pipe_keepalive;
+    /// bbport: real occlusion query results (vk_occlusion.h); null with BB_OCCLUSION=0. Before
+    /// the draw pipe: its thread (which runs the dumps) stops first.
+    std::unique_ptr<Occlusion> occlusion;
     std::unique_ptr<DrawPipe> draw_pipe;
+    /// bbport BB_DRAWREC_WORKERS=1 (docs/parallel-stageb.md): the lookahead thread bb:DrawAhead
+    /// walks the draw pipe a few packets ahead of stage B and asks the cache for the lines its
+    /// next draws read first (texture set memo slots, image slots, page tracking words, the
+    /// arena table). It reads the packets and their prepared draws only and changes nothing:
+    /// stage B's work and order are as without it. After draw_pipe: it stops before the ring goes.
+    static bool LookaheadWanted();
+    static u32 LookaheadWindow();
+    void LookaheadLoop(std::stop_token stop);
+    /// The prefetches for one packet; false when it holds nothing to prefetch for.
+    bool PrefetchPacket(const u8* data, u32 size);
+    u32 PrefetchDraw(const u8* data, u32 size);
+    std::jthread lookahead_thread;
 
     /// BB_HONEST_LABELS (SignalAfterGpu). Last: its thread stops before the scheduler goes.
     struct GpuSignal {

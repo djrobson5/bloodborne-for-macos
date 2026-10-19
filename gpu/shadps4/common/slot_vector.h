@@ -119,6 +119,12 @@ public:
         return ReadStorageBit(id.index);
     }
 
+    /// bbport: where slot `id` is, or null past the capacity: for a cache prefetch from another
+    /// thread (the storage pointer is read without a lock; nothing is read through the result).
+    [[nodiscard]] const T* SlotAddress(SlotId id) const noexcept {
+        return id.index < values_capacity ? &values[id.index].object : nullptr;
+    }
+
     template <typename... Args>
     SlotId insert(Args&&... args) noexcept {
         const u32 index = FreeValueIndex();

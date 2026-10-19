@@ -53,3 +53,12 @@ vertical FOV and uses this port's output size. Vulkan UI composition adds unifor
 centered fitting, including stencil masks and window-space vertices. The existing
 presenter already letterboxes. The existing renderer, temporal resources,
 synchronization, shader and motion-vector paths remain in use.
+
+Online and picture sources:
+https://github.com/droogie/bbhost/tree/566184a74f071166299bb656c4af479e5bbe2771
+
+engine/online_fixes.cpp adapts src/engine/chara_id.cpp (the login's character step clears the
+empty-list character id) and src/engine/sos_signs.cpp (the summon sign timeout). The fog control in
+engine/graphics.cpp adapts the fog table upload hook of src/engine/graphics_patch.cpp, redirected
+through the function's padding; the play-log redirect in scripts/online.py follows src/hle/http.cpp. The boss defeat flags in
+engine/trophy_sync.cpp are from the boss rush table of plugins/boss_rush/boss_rush.cpp.

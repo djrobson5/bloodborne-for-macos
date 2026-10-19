@@ -858,3 +858,14 @@ bool menu_pointer_in_menu() {
     // few frames means none has.
     return menu_open() || now_ms() - g_focus_ms.load(std::memory_order_relaxed) < 400;
 }
+
+bool menu_pointer_navigating() {
+    // bbport: whether the keys that move the character navigate a menu as the d-pad (input.cpp):
+    // the front end, the flow's open menu, or a list with focus in the last few frames. Not the
+    // pointer's 400 ms after a list lost focus: W pressed right after closing the inventory was a
+    // held d-pad up in the world, which turns HP into Quicksilver Bullets.
+    if (front_end()) {
+        return true;
+    }
+    return menu_open() || now_ms() - g_focus_ms.load(std::memory_order_relaxed) < 70;
+}

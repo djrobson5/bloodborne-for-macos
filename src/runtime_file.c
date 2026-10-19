@@ -272,13 +272,50 @@ static void touch_for_write(void *buffer,uint64_t size) {
         *b=*b;
     }
 }
+/* bbport: the kernel's copy into guest memory the guest may write failed: the GPU thread
+ * protected a page again between touch_for_write and the copy (EFAULT; Windows: ERROR_NOACCESS).
+ * The data goes through a host buffer and memcpy, whose faults the handler resolves as for guest
+ * code. offset<0: from the descriptor's position (a failed read leaves it where it was). */
+static ssize_t read_bounced(int h,void *buffer,uint64_t size,int64_t offset) {
+    enum { BOUNCE=1<<20 };
+    unsigned char *bounce=malloc(size<BOUNCE ? size : BOUNCE);
+    if (!bounce) { errno=ENOMEM; return -1; }
+    uint64_t done=0;
+    while (done<size) {
+        const uint64_t chunk=size-done<BOUNCE ? size-done : BOUNCE;
+        const ssize_t n=offset<0 ? read(h,bounce,chunk) : pread(h,bounce,chunk,offset+(int64_t)done);
+        if (n<0) {
+            if (done) break;
+            int e=errno; free(bounce); errno=e;
+            return -1;
+        }
+        memcpy((unsigned char *)buffer+done,bounce,(size_t)n);
+        done+=(uint64_t)n;
+        if ((uint64_t)n<chunk) break;
+    }
+    free(bounce);
+    static unsigned notes;
+    if (__atomic_fetch_add(&notes,1,__ATOMIC_RELAXED)<4)
+        printf("Runtime: a file read into guest memory failed (a page protected again); read through a host buffer\n");
+    return (ssize_t)done;
+}
+/* A failed read of a game file is logged (the first 16): the game panics on it (Dantelion2
+ * FileTransferTask) without saying which file, and the log is all a player can send. */
+static void note_read_failure(int fd,uint64_t size,int64_t offset,int error) {
+    static unsigned noted;
+    if (__atomic_fetch_add(&noted,1,__ATOMIC_RELAXED)>=16) return;
+    File *f=get(fd);
+    printf("Runtime: reading %s (%llu bytes at %lld) failed: %s\n",f ? f->path : "?",
+           (unsigned long long)size,(long long)offset,strerror(error));
+}
 static int64_t do_read(int fd,void *buffer,uint64_t size) {
     int h=host_fd(fd);
     if (h<0) return get(fd) ? -EISDIR : -EBADF;
     runtime_memory_note_write((uintptr_t)buffer,size);
     touch_for_write(buffer,size);
     ssize_t n=read(h,buffer,size);
-    if (n<0) { if (audio_trace()) printf("Audio trace: read(fd %d, %llu) failed, errno %d\n",fd,(unsigned long long)size,errno); return -errno; }
+    if (n<0 && size && runtime_memory_guest_writable((uintptr_t)buffer,size)) n=read_bounced(h,buffer,size,-1);
+    if (n<0) { int e=errno; note_read_failure(fd,size,-1,e); return -e; }
     if (n>0) runtime_memory_note_write((uintptr_t)buffer,(uint64_t)n); /* and once the data is there */
     __atomic_add_fetch(&reads,1,__ATOMIC_RELAXED); __atomic_add_fetch(&bytes_read,(uint64_t)n,__ATOMIC_RELAXED);
     return n;
@@ -289,7 +326,8 @@ static int64_t do_pread(int fd,void *buffer,uint64_t size,int64_t offset) {
     runtime_memory_note_write((uintptr_t)buffer,size);
     touch_for_write(buffer,size);
     ssize_t n=pread(h,buffer,size,offset);
-    if (n<0) { if (audio_trace()) printf("Audio trace: pread(fd %d, %llu @%lld) failed, errno %d\n",fd,(unsigned long long)size,(long long)offset,errno); return -errno; }
+    if (n<0 && size && offset>=0 && runtime_memory_guest_writable((uintptr_t)buffer,size)) n=read_bounced(h,buffer,size,offset);
+    if (n<0) { int e=errno; note_read_failure(fd,size,offset,e); return -e; }
     if (n>0) runtime_memory_note_write((uintptr_t)buffer,(uint64_t)n); /* and once the data is there */
     __atomic_add_fetch(&reads,1,__ATOMIC_RELAXED); __atomic_add_fetch(&bytes_read,(uint64_t)n,__ATOMIC_RELAXED);
     return n;

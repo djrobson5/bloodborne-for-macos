@@ -46,6 +46,14 @@ public:
     /// cannot run (Problem() says why; missing assets or device features are permanent).
     bool Record(const Frame& frame);
 
+    /// Starts building the model for `preset` and that output size on a worker thread, so the
+    /// first frame that asks for FSR 4 finds it ready (building it compiles its passes, ~20 s the
+    /// first time on some drivers). Nothing if one is built or being built already.
+    void Prewarm(int preset, u32 output_width, u32 output_height);
+    /// The model is being built in the background: Record returns false (not fatal) until it is
+    /// done, and the caller keeps FSR 3.1 on screen meanwhile.
+    [[nodiscard]] bool Preparing() const noexcept;
+
     /// Why the last Record failed, or null.
     [[nodiscard]] const char* Problem() const noexcept;
     /// Assets or device features are missing: FSR 4 will not run in this session.

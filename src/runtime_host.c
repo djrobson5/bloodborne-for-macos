@@ -76,29 +76,70 @@ uint64_t host_realtime_ns(void) {
     return (ticks - UINT64_C(116444736000000000)) * 100;
 }
 static __thread HANDLE sleep_timer;
-/* High-resolution waitable timers (Windows 10 1803+) wake within ~0.5 ms; the rest of a
- * short wait is spun, so frame pacing and audio deadlines stay precise. */
-void host_sleep_until_ns(uint64_t deadline) {
-    enum { SPIN_NS = 600000 };
+static __thread int sleep_timer_high_resolution;
+enum { PRECISE_SPIN_NS = 600000, ADAPTIVE_MARGIN_NS = 100000 };
+/* How late the high-resolution timer wakes (ns), a running average over ~16 waits, measured on
+ * every timer wait. The adaptive spin (SPIN_ADAPTIVE) is that plus a margin: a fixed short
+ * spin woke the game's threads late whenever the timer was later than it (~20 sleeps a frame
+ * on the game's critical threads), a fixed long one burns a core. */
+static int64_t timer_late_ns = 300000;
+#define SPIN_ADAPTIVE UINT64_MAX
+/* High-resolution waitable timers (Windows 10 1803+) wake within ~0.5 ms; the last spin_ns of
+ * a wait is spun (all of it without such a timer). */
+static void sleep_until_spinning(uint64_t deadline, uint64_t spin_ns) {
     uint64_t now = host_monotonic_ns();
     if (now >= deadline) return;
-    if (deadline - now > SPIN_NS) {
-        if (!sleep_timer) {
-            sleep_timer = CreateWaitableTimerExW(NULL, NULL, CREATE_WAITABLE_TIMER_HIGH_RESOLUTION, TIMER_ALL_ACCESS);
-            if (!sleep_timer) sleep_timer = CreateWaitableTimerExW(NULL, NULL, 0, TIMER_ALL_ACCESS);
-        }
+    if (!sleep_timer) {
+        sleep_timer = CreateWaitableTimerExW(NULL, NULL, CREATE_WAITABLE_TIMER_HIGH_RESOLUTION, TIMER_ALL_ACCESS);
+        sleep_timer_high_resolution = sleep_timer != NULL;
+        if (!sleep_timer) sleep_timer = CreateWaitableTimerExW(NULL, NULL, 0, TIMER_ALL_ACCESS);
+    }
+    if (spin_ns == SPIN_ADAPTIVE) {
+        int64_t late = __atomic_load_n(&timer_late_ns, __ATOMIC_RELAXED);
+        spin_ns = (uint64_t)(late > 0 ? late : 0) + ADAPTIVE_MARGIN_NS;
+        if (spin_ns > PRECISE_SPIN_NS) spin_ns = PRECISE_SPIN_NS;
+    }
+    if (!sleep_timer_high_resolution && spin_ns < PRECISE_SPIN_NS) spin_ns = PRECISE_SPIN_NS;
+    if (deadline - now > spin_ns) {
+        const uint64_t due_at = deadline - spin_ns;
         LARGE_INTEGER due;
-        due.QuadPart = -(LONGLONG)((deadline - now - SPIN_NS) / 100);
-        if (sleep_timer && due.QuadPart < 0 && SetWaitableTimer(sleep_timer, &due, 0, NULL, NULL, FALSE))
+        due.QuadPart = -(LONGLONG)((due_at - now) / 100);
+        if (sleep_timer && due.QuadPart < 0 && SetWaitableTimer(sleep_timer, &due, 0, NULL, NULL, FALSE)) {
             WaitForSingleObject(sleep_timer, INFINITE);
-        else
+            if (sleep_timer_high_resolution) {
+                const uint64_t woke = host_monotonic_ns();
+                int64_t sample = woke > due_at ? (int64_t)(woke - due_at) : 0;
+                if (sample > 2000000) sample = 2000000;
+                const int64_t old = __atomic_load_n(&timer_late_ns, __ATOMIC_RELAXED);
+                __atomic_store_n(&timer_late_ns, old + (sample - old) / 16, __ATOMIC_RELAXED);
+            }
+        } else {
             Sleep((DWORD)((deadline - now) / 1000000));
+        }
     }
     while (host_monotonic_ns() < deadline) YieldProcessor();
 }
+/* Frame pacing and audio deadlines: precise. */
+void host_sleep_until_ns(uint64_t deadline) { sleep_until_spinning(deadline, PRECISE_SPIN_NS); }
+/* The game's own sleeps (sceKernelUsleep, nanosleep: ~20-26 per frame, ~4 ms each in Central
+ * Yharnam). By default the spin tail follows the timer (SPIN_ADAPTIVE: as late as it wakes,
+ * plus 0.1 ms; ~0.2-0.4 ms instead of 0.6), so a sleep neither burns a fixed 0.6 ms of a core
+ * nor overruns. BB_SLEEP_SPIN_US sets a fixed tail (600: as before). */
+static uint64_t guest_sleep_spin_ns(void) {
+    static uint64_t spin = 0;
+    uint64_t value = __atomic_load_n(&spin, __ATOMIC_RELAXED);
+    if (value == 0) {
+        const char *env = getenv("BB_SLEEP_SPIN_US");
+        value = env && env[0] ? strtoull(env, NULL, 10) * 1000 : SPIN_ADAPTIVE;
+        if (value != SPIN_ADAPTIVE && value > PRECISE_SPIN_NS) value = PRECISE_SPIN_NS;
+        if (value == 0) value = 1;
+        __atomic_store_n(&spin, value, __ATOMIC_RELAXED);
+    }
+    return value;
+}
 void host_sleep_ns(uint64_t ns) {
     if (!ns) { SwitchToThread(); return; }
-    host_sleep_until_ns(host_monotonic_ns() + ns);
+    sleep_until_spinning(host_monotonic_ns() + ns, guest_sleep_spin_ns());
 }
 #else
 #include <pthread.h>

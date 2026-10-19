@@ -4,12 +4,22 @@
 #pragma once
 #include "engine_hooks.h"
 #include "bbport_platform.h"
+#include <vector>
 namespace BbEngine {
 constexpr std::uint64_t kPreferredGuestSlide=0x400000;
 bool host_read_safe(const void* p,void* out,std::size_t n);
 void host_log(const char*,...);
 void StateInitialize(std::uint64_t image);
 void* params_row(const char* table,std::uint32_t id,std::size_t* size);
+// A loaded param table (the repository's ResCap and its file) and its records, for walking every
+// row. The file changes if the game reloads the table: params_table_file(cap) reads it again.
+struct ParamTable { std::uint64_t cap=0,file=0;std::uint16_t rows=0;std::uint8_t format=0,flags=0; };
+bool params_table(const char* table,ParamTable* out);
+std::uint64_t params_table_file(std::uint64_t cap);
+struct ParamRecord { std::uint32_t id;std::uint64_t data; };
+bool params_records(const ParamTable& table,std::vector<ParamRecord>* out);
+// GameDataMan's local player record (PlayerGameData), or 0 while there is none.
+std::uint64_t player_record();
 bool player_stat_get(const char* name,std::int64_t* value);
 bool player_stat_set(const char* name,std::int64_t value);
 bool player_origin(int* origin);

@@ -96,6 +96,20 @@ public:
         }
     }
 
+    bool HelpOne() {
+        Task task;
+        {
+            std::scoped_lock lk{mutex};
+            if (async_tasks.empty()) {
+                return false;
+            }
+            task = std::move(async_tasks.front());
+            async_tasks.pop_front();
+        }
+        RunAsync(task);
+        return true;
+    }
+
     void Run(std::size_t count, const std::function<void(std::size_t)>& task) {
         auto job = std::make_shared<Job>();
         job->task = &task;
@@ -186,6 +200,9 @@ private:
 
     void Loop(unsigned index) {
         Common::SetCurrentThreadName(("bb:Copy" + std::to_string(index)).c_str());
+        // The GPU command thread waits for these copies (WaitHostCopies, WaitAsync); raised
+        // only with cores to spare (bulk uploads while streaming, see MakeCritical).
+        BbThreads::MakeCritical(/*bulk=*/true);
         u64 seen = 0;
         std::unique_lock lk{mutex};
         while (true) {
@@ -292,6 +309,10 @@ void WaitAsync() {
         batch.bytes = 0;
     }
     GetPool().WaitAll();
+}
+
+bool HelpOne() {
+    return GetPool().Enabled() && GetPool().HelpOne();
 }
 
 void ParallelFor(std::size_t count, const std::function<void(std::size_t)>& task) {

@@ -13,6 +13,8 @@
 #define VK_USE_PLATFORM_XLIB_KHR
 #endif
 
+#include <algorithm>
+#include <string>
 #include <vector>
 #include <fmt/ranges.h>
 
@@ -31,6 +33,15 @@ namespace Vulkan {
 
 static const char* const VALIDATION_LAYER_NAME = "VK_LAYER_KHRONOS_validation";
 static const char* const CRASH_DIAGNOSTIC_LAYER_NAME = "VK_LAYER_LUNARG_crash_diagnostic";
+
+/// bbport: the extensions of the last instance CreateInstance made (IsInstanceExtensionEnabled).
+static std::vector<std::string> enabled_instance_extensions;
+
+#if defined(VK_USE_PLATFORM_WIN32_KHR)
+static const vk::SurfaceFullScreenExclusiveInfoEXT full_screen_exclusive_disallowed{
+    .fullScreenExclusive = vk::FullScreenExclusiveEXT::eDisallowed,
+};
+#endif
 
 static VKAPI_ATTR VkBool32 VKAPI_CALL DebugUtilsCallback(
     vk::DebugUtilsMessageSeverityFlagBitsEXT severity, vk::DebugUtilsMessageTypeFlagsEXT type,
@@ -194,10 +205,14 @@ std::vector<const char*> GetInstanceExtensions(Frontend::WindowSystemType window
 
     if (window_type != Frontend::WindowSystemType::Headless) {
         extensions.push_back(VK_KHR_SURFACE_EXTENSION_NAME);
-    }
-
-    if (EmulatorSettings.IsHdrAllowed()) {
+        // bbport: HDR output (hdr in bbport.ini): the surface lists its HDR formats only with
+        // this extension. Enabled whenever available; the SDR swapchain still picks
+        // SRGB_NONLINEAR (vk_swapchain.cpp).
         extensions.push_back(VK_EXT_SWAPCHAIN_COLOR_SPACE_EXTENSION_NAME);
+#if defined(VK_USE_PLATFORM_WIN32_KHR)
+        // bbport: needed by VK_EXT_full_screen_exclusive (device), and the *2 surface queries.
+        extensions.push_back(VK_KHR_GET_SURFACE_CAPABILITIES_2_EXTENSION_NAME);
+#endif
     }
 
     if (enable_debug_utils) {
@@ -287,6 +302,7 @@ vk::UniqueInstance CreateInstance(Frontend::WindowSystemType window_type, bool e
 
     const auto layers = GetInstanceLayers(enable_validation, enable_crash_diagnostic);
     const auto extensions = GetLayerExtensions(GetInstanceExtensions(window_type, true), layers);
+    enabled_instance_extensions.assign(extensions.begin(), extensions.end());
 
     const vk::ApplicationInfo application_info = {
         .pApplicationName = "shadPS4",
@@ -437,6 +453,63 @@ vk::UniqueDebugUtilsMessengerEXT CreateDebugCallback(vk::Instance instance) {
     ASSERT_MSG(messenger_result == vk::Result::eSuccess, "Failed to create debug callback: {}",
                vk::to_string(messenger_result));
     return std::move(messenger);
+}
+
+bool IsInstanceExtensionEnabled(std::string_view name) {
+    return std::ranges::find(enabled_instance_extensions, name) !=
+           enabled_instance_extensions.end();
+}
+
+const char* FullScreenExclusiveExtensionName() {
+#if defined(VK_USE_PLATFORM_WIN32_KHR)
+    return VK_EXT_FULL_SCREEN_EXCLUSIVE_EXTENSION_NAME;
+#else
+    return nullptr;
+#endif
+}
+
+const void* FullScreenExclusiveDisallowed(bool enabled) {
+#if defined(VK_USE_PLATFORM_WIN32_KHR)
+    return enabled ? &full_screen_exclusive_disallowed : nullptr;
+#else
+    return nullptr;
+#endif
+}
+
+vk::ResultValue<std::vector<vk::PresentModeKHR>> GetSurfacePresentModes(
+    vk::Instance instance, vk::PhysicalDevice physical, vk::SurfaceKHR surface,
+    bool full_screen_exclusive) {
+#if defined(VK_USE_PLATFORM_WIN32_KHR)
+    // Loaded here: the dispatcher's Win32 entries are only filled in this translation unit.
+    const auto get_modes = full_screen_exclusive
+        ? reinterpret_cast<PFN_vkGetPhysicalDeviceSurfacePresentModes2EXT>(
+              VULKAN_HPP_DEFAULT_DISPATCHER.vkGetInstanceProcAddr(
+                  static_cast<VkInstance>(instance), "vkGetPhysicalDeviceSurfacePresentModes2EXT"))
+        : nullptr;
+    if (get_modes) {
+        const VkPhysicalDeviceSurfaceInfo2KHR info{
+            .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SURFACE_INFO_2_KHR,
+            .pNext = &full_screen_exclusive_disallowed,
+            .surface = static_cast<VkSurfaceKHR>(surface),
+        };
+        const VkPhysicalDevice device = static_cast<VkPhysicalDevice>(physical);
+        u32 count = 0;
+        VkResult result = get_modes(device, &info, &count, nullptr);
+        std::vector<vk::PresentModeKHR> modes;
+        if (result == VK_SUCCESS) {
+            modes.resize(count);
+            result = get_modes(device, &info, &count,
+                               reinterpret_cast<VkPresentModeKHR*>(modes.data()));
+            modes.resize(count);
+        }
+        if (result == VK_SUCCESS || result == VK_INCOMPLETE) {
+            return {vk::Result::eSuccess, std::move(modes)};
+        }
+        LOG_WARNING(Render_Vulkan, "vkGetPhysicalDeviceSurfacePresentModes2EXT failed: {}",
+                    vk::to_string(vk::Result{result}));
+    }
+#endif
+    return physical.getSurfacePresentModesKHR(surface);
 }
 
 } // namespace Vulkan

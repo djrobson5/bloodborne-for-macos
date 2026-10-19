@@ -372,8 +372,10 @@ struct DlssUpscaler::Impl {
         if (!available) {
             return false;
         }
+        // bbport: a scene at the output size (a native scene) is DLAA, whatever the preset.
+        const bool native = f.render_width == f.output.width && f.render_height == f.output.height;
         const Key wanted{f.render_width, f.render_height, f.output.width, f.output.height,
-                         Quality(f.preset), IsFloatFormat(f.color.format)};
+                         native ? int(Dlaa) : Quality(f.preset), IsFloatFormat(f.color.format)};
         if (!feature || !(wanted == key)) {
             if (feature) {
                 scheduler.Finish(); // the feature's resources may still be in use

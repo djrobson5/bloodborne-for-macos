@@ -1,13 +1,18 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 #include "video_core/renderer_vulkan/vk_fsr4.h"
+#include "video_core/renderer_vulkan/vk_fsr4vk.h"
 #include "bbport_toggles.h"
 
 #include <algorithm>
+#include <filesystem>
+#include <atomic>
+#include <chrono>
 #include <cstdio>
 #include <cstdlib>
 #include <deque>
 #include <fstream>
 #include <string>
+#include <thread>
 #include <utility>
 #include <vector>
 
@@ -38,6 +43,15 @@ bool ReadFile(const std::string& path, std::vector<u8>& data) {
 }
 
 FfxFsr4ModelPreset ModelPreset(int preset) {
+    // Bloodborne PC (after IFreemz/shadPS4-Bloodborne-DLSS-FSR 9b2766e): BB_FSR4_BALANCED=1 runs
+    // the balanced model for the 2x and 3x presets too; it leaves fewer trails behind moving
+    // characters than the performance models, at some GPU cost. The render size stays the preset's.
+    static const bool balanced_low = [] {
+        const char* v = std::getenv("BB_FSR4_BALANCED");
+        return v && v[0] == '1';
+    }();
+    if (balanced_low && preset >= 3)
+        return FFX_FSR4_MODEL_PRESET_BALANCED;
     switch (preset) {
     case 0:
         return FFX_FSR4_MODEL_PRESET_NATIVE_AA;
@@ -72,12 +86,70 @@ struct Fsr4Upscaler::Impl {
     std::unique_ptr<Fsr411::Upscaler> fsr411;
     std::deque<u64> fsr411_ticks; ///< scheduler ticks of its recent frames (constant ring)
     std::string fsr411_described;
+    // bbport: FSR 4.1.1 through the fsr4vk provider DLL where the replay cannot run (Windows).
+    std::unique_ptr<Fsr4Vk> fsr4vk;
+    std::string fsr4vk_described;
+    // bbport: the model is built on a worker thread (Build): creating it compiles its 16 compute
+    // pipelines, which took one NVIDIA driver 23 s the first time - on the draw recording thread
+    // that froze the game. While `preparing`, only the worker touches the backend and context
+    // fields; the render thread reads them again after joining it (Adopt).
+    std::thread prep;
+    std::atomic<bool> preparing{false};
+    bool built_ok = false, built_fatal = false;
+    std::string built_problem;
 
     Impl(const Instance& instance_, Scheduler& scheduler_)
         : instance{instance_}, scheduler{scheduler_} {}
 
     ~Impl() {
+        if (prep.joinable()) prep.join();
         Destroy();
+    }
+
+    /// A failure while building (worker thread): applied by Adopt on the render thread.
+    void BuildFail(std::string reason, bool permanent) {
+        built_problem = std::move(reason);
+        built_fatal |= permanent;
+    }
+
+    void StartBuild(int preset, u32 ow, u32 oh) {
+        built_ok = built_fatal = false;
+        built_problem.clear();
+        preparing = true;
+        std::printf("Upscaler: FSR 4 %s model building in the background (%ux%u); FSR 3.1 until it is ready\n",
+                    ffxFsr4ModelPresetName(ModelPreset(preset)), ow, oh);
+        prep = std::thread([this, preset, ow, oh] {
+            const auto start = std::chrono::steady_clock::now();
+            built_ok = CreateBackend(preset, ow, oh);
+            if (built_ok) {
+                std::printf("Upscaler: FSR 4 ready after %.1f s\n",
+                            std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count());
+            }
+            preparing = false;
+        });
+    }
+
+    /// Render thread: a finished build becomes the model in use (or its failure is reported).
+    void Adopt() {
+        if (preparing || !prep.joinable()) return;
+        prep.join();
+        if (!built_ok) {
+            Fail(built_problem, built_fatal);
+            Destroy(true);
+        }
+    }
+
+    bool Waiting() {
+        problem = "compiling its shaders in the background; FSR 3.1 until they are ready";
+        return false;
+    }
+
+    void Prewarm(int preset, u32 ow, u32 oh) {
+        if (fatal || preparing || prep.joinable() || context_ok || !ow || !oh ||
+            !instance.IsFsr4Int8Supported() || BbSettings::Get().upscaler == BbSettings::UpscalerFsr411) {
+            return;
+        }
+        StartBuild(std::clamp(preset, 0, 4), ow, oh);
     }
 
     /// `recording`: called from Record(), inside the upscaler's pass on the command buffer it
@@ -116,7 +188,7 @@ struct Fsr4Upscaler::Impl {
     bool CreateBackend(int preset, u32 ow, u32 oh) {
         FfxFsr4V07AssetSet assets{};
         if (!ffxFsr4V07BuildAssetSet(ModelPreset(preset), ow, oh, &assets)) {
-            Fail("output size is not supported by the v07 model", true);
+            BuildFail("output size is not supported by the v07 model", true);
             return false;
         }
         const std::string dir = AssetDir() + "/";
@@ -135,7 +207,7 @@ struct Fsr4Upscaler::Impl {
             if (ReadFile(dir + name, data)) {
                 return true;
             }
-            Fail("missing " + dir + name + " (run tools/fetch_fsr4_assets.sh)", true);
+            BuildFail("missing " + dir + name + " (run tools/fetch_fsr4_assets.sh)", true);
             return false;
         };
         if (!load(assets.pre, code[0])) return false;
@@ -149,7 +221,7 @@ struct Fsr4Upscaler::Impl {
         }
         if (initializer.size() != FFX_FSR4_V07_INITIALIZER_BYTES ||
             weights.size() != FFX_FSR4_V07_PRE_PASS_WEIGHTS_BYTES) {
-            Fail("model weights have an unexpected size", true);
+            BuildFail("model weights have an unexpected size", true);
             return false;
         }
         if (optimized) {
@@ -168,7 +240,7 @@ struct Fsr4Upscaler::Impl {
         ci.physicalDevice = instance.GetPhysicalDevice();
         for (u32 i = 0; i < FFX_FSR4_VK_PASS_COUNT; ++i) {
             if (code[i].size() % 4) {
-                Fail("invalid SPIR-V asset", true);
+                BuildFail("invalid SPIR-V asset", true);
                 return false;
             }
             ci.shaders[i] = {reinterpret_cast<const uint32_t*>(code[i].data()), code[i].size(),
@@ -183,7 +255,7 @@ struct Fsr4Upscaler::Impl {
         ci.scratchBufferSize = scratch.size();
         if (const VkResult result = ffxFsr4VkCreateContext(&ci, &backend);
             result != VK_SUCCESS) {
-            Fail("Vulkan backend creation failed (" + std::to_string(int(result)) + ")", true);
+            BuildFail("Vulkan backend creation failed (" + std::to_string(int(result)) + ")", true);
             backend = {};
             return false;
         }
@@ -199,7 +271,7 @@ struct Fsr4Upscaler::Impl {
         const auto created = ffxFsr4V07CreateContext(&context, &desc.header, nullptr);
         ffxFsr4V07SetBackendInterface(nullptr);
         if (created != FFX_API_RETURN_OK) {
-            Fail("provider context creation failed (" + std::to_string(created) + ")", true);
+            BuildFail("provider context creation failed (" + std::to_string(created) + ")", true);
             return false;
         }
         context_ok = true;
@@ -233,10 +305,39 @@ struct Fsr4Upscaler::Impl {
         return ffxFsr4VkSetExternalImageState(&backend, &state);
     }
 
-    bool Record411(const Frame& f) {
-        if (!instance.IsFsr411Supported()) {
-            Fail("FSR 4.1.1 needs INT8 dot products and VK_VALVE_shader_mixed_float_dot_product", true);
+    bool RecordFsr4Vk(const Frame& f) {
+        if (!fsr4vk) {
+            fsr4vk = std::make_unique<Fsr4Vk>(instance, scheduler);
+        }
+        if (!fsr4vk->Record(f)) {
+            const char* reason = fsr4vk->Problem();
+            Fail(std::string{"FSR 4.1.1 (fsr4vk): "} + (reason ? reason : "dispatch failed"),
+                 fsr4vk->Fatal());
             return false;
+        }
+        if (const std::string d = fsr4vk->Describe(); d != fsr4vk_described) {
+            fsr4vk_described = d;
+            std::printf("Upscaler: FSR 4.1.1 through fsr4vk, %s\n", d.c_str());
+        }
+        problem.clear();
+        return true;
+    }
+
+    bool Record411(const Frame& f) {
+        if (!instance.IsFsr411Available()) {
+            Fail("FSR 4.1.1 needs INT8 dot products and either VK_VALVE_shader_mixed_float_dot_product "
+                 "or the fsr4vk files",
+                 true);
+            return false;
+        }
+        // bbport: the replay needs its fsr4_411 set (built from an AMD DLL); fsr4vk, shipped in
+        // the package, otherwise.
+        const char* set = std::getenv("BB_FSR411_DIR");
+        std::error_code set_error;
+        if (!instance.IsFsr411Supported() ||
+            (instance.IsFsr4VkSupported() &&
+             !std::filesystem::is_directory(set && set[0] ? set : "fsr4_411", set_error))) {
+            return RecordFsr4Vk(f);
         }
         if (!fsr411) {
             const char* env = std::getenv("BB_FSR411_DIR");
@@ -291,14 +392,20 @@ struct Fsr4Upscaler::Impl {
             Fail("the GPU lacks INT8 dot product / compute derivative support", true);
             return false;
         }
+        if (preparing) {
+            return Waiting();
+        }
+        Adopt();
+        if (fatal) {
+            return false;
+        }
         const int preset = std::clamp(f.preset, 0, 4);
         if (!context_ok || preset != model || f.output.width != out_width ||
             f.output.height != out_height) {
+            // Built in the background; FSR 3.1 shows the frames until then (TemporalUpscaler).
             Destroy(true);
-            if (!CreateBackend(preset, f.output.width, f.output.height)) {
-                Destroy(true);
-                return false;
-            }
+            StartBuild(preset, f.output.width, f.output.height);
+            return Waiting();
         }
         Retire();
         const u64 frame_id = next_frame_id++;
@@ -391,6 +498,14 @@ Fsr4Upscaler::~Fsr4Upscaler() = default;
 
 bool Fsr4Upscaler::Record(const Frame& frame) {
     return impl->Record(frame);
+}
+
+void Fsr4Upscaler::Prewarm(int preset, u32 output_width, u32 output_height) {
+    impl->Prewarm(preset, output_width, output_height);
+}
+
+bool Fsr4Upscaler::Preparing() const noexcept {
+    return impl->preparing;
 }
 
 const char* Fsr4Upscaler::Problem() const noexcept {

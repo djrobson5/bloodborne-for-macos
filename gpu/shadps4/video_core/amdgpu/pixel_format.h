@@ -356,7 +356,10 @@ constexpr NumberConversion MapNumberConversion(const NumberFormat num_fmt,
         case DataFormat::Format16_16_16_16:
             return NumberConversion::Sint16ToSnormNz;
         default:
-            UNREACHABLE_MSG("data_fmt = {}", u32(data_fmt));
+            // bbport: Bloodborne sometimes binds SnormNz with a packed format (seen: data_fmt 7,
+            // 11_11_10) after minutes of play; this stopped the game (exit 23). Such a descriptor
+            // has no SnormNz meaning, so it is read without a conversion instead.
+            return NumberConversion::None;
         }
     }
     default:

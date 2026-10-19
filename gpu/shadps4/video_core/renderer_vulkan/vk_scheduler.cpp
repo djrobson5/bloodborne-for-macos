@@ -17,6 +17,7 @@
 
 #include "bbport_copy.h"
 #include "bbport_platform.h"
+#include "bbport_sections.h"
 #include "video_core/renderer_vulkan/vk_gpu_profiler.h"
 #include "bbport_toggles.h"
 #include "bbport_wait_trace.h"
@@ -322,37 +323,165 @@ std::unique_ptr<RecordChunk> Scheduler::AcquireChunk() {
     return chunk;
 }
 
-void Scheduler::SignalAfterHostCopies(std::function<void()> signal) {
-    // A direct segment queues it too: signals queued before it must not be overtaken.
-    if (!IsRecordingDeferred() && !direct_segment) {
-        WaitHostCopies();
-        signal();
-        return;
-    }
-    BbCopy::FlushBatch();
-    deferred_signals_issued.fetch_add(1, std::memory_order_relaxed);
-    RecordOrdered([signal = std::move(signal), done = deferred_signals_done]() mutable {
-        BbCopy::AfterCopies([signal = std::move(signal), done = std::move(done)] {
-            signal();
-            done->fetch_add(1, std::memory_order_release);
-        });
-    });
-    KickRecording(true);
+namespace {
+/// bbport BB_HOST_WAIT_SPIN_US (default 100; 0: the loops as before): the waits for host copies
+/// and deferred signals spin with pause for this long before they yield (Sleep(0) on Windows: a
+/// system call each, and the core may go to another thread for a while), and help the copy
+/// threads one queued task at a time (BbCopy::HelpOne) instead of BbCopy::WaitAsync, which also
+/// waits for copies issued after the signal.
+u32 HostWaitSpinUs() {
+    static const u32 us = [] {
+        const char* env = std::getenv("BB_HOST_WAIT_SPIN_US");
+        return env && env[0] ? static_cast<u32>(std::max(0, std::atoi(env))) : 100u;
+    }();
+    return us;
 }
 
-void Scheduler::WaitDeferredSignals() {
-    const u64 issued = deferred_signals_issued.load(std::memory_order_relaxed);
-    if (deferred_signals_done->load(std::memory_order_acquire) >= issued ||
+/// Waits until `done()`. `help`: runs queued copy tasks meanwhile (the signals wait for them).
+template <typename Done>
+void WaitUntil(Done&& done, bool help) {
+    const u32 spin_us = HostWaitSpinUs();
+    if (spin_us == 0) {
+        while (!done()) {
+            if (help) {
+                BbCopy::WaitAsync();
+            }
+            std::this_thread::yield();
+        }
+        return;
+    }
+    const auto spin_until = std::chrono::steady_clock::now() + std::chrono::microseconds(spin_us);
+    bool spinning = true;
+    for (u32 spins = 1; !done(); ++spins) {
+        if (help && (spins & 63) == 1 && BbCopy::HelpOne()) {
+            continue;
+        }
+        if (!spinning) {
+            std::this_thread::yield();
+            continue;
+        }
+        __builtin_ia32_pause();
+        // The clock is read every 256 pauses, not per iteration.
+        if (!(spins & 255) && std::chrono::steady_clock::now() >= spin_until) {
+            spinning = false;
+        }
+    }
+}
+
+/// bbport: a wait that blocked, timed into the "host copies" share of the frame statistics and per
+/// call site (the "Stage B waits" line).
+struct SiteWait {
+    std::atomic<u64>& count;
+    std::atomic<u64>& ns;
+    std::chrono::steady_clock::time_point start = std::chrono::steady_clock::now();
+    ~SiteWait() {
+        const u64 spent = static_cast<u64>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                               std::chrono::steady_clock::now() - start)
+                                               .count());
+        BbStats::host_copies_wait_ns.fetch_add(spent, std::memory_order_relaxed);
+        count.fetch_add(1, std::memory_order_relaxed);
+        ns.fetch_add(spent, std::memory_order_relaxed);
+    }
+};
+
+u32 ClampSite(u32 site) {
+    return std::min<u32>(site, BbStats::WaitOther);
+}
+
+bool FenceOrderEnv() {
+    static const bool on = [] {
+        // bbport: ordered unless BB_FENCE_ORDER=all (the opt-out after the beta A/B).
+        const char* env = std::getenv("BB_FENCE_ORDER");
+        const bool ordered = !(env && std::strcmp(env, "all") == 0);
+        if (ordered) {
+            std::printf("GPU: WriteData and DMA wait only for the fences the command processor "
+                        "would have written before them (BB_FENCE_ORDER=all turns it off)\n");
+        }
+        return ordered;
+    }();
+    return on;
+}
+} // namespace
+
+bool Scheduler::FenceOrderScoped() {
+    return FenceOrderEnv() || BbToggle::Experiment(8);
+}
+
+bool Scheduler::FenceOrderPossible() {
+    static const bool possible = FenceOrderEnv() || std::getenv("BB_TOGGLE_FILE") != nullptr;
+    return possible;
+}
+
+void Scheduler::WaitDeferredSignals(u32 site) {
+    WaitDeferredSignalsUpTo(deferred_signals_issued.load(std::memory_order_relaxed), site);
+}
+
+void Scheduler::WaitDeferredSignalsUpTo(u64 need, u32 site) {
+    if (deferred_signals_done->load(std::memory_order_acquire) >= need ||
         BbToggle::Disabled(BbToggle::OrderedGuestWrites)) {
         return;
     }
-    BbStats::WaitTimer timer{BbStats::host_copies_wait_ns};
+    site = ClampSite(site);
+    BbSections::Scope scope{BbSections::WaitSignals};
+    SiteWait timer{BbStats::signal_waits[site], BbStats::signal_wait_ns[site]};
     KickRecording(true);
-    while (deferred_signals_done->load(std::memory_order_acquire) < issued) {
-        // Helps the copy threads the signals wait for.
-        BbCopy::WaitAsync();
-        std::this_thread::yield();
+    // Helps the copy threads the signals wait for.
+    WaitUntil([&] { return deferred_signals_done->load(std::memory_order_acquire) >= need; },
+              true);
+}
+
+void Scheduler::WaitDeferredSignalsFor(u32 site, u64 address, u64 size, u64 src, u64 src_size) {
+    if (!FenceOrderScoped()) {
+        WaitDeferredSignals(site);
+        return;
     }
+    const u64 issued = deferred_signals_issued.load(std::memory_order_relaxed);
+    const u64 done = deferred_signals_done->load(std::memory_order_acquire);
+    if (done >= issued) {
+        return;
+    }
+    // Signals complete in the order they were issued (BbCopy::AfterCopies keeps it): waiting for
+    // the newest one needed covers the ones before it.
+    u64 need = std::min(signal_barrier.load(std::memory_order_relaxed), issued);
+    need = std::max(need, NewestLabelOverlap(done, address, size));
+    if (src_size != 0) {
+        need = std::max(need, NewestLabelOverlap(done, src, src_size));
+    }
+    if (need <= done) {
+        BbStats::signal_waits_skipped[ClampSite(site)].fetch_add(1, std::memory_order_relaxed);
+        return;
+    }
+    WaitDeferredSignalsUpTo(need, site);
+}
+
+void Scheduler::NoteDeferredLabel(u64 label, u32 label_size, u64 seq) {
+    if (label_size == 0) {
+        // Not a label write (GPU idle, an interrupt, a GDS store): nothing may overtake it.
+        signal_barrier.store(seq, std::memory_order_relaxed);
+        return;
+    }
+    auto& entry = deferred_labels[deferred_label_count++ % DeferredLabels];
+    deferred_label_lost = std::max(deferred_label_lost, entry.seq);
+    entry = {label, label_size, seq};
+}
+
+u64 Scheduler::NewestLabelOverlap(u64 done, u64 address, u64 size) const {
+    if (size == 0) {
+        return 0;
+    }
+    // An entry overwritten while its signal may still be pending counts as overlapping.
+    u64 newest = deferred_label_lost > done ? deferred_label_lost : 0;
+    const u64 count = std::min<u64>(deferred_label_count, DeferredLabels);
+    for (u64 i = 0; i < count; ++i) {
+        const auto& entry = deferred_labels[(deferred_label_count - 1 - i) % DeferredLabels];
+        if (entry.seq <= done) {
+            break; // this one and the older ones are written
+        }
+        if (entry.address < address + size && address < entry.address + entry.size) {
+            newest = std::max(newest, entry.seq);
+        }
+    }
+    return newest;
 }
 
 namespace {
@@ -386,7 +515,7 @@ void Scheduler::NoteHostCopySource(u64 address, u64 size) {
     }
 }
 
-void Scheduler::WaitHostCopiesFor(u64 address, u64 size) {
+void Scheduler::WaitHostCopiesFor(u64 address, u64 size, u32 site) {
     {
         std::scoped_lock lk{host_copy_sources_mutex};
         bool overlap = host_copy_big_seq > host_copy_sources_done;
@@ -405,10 +534,10 @@ void Scheduler::WaitHostCopiesFor(u64 address, u64 size) {
             return;
         }
     }
-    WaitHostCopies();
+    WaitHostCopies(site);
 }
 
-void Scheduler::WaitHostCopies() {
+void Scheduler::WaitHostCopies(u32 site) {
     u64 sources_seen;
     {
         std::scoped_lock lk{host_copy_sources_mutex};
@@ -423,13 +552,15 @@ void Scheduler::WaitHostCopies() {
             s.host_copy_sources_done = std::max(s.host_copy_sources_done, seen);
         }
     } forget{*this, sources_seen};
+    BbSections::Scope scope{BbSections::WaitCopies};
     if (host_copies_done.load(std::memory_order_acquire) < host_copies_issued) {
-        BbStats::WaitTimer timer{BbStats::host_copies_wait_ns};
+        site = ClampSite(site);
+        SiteWait timer{BbStats::copy_waits[site], BbStats::copy_wait_ns[site]};
         BbStats::host_copy_waits.fetch_add(1, std::memory_order_relaxed);
         KickRecording(true);
-        while (host_copies_done.load(std::memory_order_acquire) < host_copies_issued) {
-            std::this_thread::yield();
-        }
+        const u64 issued = host_copies_issued;
+        WaitUntil(
+            [&] { return host_copies_done.load(std::memory_order_acquire) >= issued; }, false);
     }
     BbStats::WaitTimer timer{BbStats::copy_threads_wait_ns};
     BbCopy::WaitAsync();
@@ -449,7 +580,7 @@ void Scheduler::KickRecording(bool force) {
         MaybeSplit();
     }
     // Batches of tens of KiB keep the queue handoff cheap relative to the work it carries.
-    if (!force && full_chunks.empty() && record_chunk->Size() < 32 * 1024) {
+    if (!force && full_chunks.empty() && CurrentChunk().Size() < 32 * 1024) {
         return;
     }
     HandOver();
@@ -461,7 +592,7 @@ void Scheduler::MaybeSplit() {
         return;
     }
     // Cutting inside a render pass closes and reopens it: only after a longer stretch.
-    const size_t bytes = segment_bytes + record_chunk->Size();
+    const size_t bytes = segment_bytes + CurrentChunk().Size();
     if (bytes < (is_rendering ? 2 * split_bytes : split_bytes)) {
         return;
     }
@@ -510,6 +641,11 @@ void Scheduler::HandOver() {
     if (!commands && !ordered) {
         return;
     }
+    // The chunks that take the current ones' places, taken first (AcquireChunk locks
+    // recorder_mutex) and swapped in below: record_chunk and ordered_chunk are never null, not
+    // even for a fault handler recording on this thread meanwhile (deadinside28 10baf9d, #100).
+    std::unique_ptr<RecordChunk> next_record = record_chunk->Empty() ? nullptr : AcquireChunk();
+    std::unique_ptr<RecordChunk> next_ordered = ordered_chunk->Empty() ? nullptr : AcquireChunk();
     Worker& worker = *workers[current_segment % workers.size()];
     bool wake = false;
     {
@@ -521,11 +657,12 @@ void Scheduler::HandOver() {
                 worker.queue.push_back(std::move(chunk));
                 ++batch->handed[current_segment];
             }
-            if (!record_chunk->Empty()) {
-                segment_bytes += record_chunk->Size();
-                record_chunk->segment = current_segment;
-                record_chunk->batch = batch;
-                worker.queue.push_back(std::move(record_chunk));
+            if (next_record) {
+                record_chunk.swap(next_record); // next_record: the chunk handed over
+                segment_bytes += next_record->Size();
+                next_record->segment = current_segment;
+                next_record->batch = batch;
+                worker.queue.push_back(std::move(next_record));
                 ++batch->handed[current_segment];
             }
             worker.queued.store(worker.queue.size(), std::memory_order_release);
@@ -542,8 +679,9 @@ void Scheduler::HandOver() {
             for (auto& chunk : ordered_full) {
                 queue(std::move(chunk));
             }
-            if (!ordered_chunk->Empty()) {
-                queue(std::move(ordered_chunk));
+            if (next_ordered) {
+                ordered_chunk.swap(next_ordered); // next_ordered: the chunk handed over
+                queue(std::move(next_ordered));
             }
             ordered_queued.store(ordered_queue.size(), std::memory_order_release);
             // Any thread may run them; the current segment's thread is woken for them (when it
@@ -622,7 +760,7 @@ void Scheduler::EnterDirectMode() {
         }
         // A segment nothing was handed to yet is not begun: it becomes the direct one.
         const bool untouched =
-            batch->handed[current_segment] == 0 && full_chunks.empty() && record_chunk->Empty();
+            batch->handed[current_segment] == 0 && full_chunks.empty() && CurrentChunk().Empty();
         if (!untouched) {
             // Its recording thread ends the segment's command buffer (the pool is that thread's).
             Record([](vk::CommandBuffer cmdbuf) { Check(cmdbuf.end()); });
@@ -675,6 +813,7 @@ void Scheduler::RecorderThread(std::stop_token stoken, u32 index) {
         std::snprintf(name, sizeof(name), "bb:VkRecorder%u", index);
         Common::SetCurrentThreadName(name);
     }
+    BbThreads::MakeCritical();
     Worker& worker = *workers[index];
     std::vector<std::unique_ptr<RecordChunk>> ordered;
     const auto has_work = [&] {
@@ -687,7 +826,7 @@ void Scheduler::RecorderThread(std::stop_token stoken, u32 index) {
         // take time from guest threads. The others sleep until a new segment reaches them.
         if (active_worker.load(std::memory_order_relaxed) == index) {
             static const auto spin_time =
-                std::chrono::microseconds(BbThreads::Available() >= 12 ? 200 : 20);
+                std::chrono::microseconds(BbThreads::CapSpinUs(BbThreads::Available() >= 12 ? 200 : 20));
             const auto spin_until = std::chrono::steady_clock::now() + spin_time;
             for (u32 spins = 1; worker.queued.load(std::memory_order_acquire) == 0 &&
                                 ordered_queued.load(std::memory_order_acquire) == 0;

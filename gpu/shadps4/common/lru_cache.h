@@ -55,8 +55,10 @@ public:
 
     template <typename Func>
     void ForEachItemBelow(TickType tick, Func&& func) {
+        // bbport: invoke_result_t, not invoke_result (a struct, never bool): the callbacks'
+        // "stop" never stopped the walk, so every GC pass visited every old entry.
         static constexpr bool RETURNS_BOOL =
-            std::is_same_v<std::invoke_result<Func, ObjectType>, bool>;
+            std::is_same_v<std::invoke_result_t<Func, ObjectType>, bool>;
         Item* iterator = first_item;
         while (iterator) {
             if (static_cast<s64>(tick) - static_cast<s64>(iterator->tick) < 0) {

@@ -22,6 +22,7 @@
 #include "video_core/renderer_vulkan/vk_common.h"
 #include "video_core/renderer_vulkan/vk_dlss.h"
 #include "video_core/renderer_vulkan/vk_fsr4.h"
+#include "video_core/renderer_vulkan/vk_hdr_native.h"
 #include "video_core/texture_cache/image.h"
 
 struct FfxVkPortableUpscaleContext;
@@ -47,7 +48,8 @@ class TemporalUpscaler {
 public:
     TemporalUpscaler(const Instance& instance, Scheduler& scheduler,
                      VideoCore::TextureCache& texture_cache, Runtime& runtime,
-                     CameraMotion& camera_motion, SceneTargets& scene_targets);
+                     CameraMotion& camera_motion, SceneTargets& scene_targets,
+                     HdrNative& hdr_native);
     ~TemporalUpscaler();
 
     [[nodiscard]] bool Enabled() const noexcept {
@@ -70,6 +72,10 @@ public:
 
     /// Start of a frame in the command stream (display pass).
     bool OnFrameStart();
+    /// bbport: native HDR output (vk_hdr_native.h). Right before OnFrameStart: the display pass
+    /// copies the finished frame into the display buffer at `address`; `frame` is the target
+    /// the previous draw rendered into.
+    void OnDisplayPass(VAddr address, VideoCore::ImageId frame);
     bool RasterScaling() const;
     /// bbport: LOD bias for scene materials, log2(render / output) while a reduced scene is
     /// upscaled (0 at native size, for TAA and without an upscaler).
@@ -161,6 +167,12 @@ private:
         return w >= render_width && h >= render_height && w < render_width + 8 &&
                h < render_height + 8;
     }
+    /// bbport: native HDR output: the game's tonemapped frame (the UI target): RGBA8 of the
+    /// render size, not a display buffer.
+    [[nodiscard]] bool LdrFrame(VideoCore::ImageId id) const;
+    /// bbport: native HDR output: the output-size UI image as a native HDR source (UNORM view:
+    /// the display-encoded values, whatever its format).
+    HdrNative::Source HdrUiImage();
     /// The scene's size inside a `w` x `h` render target: the game's viewport.
     [[nodiscard]] std::array<u32, 2> SceneSize(u32 w, u32 h) const;
     // The scene color is drawn into a reduced SceneTargets proxy (live presets).
@@ -187,6 +199,9 @@ private:
     Runtime& runtime;
     CameraMotion& camera_motion;
     SceneTargets& scene_targets;
+    HdrNative& hdr_native;
+    /// bbport: native HDR output: the game's UI target this frame's UI-free copy came from.
+    VideoCore::ImageId hdr_ui_target{};
     int applied_preset = -1;
     int applied_upscaler = -1;
     bool dispatched_last_frame = false;
@@ -257,6 +272,7 @@ private:
     std::unique_ptr<Fsr4Upscaler> fsr4;
     std::unique_ptr<DlssUpscaler> dlss; ///< NVIDIA devices only; records the FSR 4 frame
     bool fsr4_failed = false;
+    bool fsr4_building = false; ///< FSR 4's model is built in the background: FSR 3.1 until then
     VideoCore::UniqueImage motion_image;
     VideoCore::UniqueImage output_image;
     vk::UniqueImageView motion_view;

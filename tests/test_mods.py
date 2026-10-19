@@ -33,6 +33,24 @@ class ModTests(unittest.TestCase):
         (folder / file).write_bytes(contents)
         return root
 
+    def test_game_update_beside_the_game_is_layered_under_mods(self):
+        update = self.root / 'CUSA03173-UPDATE'
+        (update / 'dvdroot_ps4' / 'chr').mkdir(parents=True)
+        (update / 'sce_sys').mkdir()
+        (update / 'eboot.bin').write_bytes(b'1.09 executable')
+        (update / 'sce_sys' / 'param.sfo').write_bytes(b'1.09 sfo')
+        (update / 'dvdroot_ps4' / 'chr' / 'a.dcx').write_bytes(b'updated')
+        (update / 'dvdroot_ps4' / 'chr' / 'b.dcx').write_bytes(b'updated b')
+        self.assertEqual(mods.update_folder(self.game), update)
+        a = self.mod('A')
+        result = mods.build_overlay(self.game, self.root / 'out', [('A', a)], mods.update_folder(self.game))
+        self.assertEqual((result / 'eboot.bin').read_bytes(), b'1.09 executable')
+        self.assertEqual((result / 'sce_sys' / 'param.sfo').read_bytes(), b'1.09 sfo')
+        self.assertEqual((result / 'dvdroot_ps4' / 'chr' / 'a.dcx').read_bytes(), b'mod')
+        self.assertEqual((result / 'dvdroot_ps4' / 'chr' / 'b.dcx').read_bytes(), b'updated b')
+        self.assertEqual((self.game / 'eboot.bin').read_bytes(), b'original executable')
+        self.assertIsNone(mods.update_folder(update))
+
     def test_merge_replacement_new_file_and_directory_listing(self):
         a = self.mod('A')
         self.mod('A', b'new', 'new.dcx')
@@ -63,6 +81,19 @@ class ModTests(unittest.TestCase):
         self.assertEqual(mods.build_overlay(self.game, self.root / 'out', []), self.game)
         self.assertFalse((self.root / 'out').exists())
 
+    def test_a_new_start_removes_overlays_left_by_earlier_ones(self):
+        a = self.mod('A')
+        out = self.root / 'out'
+        first = mods.build_overlay(self.game, out, [('A', a)])
+        second = mods.build_overlay(self.game, out, [('A', a)])
+        self.assertFalse(first.exists())
+        self.assertEqual([p.name for p in out.iterdir()], [second.name])
+        mods.build_overlay(self.game, out, [])  # mods switched off sweeps too
+        self.assertEqual(list(out.iterdir()), [])
+        # Only links went: the game and the mod keep their files.
+        self.assertEqual((self.assets / 'a.dcx').read_bytes(), b'original')
+        self.assertEqual((a / 'dvdroot_ps4/chr/a.dcx').read_bytes(), b'mod')
+
     def test_directory_conflict_does_not_modify_base(self):
         a = self.mod('A')
         (a / 'dvdroot_ps4/chr/a.dcx').unlink()
@@ -74,11 +105,15 @@ class ModTests(unittest.TestCase):
         self.assertEqual((self.assets / 'b.dcx').read_bytes(), b'untouched')
         self.assertEqual(list((self.root / 'out').iterdir()), [])
 
-    def test_mod_symlinks_rejected(self):
+    def test_mod_symlinks_skipped_not_followed(self):
         a = self.mod('A')
-        (a / 'dvdroot_ps4/escape').symlink_to(self.assets, target_is_directory=True)
-        with self.assertRaises(ValueError):
-            mods.build_overlay(self.game, self.root / 'out', [('A', a)])
+        try:
+            (a / 'dvdroot_ps4/escape').symlink_to(self.assets, target_is_directory=True)
+        except OSError:
+            self.skipTest('symbolic links need administrator rights or developer mode here')
+        result = mods.build_overlay(self.game, self.root / 'out', [('A', a)])
+        self.assertFalse((result / 'dvdroot_ps4/escape').exists())
+        self.assertEqual((result / 'dvdroot_ps4/chr/a.dcx').read_bytes(), b'mod')
 
     def test_executable_replacement_rejected(self):
         a = self.mod('A')
@@ -114,14 +149,16 @@ class ModTests(unittest.TestCase):
 
     def test_wrapped_and_bare_layouts(self):
         layouts = {'Title': 'CUSA03173/dvdroot_ps4/chr', 'Archive': 'Archive v1.2/dvdroot_ps4/chr',
-                   'Bare': 'chr', 'Nested': 'Nested/app0/dvdroot_ps4/chr'}
+                   'Bare': 'chr', 'Nested': 'Nested/app0/dvdroot_ps4/chr',
+                   'Us': 'CUSA03179/dvdroot_ps4/chr'}
         for name, path in layouts.items():
             folder = self.moddir / name / path
             folder.mkdir(parents=True)
             (folder / 'a.dcx').write_bytes(name.encode())
         (self.moddir / 'Archive/readme.txt').write_text('notes')
+        (self.moddir / 'Us/screenshots').mkdir()  # beside the serial folder: not one wrapper
         (self.moddir / 'Junk/stuff').mkdir(parents=True)
-        self.assertEqual(mods.discover(self.moddir), ['Archive', 'Bare', 'Nested', 'Title'])
+        self.assertEqual(mods.discover(self.moddir), ['Archive', 'Bare', 'Nested', 'Title', 'Us'])
         for name in layouts:
             with self.subTest(name=name):
                 result = mods.build_overlay(self.game, self.root / 'out',

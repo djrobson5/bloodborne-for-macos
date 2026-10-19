@@ -5,12 +5,16 @@
 
 #include <deque>
 
+#include <chrono>
 #include <condition_variable>
+#include <memory>
 #include <mutex>
 
 #include "core/libraries/videoout/buffer.h"
 #include "video_core/renderer_vulkan/host_passes/fsr_pass.h"
+#include "video_core/renderer_vulkan/host_passes/hdr_pass.h"
 #include "video_core/renderer_vulkan/host_passes/pp_pass.h"
+#include "video_core/renderer_vulkan/vk_hdr_native.h"
 #include "video_core/renderer_vulkan/vk_instance.h"
 #include "video_core/renderer_vulkan/vk_runtime.h"
 #include "video_core/renderer_vulkan/vk_scheduler.h"
@@ -38,7 +42,11 @@ struct Frame {
     u64 ready_tick;
     bool is_hdr{false};
     u8 id{};
-
+    /// bbport: native HDR output (vk_hdr_native.h): a gain map, exchanged in PrepareFrame for
+    /// the one made at the display buffer's display pass; `hdr_native` while it belongs to the
+    /// frame shown (else the HDR encode falls back to expand).
+    std::unique_ptr<HdrGainMap> hdr_gain;
+    bool hdr_native{false};
 };
 
 enum SchedulerType {
@@ -74,6 +82,8 @@ public:
         return swapchain.HasHDR();
     }
 
+    /// The game's own HDR request (VideoOut, every flip). bbport: off (Swapchain::HasHDR is
+    /// false), so it leaves the HDR output (hdr in bbport.ini, PresentHdr) and pp_settings alone.
     void SetHDR(bool enable) {
         if (!IsHDRSupported()) {
             return;
@@ -109,6 +119,23 @@ private:
 
     void SetExpectedGameSize(s32 width, s32 height);
 
+    /// bbport: HDR output. A swapchain-sized image of the SDR format (the frame letterboxed into
+    /// it, or the menu layer drawn into it), sampled by the HDR encode pass.
+    struct HdrTarget {
+        vk::Image image{};
+        VmaAllocation allocation{};
+        vk::ImageView view{};
+    };
+    void CreateHdrTarget(HdrTarget& target, vk::Extent2D extent, const char* name);
+    void DestroyHdrTarget(const HdrTarget& target);
+    /// The targets at the swapchain's size; the old ones go once the GPU is past them.
+    void EnsureHdrTargets(vk::Extent2D extent);
+    /// Records the frame (letterboxed), the menu and the HDR encode into the swapchain image.
+    void PresentHdr(vk::CommandBuffer cmdbuf, Frame* frame, vk::Extent2D extent);
+    /// One line when the HDR output's mode starts or changes; in native mode one when frames
+    /// stop or start having a gain map (at most every 5 s, with the switches in between).
+    void LogHdrState(bool scrgb, int mode, bool native_frame);
+
 private:
     float expected_ratio{1920.0 / 1080.0f};
     u32 expected_frame_width{1920};
@@ -120,6 +147,14 @@ private:
     HostPasses::FsrPass::Settings fsr_settings{};
     HostPasses::PostProcessingPass::Settings pp_settings{};
     HostPasses::PostProcessingPass pp_pass;
+    HostPasses::HdrOutputPass hdr_pass; ///< bbport: HDR output encode (present thread)
+    HdrTarget hdr_game{}, hdr_overlay{}; ///< bbport: HDR output's SDR composite and menu layer
+    vk::Extent2D hdr_extent{};
+    int hdr_logged_mode = -1;   ///< bbport: LogHdrState (present thread)
+    int hdr_native_state = -1;  ///< native mode: the last frame had a gain map (1) or not (0)
+    int hdr_logged_native = -1; ///< ... as last logged
+    u32 hdr_native_switches = 0;
+    std::chrono::steady_clock::time_point hdr_next_log{};
     std::mutex passes_mutex; ///< bbport: the passes are recorded on the recording threads
     AmdGpu::Liverpool* liverpool;
     Scheduler draw_scheduler;
