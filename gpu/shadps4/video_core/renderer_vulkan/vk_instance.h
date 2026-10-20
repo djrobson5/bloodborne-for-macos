@@ -441,6 +441,16 @@ public:
         return properties.limits.maxComputeSharedMemorySize;
     }
 
+    /// Returns the maximum range of a uniform buffer descriptor
+    u32 MaxUniformBufferRange() const {
+        return properties.limits.maxUniformBufferRange;
+    }
+
+    /// Returns true when uniform blocks can use the std430 layout
+    bool IsUniformBufferStandardLayoutSupported() const {
+        return vk12_features.uniformBufferStandardLayout;
+    }
+
     /// Returns the maximum sampler LOD bias.
     float MaxSamplerLodBias() const {
         return properties.limits.maxSamplerLodBias;

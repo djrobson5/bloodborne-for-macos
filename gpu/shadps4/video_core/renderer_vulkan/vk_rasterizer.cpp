@@ -3243,9 +3243,12 @@ void Rasterizer::BindBuffers(const Shader::Info& stage, const PreparedStage* pre
                              Shader::Backend::Bindings& binding,
                              Shader::PushData& push_data, u32& write_index) {
     BB_SECTION(BindBuffers);
-    const u64 alignment = instance.StorageMinAlignment();
+    const auto& profile = pipeline_cache.GetProfile();
     for (u32 buffer_index = 0; buffer_index < stage.buffers.size(); ++buffer_index) {
         const auto& desc = stage.buffers[buffer_index];
+        const bool is_uniform = desc.IsUniform(profile);
+        const u64 alignment =
+            is_uniform ? instance.UniformMinAlignment() : instance.StorageMinAlignment();
         const RingBinding* ring = num_ring_stages ? FindRingBinding(stage, buffer_index) : nullptr;
         if (ring) {
             // Copied by the GPU command thread into the constant ring (read-only).
@@ -3369,7 +3372,8 @@ void Rasterizer::BindBuffers(const Shader::Info& stage, const PreparedStage* pre
         set_write.dstBinding = binding.unified++;
         set_write.dstArrayElement = 0;
         set_write.descriptorCount = 1;
-        set_write.descriptorType = vk::DescriptorType::eStorageBuffer;
+        set_write.descriptorType =
+            is_uniform ? vk::DescriptorType::eUniformBuffer : vk::DescriptorType::eStorageBuffer;
         set_write.pBufferInfo = &buffer_infos.back();
         ++binding.buffer;
     }

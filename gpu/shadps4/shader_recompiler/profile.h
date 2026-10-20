@@ -14,6 +14,9 @@ struct Profile {
     u32 supported_spirv{0x00010000};
     u32 subgroup_size{};
     u32 sparse_page_shift{};
+    /// bbport: size of the uniform block that read-only guest buffers are declared as; 0 keeps
+    /// them storage buffers (BufferResource::IsUniform).
+    u32 max_ubo_size{};
     bool support_int8{};
     bool support_int16{};
     bool support_int64{};

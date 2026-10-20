@@ -1,6 +1,7 @@
 // SPDX-FileCopyrightText: Copyright 2024-2026 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <cstdlib>
@@ -146,7 +147,7 @@ using Shader::SwStage;
 constexpr static auto SpirvVersion1_6 = 0x00010600U;
 
 constexpr static std::array DescriptorHeapSizes = {
-    vk::DescriptorPoolSize{vk::DescriptorType::eUniformBuffer, 512},
+    vk::DescriptorPoolSize{vk::DescriptorType::eUniformBuffer, 8192},
     vk::DescriptorPoolSize{vk::DescriptorType::eStorageBuffer, 8192},
     vk::DescriptorPoolSize{vk::DescriptorType::eSampledImage, 8192},
     vk::DescriptorPoolSize{vk::DescriptorType::eStorageImage, 1024},
@@ -398,6 +399,22 @@ PipelineCache::PipelineCache(const Instance& instance_, Scheduler& scheduler_,
         .supported_spirv = SpirvVersion1_6,
         .subgroup_size = instance.SubgroupSize(),
         .sparse_page_shift = sparse_page_shift,
+        // bbport: on MoltenVK read-only guest buffers are uniform buffers, which Metal reads
+        // through the constant address space (~8% faster in the G-buffer passes than device
+        // reads through the buffer L1). BB_UNIFORM_BUFFERS=0/1 overrides.
+        .max_ubo_size = [&]() -> u32 {
+            bool enable = instance.GetDriverID() == vk::DriverId::eMoltenvk;
+            if (const char* env = std::getenv("BB_UNIFORM_BUFFERS")) {
+                enable = env[0] == '1';
+            }
+            // Binding offsets below the uniform alignment go through PushData::AddOffset,
+            // which holds offsets below 256.
+            if (!enable || instance.UniformMinAlignment() > 256 ||
+                !instance.IsUniformBufferStandardLayoutSupported()) {
+                return 0;
+            }
+            return std::min(instance.MaxUniformBufferRange(), 1U << 30);
+        }(),
         .support_int8 = instance.IsShaderInt8Supported(),
         .support_int16 = instance.IsShaderInt16Supported(),
         .support_int64 = instance.IsShaderInt64Supported(),

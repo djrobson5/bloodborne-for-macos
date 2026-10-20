@@ -5,6 +5,7 @@
 
 #include "common/types.h"
 #include "shader_recompiler/ir/type.h"
+#include "shader_recompiler/profile.h"
 #include "video_core/amdgpu/resource.h"
 
 #include <boost/container/static_vector.hpp>
@@ -86,6 +87,17 @@ struct BufferResource {
 
     bool IsSpecial() const noexcept {
         return buffer_type != BufferType::Guest;
+    }
+
+    /// bbport: read-only buffers of 32-bit elements are bound as uniform buffers when the
+    /// profile allows it (MoltenVK, where Metal reads them through the constant address space
+    /// instead of the buffer L1).
+    bool IsUniform(const Profile& profile) const noexcept {
+        const bool readable_type = buffer_type == BufferType::Guest ||
+                                   buffer_type == BufferType::Flatbuf ||
+                                   buffer_type == BufferType::ClipPlanes;
+        return profile.max_ubo_size != 0 && !is_written && readable_type &&
+               False(used_types & (IR::Type::U8 | IR::Type::U16 | IR::Type::U64));
     }
 
     constexpr AmdGpu::Buffer GetSharp(const auto& info) const noexcept {
