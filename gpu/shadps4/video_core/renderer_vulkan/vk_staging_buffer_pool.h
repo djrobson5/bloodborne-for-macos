@@ -73,6 +73,11 @@ private:
                                      VideoCore::MemoryType type);
     StagingBufferRef RequestLarge(u64 size, VideoCore::MemoryType type, bool deferred);
 
+    /// Frees a trimmed buffer: now, or on macOS at the next DestroyReleased.
+    void Release(std::unique_ptr<VideoCore::StreamBuffer> buffer);
+    void Release(std::unique_ptr<VideoCore::Buffer> buffer);
+    /// Waits for every submission so far and destroys the released buffers.
+    void DestroyReleased();
     void TrimRing(Ring& ring);
     void TrimLarge(std::vector<LargeBuffer>& cache);
 
@@ -85,6 +90,8 @@ private:
     u64 keep_blocks = 0; ///< bbport: ring blocks never trimmed
     std::array<std::vector<LargeBuffer>, NUM_TYPES> large_caches;
     u64 frame = 0;
+    std::vector<std::unique_ptr<VideoCore::StreamBuffer>> released_blocks;
+    std::vector<std::unique_ptr<VideoCore::Buffer>> released_large;
 };
 
 } // namespace Vulkan

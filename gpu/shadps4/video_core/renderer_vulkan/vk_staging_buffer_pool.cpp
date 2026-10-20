@@ -4,6 +4,7 @@
 #include "bbport_toggles.h"
 #include <algorithm>
 #include <bit>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 
@@ -30,6 +31,15 @@ constexpr u64 LARGE_IDLE_FRAMES = 3000;
 constexpr u64 PREWARM_BLOCKS = 8;
 constexpr u64 LARGE_MIN_GRANULARITY = 64_KB;
 constexpr u64 BLOCK_SIZE = 16_MB;
+
+// bbport BB_STAGING_LOG=1 (diagnostics): prints each staging buffer the pool frees.
+bool LogTrims() {
+    static const bool enabled = [] {
+        const char* env = std::getenv("BB_STAGING_LOG");
+        return env && env[0] == '1';
+    }();
+    return enabled;
+}
 
 u64 RoundAllocationSize(u64 size) {
     const u64 step = std::max(std::bit_floor(size) / 4, LARGE_MIN_GRANULARITY);
@@ -161,13 +171,50 @@ void StagingBufferPool::FreeDeferred(const StagingBufferRef& ref) {
 
 void StagingBufferPool::TickFrame() {
     ++frame;
+    // bbport BB_STAGING_TRIM=0 (diagnostics): idle staging memory is never freed.
+    static const bool trim = [] {
+        const char* env = std::getenv("BB_STAGING_TRIM");
+        return !env || env[0] != '0';
+    }();
+    if (!trim) {
+        PublishStats();
+        return;
+    }
     for (Ring& ring : rings) {
         TrimRing(ring);
     }
     for (auto& cache : large_caches) {
         TrimLarge(cache);
     }
+    DestroyReleased();
     PublishStats();
+}
+
+// bbport macOS: the pool's buffers have device addresses, and MoltenVK makes every live one
+// resident (useResource) in each command buffer that binds a pipeline using
+// PhysicalStorageBufferAddresses, which guest shaders do (KhronosGroup/MoltenVK#2876). A buffer
+// destroyed while any such submission is still executing loses the device ("Invalid Resource"),
+// even one the GPU never used. Trimmed buffers are destroyed together after every earlier
+// submission completed; later submissions no longer reference them.
+void StagingBufferPool::Release(std::unique_ptr<VideoCore::StreamBuffer> buffer) {
+#ifdef __APPLE__
+    released_blocks.push_back(std::move(buffer));
+#endif
+}
+
+void StagingBufferPool::Release(std::unique_ptr<VideoCore::Buffer> buffer) {
+#ifdef __APPLE__
+    released_large.push_back(std::move(buffer));
+#endif
+}
+
+void StagingBufferPool::DestroyReleased() {
+    if (released_blocks.empty() && released_large.empty()) {
+        return;
+    }
+    scheduler.Wait(scheduler.CurrentTick() - 1);
+    released_blocks.clear();
+    released_large.clear();
 }
 
 void StagingBufferPool::TrimRing(Ring& ring) {
@@ -178,6 +225,12 @@ void StagingBufferPool::TrimRing(Ring& ring) {
             !scheduler.IsFree(block.buffer->LastTick())) {
             continue;
         }
+        if (LogTrims()) {
+            std::fprintf(stderr, "Staging: frame %llu trims ring block %zu/%zu type %u buffer %p\n",
+                         (unsigned long long)frame, i, blocks.size(), u32(block.buffer->mem_type),
+                         (void*)VkBuffer(block.buffer->Handle()));
+        }
+        Release(std::move(blocks[i].buffer));
         blocks.erase(blocks.begin() + i);
         if (i < ring.current) {
             --ring.current;
@@ -191,9 +244,23 @@ void StagingBufferPool::TrimRing(Ring& ring) {
 }
 
 void StagingBufferPool::TrimLarge(std::vector<LargeBuffer>& cache) {
-    std::erase_if(cache, [this](const LargeBuffer& entry) {
-        return !entry.held && frame - entry.last_used_frame >= LARGE_IDLE_FRAMES &&
-               scheduler.IsFree(entry.tick);
+    std::erase_if(cache, [this](LargeBuffer& entry) {
+        const bool trim = !entry.held && frame - entry.last_used_frame >= LARGE_IDLE_FRAMES &&
+                          scheduler.IsFree(entry.tick);
+        if (trim && LogTrims()) {
+            std::fprintf(stderr,
+                         "Staging: frame %llu trims large buffer %llu KiB type %u buffer %p "
+                         "(last used frame %llu, tick %llu)\n",
+                         (unsigned long long)frame,
+                         (unsigned long long)(entry.buffer->SizeBytes() >> 10),
+                         u32(entry.buffer->mem_type), (void*)VkBuffer(entry.buffer->Handle()),
+                         (unsigned long long)entry.last_used_frame,
+                         (unsigned long long)entry.tick);
+        }
+        if (trim) {
+            Release(std::move(entry.buffer));
+        }
+        return trim;
     });
 }
 
