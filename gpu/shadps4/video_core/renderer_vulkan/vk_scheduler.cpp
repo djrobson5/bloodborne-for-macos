@@ -264,10 +264,65 @@ void Scheduler::BeginRendering(const RenderState& new_state) {
     });
 }
 
+// bbport BB_PASS_BREAKS=1: what ends render passes, every 5 s: the callers' return addresses
+// (atos -o out/bb-probe -l <base> <addresses>), most frequent first. A tile-based GPU (Apple)
+// loads and stores every attachment again for each pass.
+static void NotePassBreak() {
+#ifndef _WIN32
+    static const bool enabled = [] {
+        const char* env = std::getenv("BB_PASS_BREAKS");
+        return env && env[0] == '1';
+    }();
+    if (!enabled) {
+        return;
+    }
+    struct Site {
+        void* frames[4];
+        u64 count;
+    };
+    static std::mutex mutex;
+    static std::unordered_map<uintptr_t, Site> sites;
+    static auto last = std::chrono::steady_clock::now();
+    void* frames[6]{};
+    const int depth = backtrace(frames, 6);
+    uintptr_t key = 0;
+    for (int i = 2; i < depth; ++i) {
+        key = key * 31 + reinterpret_cast<uintptr_t>(frames[i]);
+    }
+    std::lock_guard lock{mutex};
+    auto& site = sites[key];
+    if (site.count++ == 0) {
+        for (int i = 0; i < 4; ++i) {
+            site.frames[i] = i + 2 < depth ? frames[i + 2] : nullptr;
+        }
+    }
+    const auto now = std::chrono::steady_clock::now();
+    if (now - last < std::chrono::seconds(5)) {
+        return;
+    }
+    last = now;
+    std::vector<const Site*> order;
+    for (const auto& [_, s] : sites) {
+        order.push_back(&s);
+    }
+    std::ranges::sort(order, [](const Site* a, const Site* b) { return a->count > b->count; });
+    Dl_info info{};
+    dladdr(reinterpret_cast<void*>(&NotePassBreak), &info);
+    std::printf("Pass breaks (5 s, base %p):\n", info.dli_fbase);
+    for (size_t i = 0; i < std::min<size_t>(order.size(), 12); ++i) {
+        std::printf("  %6llu  %p %p %p %p\n", (unsigned long long)order[i]->count,
+                    order[i]->frames[0], order[i]->frames[1], order[i]->frames[2],
+                    order[i]->frames[3]);
+    }
+    sites.clear();
+#endif
+}
+
 void Scheduler::EndRendering() {
     if (!is_rendering) {
         return;
     }
+    NotePassBreak();
     is_rendering = false;
     Record([](vk::CommandBuffer cmdbuf) { cmdbuf.endRendering(); });
 }

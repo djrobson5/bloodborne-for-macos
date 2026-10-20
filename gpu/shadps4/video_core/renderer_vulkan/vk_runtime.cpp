@@ -2,7 +2,11 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <boost/container/small_vector.hpp>
+#include <chrono>
 #include <cstdlib>
+#include <map>
+#include <mutex>
+#include <string>
 #include "bbport_toggles.h"
 #include "video_core/buffer_cache/buffer.h"
 #include "video_core/renderer_vulkan/liverpool_to_vk.h"
@@ -852,6 +856,49 @@ void Runtime::AccessBuffer(const VideoCore::Buffer* handle, u64 offset, u64 size
     memory_barrier.srcAccessMask |= src_access & WRITE_MASK;
 }
 
+// bbport BB_PASS_BREAKS=1: the barriers that close an open render pass, every 5 s, by image
+// layout change (old -> new, aspect) and memory barrier stages.
+static void NoteBarrierInPass(const vk::DependencyInfo& dep_info) {
+    static const bool enabled = [] {
+        const char* env = std::getenv("BB_PASS_BREAKS");
+        return env && env[0] == '1';
+    }();
+    if (!enabled) {
+        return;
+    }
+    static std::mutex mutex;
+    static std::map<std::string, u64> kinds;
+    static auto last = std::chrono::steady_clock::now();
+    std::lock_guard lock{mutex};
+    for (u32 i = 0; i < dep_info.imageMemoryBarrierCount; ++i) {
+        const auto& b = dep_info.pImageMemoryBarriers[i];
+        ++kinds[fmt::format("image {} -> {} ({})", vk::to_string(b.oldLayout),
+                            vk::to_string(b.newLayout),
+                            vk::to_string(b.subresourceRange.aspectMask))];
+    }
+    if (dep_info.memoryBarrierCount) {
+        const auto& m = dep_info.pMemoryBarriers[0];
+        ++kinds[fmt::format("memory {} -> {}", vk::to_string(m.srcStageMask),
+                            vk::to_string(m.dstStageMask))];
+    }
+    const auto now = std::chrono::steady_clock::now();
+    if (now - last < std::chrono::seconds(5)) {
+        return;
+    }
+    last = now;
+    std::vector<std::pair<u64, std::string>> order;
+    for (const auto& [kind, count] : kinds) {
+        order.emplace_back(count, kind);
+    }
+    std::ranges::sort(order, std::greater{});
+    std::printf("Barriers closing render passes (5 s):\n");
+    for (size_t i = 0; i < std::min<size_t>(order.size(), 12); ++i) {
+        std::printf("  %6llu  %s\n", (unsigned long long)order[i].first,
+                    order[i].second.substr(0, 220).c_str());
+    }
+    kinds.clear();
+}
+
 void Runtime::FlushBarriers() {
     BeforeImageAccess();
     vk::DependencyInfo dep_info{};
@@ -869,6 +916,9 @@ void Runtime::FlushBarriers() {
         return;
     }
 
+    if (scheduler.IsRendering()) {
+        NoteBarrierInPass(dep_info);
+    }
     scheduler.EndRendering();
 
     // Repeated area transitions exposed a crash inside the NVIDIA driver while an image
