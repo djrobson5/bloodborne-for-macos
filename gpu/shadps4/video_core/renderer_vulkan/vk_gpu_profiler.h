@@ -62,7 +62,13 @@ private:
     void Print();
 
     static constexpr u32 NumSlices = 4;
+#ifdef __APPLE__
+    // bbport macOS: MoltenVK's timestamp pool is one MTLCounterSampleBuffer, at most 32 KiB
+    // (4096 queries); a larger one falls back to emulated timestamps.
+    static constexpr u32 SliceQueries = 1024;
+#else
     static constexpr u32 SliceQueries = 4096;
+#endif
     static inline GpuProfiler* instance_ptr = nullptr;
 
     vk::Device device;

@@ -4660,6 +4660,23 @@ RenderState Rasterizer::BeginRenderingFull(const GraphicsPipeline* pipeline) {
 
     if (state.num_layers == std::numeric_limits<u16>::max()) {
         state.num_layers = 1;
+        // bbport macOS: without attachments the render area was the largest framebuffer
+        // (32768x32768 on MoltenVK). Tile-based GPUs (Apple) walk every tile of it: ~3 ms a
+        // pass, 14 passes a frame in the first area. The draw's scissor bounds what it can touch.
+        const s16 x_offset = regs.window_scissor.window_offset_disable
+                                 ? s16(0)
+                                 : s16(regs.window_offset.window_x_offset);
+        const s16 y_offset = regs.window_scissor.window_offset_disable
+                                 ? s16(0)
+                                 : s16(regs.window_offset.window_y_offset);
+        const s16 right = std::min({s16(regs.screen_scissor.bottom_right_x),
+                                    s16(regs.window_scissor.bottom_right_x + x_offset),
+                                    s16(regs.generic_scissor.bottom_right_x + x_offset)});
+        const s16 bottom = std::min({s16(regs.screen_scissor.bottom_right_y),
+                                     s16(regs.window_scissor.bottom_right_y + y_offset),
+                                     s16(regs.generic_scissor.bottom_right_y + y_offset)});
+        state.width = std::clamp<u32>(u32(std::max<s16>(right, 1)), 1u, state.width);
+        state.height = std::clamp<u32>(u32(std::max<s16>(bottom, 1)), 1u, state.height);
     }
 
     if (reduced) {
