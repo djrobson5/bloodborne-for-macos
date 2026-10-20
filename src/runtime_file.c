@@ -191,6 +191,8 @@ static File *get(int fd) {
 }
 /* BB_AUDIO_TRACE=1: sound file opens and failed reads (missing game sounds). */
 static int audio_trace(void) { static int v=-1; if (v<0) { const char *e=getenv("BB_AUDIO_TRACE"); v=e && e[0]=='1'; } return v; }
+/* BB_FILE_TRACE=1: every open, read and seek with its result (diagnosing a game stuck loading). */
+static int file_trace(void) { static int v=-1; if (v<0) { const char *e=getenv("BB_FILE_TRACE"); v=e && e[0]=='1'; } return v; }
 /* Game mounts (including linked mod overlays) are read-only. Saves use other mounts. */
 static int game_path(const char *p) {
     if (!p || !*p) return 0;
@@ -232,6 +234,7 @@ static int64_t do_open(const char *guest,int flags,int mode) {
     ++opens;
     host_unlock(&lock);
     if (audio_trace() && strstr(guest,"sound/")) printf("Audio trace: open(%s) -> fd %d, %lld bytes\n",guest,fd,(long long)s.st_size);
+    if (file_trace()) printf("File trace: open(%s, %#x) -> fd %d, %lld bytes\n",guest,flags,fd,(long long)s.st_size);
     const char *mod_trace=getenv("BB_MOD_TRACE"), *mod_root=getenv("BB_MODS_DIR");
     if (mod_trace && mod_trace[0]=='1' && mod_root) {
         char actual[PATH_MAX],root[PATH_MAX];
@@ -318,6 +321,7 @@ static int64_t do_read(int fd,void *buffer,uint64_t size) {
     if (n<0) { int e=errno; note_read_failure(fd,size,-1,e); return -e; }
     if (n>0) runtime_memory_note_write((uintptr_t)buffer,(uint64_t)n); /* and once the data is there */
     __atomic_add_fetch(&reads,1,__ATOMIC_RELAXED); __atomic_add_fetch(&bytes_read,(uint64_t)n,__ATOMIC_RELAXED);
+    if (file_trace()) printf("File trace: %s(fd %d, %p, %llu) -> %lld\n",__func__,fd,buffer,(unsigned long long)size,(long long)n);
     return n;
 }
 static int64_t do_pread(int fd,void *buffer,uint64_t size,int64_t offset) {
@@ -330,6 +334,7 @@ static int64_t do_pread(int fd,void *buffer,uint64_t size,int64_t offset) {
     if (n<0) { int e=errno; note_read_failure(fd,size,offset,e); return -e; }
     if (n>0) runtime_memory_note_write((uintptr_t)buffer,(uint64_t)n); /* and once the data is there */
     __atomic_add_fetch(&reads,1,__ATOMIC_RELAXED); __atomic_add_fetch(&bytes_read,(uint64_t)n,__ATOMIC_RELAXED);
+    if (file_trace()) printf("File trace: %s(fd %d, %p, %llu) -> %lld\n",__func__,fd,buffer,(unsigned long long)size,(long long)n);
     return n;
 }
 static int64_t do_write(int fd,const void *buffer,uint64_t size) {

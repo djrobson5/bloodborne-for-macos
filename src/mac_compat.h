@@ -2,9 +2,10 @@
  * macOS does not. Implementations in mac_compat.c.
  *
  * Address space on Apple Silicon: [64 GiB, 448 GiB) is the kernel's GPU carveout and cannot be
- * mapped, so guest memory starts at 448 GiB (runtime_memory.c). The default malloc zone hands out
- * 0x7f... addresses, far above the 1 TiB the guest's 40-bit pointer fields can hold: the runtime's
- * allocations come from a heap of its own in [USER_MAX, 1 TiB) instead (runtime_low_malloc). */
+ * mapped. The default malloc zone hands out 0x7f... addresses, far above the 1 TiB the guest's
+ * 40-bit pointer fields can hold: the runtime's allocations come from a heap of its own at the
+ * carveout's end instead (runtime_low_malloc), below bit 39 (a 40-bit field read as signed keeps
+ * them positive), and guest memory starts after it (runtime_memory.c). */
 #ifndef BB_MAC_COMPAT_H
 #define BB_MAC_COMPAT_H
 #ifdef __APPLE__
@@ -20,9 +21,10 @@
 /* Guest-visible address ranges (runtime_memory.c reserves them at startup). */
 #define BB_MAC_LOW_MIN UINT64_C(0x0800000000)  /* host-owned guest-visible: image, stacks */
 #define BB_MAC_LOW_END UINT64_C(0x1000000000)  /* the GPU carveout starts here */
-#define BB_MAC_USER_MIN UINT64_C(0x7000000000) /* and ends here */
+#define BB_MAC_HEAP_MIN UINT64_C(0x7000000000) /* and ends here: the runtime's heap */
+#define BB_MAC_HEAP_END UINT64_C(0x7400000000)
+#define BB_MAC_USER_MIN BB_MAC_HEAP_END        /* guest memory */
 #define BB_MAC_USER_MAX UINT64_C(0xfc00000000)
-#define BB_MAC_HEAP_END UINT64_C(0x10000000000) /* 1 TiB */
 
 /* Reserves the guest-visible ranges (no access) so the host cannot place anything there. */
 int runtime_mac_reserve(void);

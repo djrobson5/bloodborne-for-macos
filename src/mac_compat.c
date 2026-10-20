@@ -29,7 +29,7 @@ static int reserved;
 int runtime_mac_reserve(void) {
     if (reserved) return 0;
     reserved=1;
-    int holes=reserve_range(BB_MAC_LOW_MIN,BB_MAC_LOW_END)+reserve_range(BB_MAC_USER_MIN,BB_MAC_HEAP_END);
+    int holes=reserve_range(BB_MAC_LOW_MIN,BB_MAC_LOW_END)+reserve_range(BB_MAC_HEAP_MIN,BB_MAC_USER_MAX);
     heap_init();
     return holes ? -1 : 0;
 }
@@ -37,11 +37,11 @@ int runtime_mac_reserve(void) {
  * 4 GiB and would otherwise grow into the guest's ranges. */
 __attribute__((constructor)) static void reserve_at_start(void) { runtime_mac_reserve(); }
 
-/* ---- Heap in [BB_MAC_USER_MAX, 1 TiB) ----
+/* ---- Heap in [BB_MAC_HEAP_MIN, BB_MAC_HEAP_END) ----
  * Power-of-two blocks with a 16-byte header in front of each pointer; freed blocks go on their
  * size class's list. Blocks are never returned to other sizes; large free ones give their pages
  * back. The runtime allocates little and mostly long-lived objects (threads, locks, handles). */
-#define HEAP_BASE BB_MAC_USER_MAX
+#define HEAP_BASE BB_MAC_HEAP_MIN
 #define HEAP_MAGIC UINT32_C(0x68776f6c)
 #define MIN_CLASS 5  /* 32-byte blocks */
 #define MAX_CLASS 32 /* 4 GiB blocks */
