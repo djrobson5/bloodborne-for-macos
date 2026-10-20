@@ -187,6 +187,87 @@ Scheduler::~Scheduler() {
 #endif
 }
 
+// bbport BB_PASS_BREAKS=1: what ends render passes, every 5 s: the callers' return addresses
+// (atos -o out/bb-probe -l <base> <addresses>), most frequent first. A tile-based GPU (Apple)
+// loads and stores every attachment again for each pass.
+struct PassBreakSite {
+    void* frames[4];
+    u64 count;
+    u64 resumes;      ///< the next pass had the same attachments
+    u64 resumes_wide; ///< of those, passes with 6 or more colour targets (the G-buffer)
+};
+static std::mutex pass_break_mutex;
+static std::unordered_map<uintptr_t, PassBreakSite> pass_break_sites;
+static uintptr_t pass_break_last;
+static auto pass_break_print = std::chrono::steady_clock::now();
+
+static bool PassBreaksEnabled() {
+    static const bool enabled = [] {
+        const char* env = std::getenv("BB_PASS_BREAKS");
+        return env && env[0] == '1';
+    }();
+    return enabled;
+}
+
+/// The pass that begins has the attachments of the one the last break ended.
+static void NotePassResume(u32 num_color_attachments) {
+#ifndef _WIN32
+    if (!PassBreaksEnabled()) {
+        return;
+    }
+    std::lock_guard lock{pass_break_mutex};
+    const auto it = pass_break_sites.find(pass_break_last);
+    if (it != pass_break_sites.end()) {
+        ++it->second.resumes;
+        it->second.resumes_wide += num_color_attachments >= 6;
+    }
+#endif
+}
+
+static void NotePassBreak() {
+#ifndef _WIN32
+    if (!PassBreaksEnabled()) {
+        return;
+    }
+    std::lock_guard lock{pass_break_mutex};
+    void* frames[6]{};
+    const int depth = backtrace(frames, 6);
+    uintptr_t key = 0;
+    for (int i = 2; i < depth; ++i) {
+        key = key * 31 + reinterpret_cast<uintptr_t>(frames[i]);
+    }
+    auto& site = pass_break_sites[key];
+    pass_break_last = key;
+    if (site.count++ == 0) {
+        for (int i = 0; i < 4; ++i) {
+            site.frames[i] = i + 2 < depth ? frames[i + 2] : nullptr;
+        }
+    }
+    const auto now = std::chrono::steady_clock::now();
+    if (now - pass_break_print < std::chrono::seconds(5)) {
+        return;
+    }
+    pass_break_print = now;
+    std::vector<const PassBreakSite*> order;
+    for (const auto& [_, s] : pass_break_sites) {
+        order.push_back(&s);
+    }
+    std::ranges::sort(order, [](const PassBreakSite* a, const PassBreakSite* b) { return a->count > b->count; });
+    Dl_info info{};
+    dladdr(reinterpret_cast<void*>(&NotePassBreak), &info);
+    std::printf("Pass breaks (5 s, base %p; resumed: the next pass had the same attachments, "
+                "6+ colour targets of those):\n",
+                info.dli_fbase);
+    for (size_t i = 0; i < std::min<size_t>(order.size(), 12); ++i) {
+        std::printf("  %6llu  resumed %6llu (%6llu)  %p %p %p %p\n",
+                    (unsigned long long)order[i]->count, (unsigned long long)order[i]->resumes,
+                    (unsigned long long)order[i]->resumes_wide, order[i]->frames[0],
+                    order[i]->frames[1], order[i]->frames[2], order[i]->frames[3]);
+    }
+    pass_break_sites.clear();
+#endif
+}
+
 void Scheduler::BeginRendering(const RenderState& new_state) {
     if (is_rendering && render_state == new_state) {
         return;
@@ -194,6 +275,9 @@ void Scheduler::BeginRendering(const RenderState& new_state) {
     // bbport: a cut of the command stream (MaybeSplit) closed this render pass; it continues
     // in the next command buffer without clearing its attachments again.
     const bool resume = resume_rendering && !is_rendering && render_state == new_state;
+    if (!is_rendering && render_state == new_state) {
+        NotePassResume(new_state.num_color_attachments);
+    }
     resume_rendering = false;
     EndRendering();
     is_rendering = true;
@@ -262,60 +346,6 @@ void Scheduler::BeginRendering(const RenderState& new_state) {
         }
         cmdbuf.beginRendering(info);
     });
-}
-
-// bbport BB_PASS_BREAKS=1: what ends render passes, every 5 s: the callers' return addresses
-// (atos -o out/bb-probe -l <base> <addresses>), most frequent first. A tile-based GPU (Apple)
-// loads and stores every attachment again for each pass.
-static void NotePassBreak() {
-#ifndef _WIN32
-    static const bool enabled = [] {
-        const char* env = std::getenv("BB_PASS_BREAKS");
-        return env && env[0] == '1';
-    }();
-    if (!enabled) {
-        return;
-    }
-    struct Site {
-        void* frames[4];
-        u64 count;
-    };
-    static std::mutex mutex;
-    static std::unordered_map<uintptr_t, Site> sites;
-    static auto last = std::chrono::steady_clock::now();
-    void* frames[6]{};
-    const int depth = backtrace(frames, 6);
-    uintptr_t key = 0;
-    for (int i = 2; i < depth; ++i) {
-        key = key * 31 + reinterpret_cast<uintptr_t>(frames[i]);
-    }
-    std::lock_guard lock{mutex};
-    auto& site = sites[key];
-    if (site.count++ == 0) {
-        for (int i = 0; i < 4; ++i) {
-            site.frames[i] = i + 2 < depth ? frames[i + 2] : nullptr;
-        }
-    }
-    const auto now = std::chrono::steady_clock::now();
-    if (now - last < std::chrono::seconds(5)) {
-        return;
-    }
-    last = now;
-    std::vector<const Site*> order;
-    for (const auto& [_, s] : sites) {
-        order.push_back(&s);
-    }
-    std::ranges::sort(order, [](const Site* a, const Site* b) { return a->count > b->count; });
-    Dl_info info{};
-    dladdr(reinterpret_cast<void*>(&NotePassBreak), &info);
-    std::printf("Pass breaks (5 s, base %p):\n", info.dli_fbase);
-    for (size_t i = 0; i < std::min<size_t>(order.size(), 12); ++i) {
-        std::printf("  %6llu  %p %p %p %p\n", (unsigned long long)order[i]->count,
-                    order[i]->frames[0], order[i]->frames[1], order[i]->frames[2],
-                    order[i]->frames[3]);
-    }
-    sites.clear();
-#endif
 }
 
 void Scheduler::EndRendering() {
