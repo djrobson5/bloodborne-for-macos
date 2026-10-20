@@ -224,6 +224,8 @@ private:
     }
 
     const Buffer* GetArena(u64 first_block, u64 last_block);
+    void MigrateDenseArena(const Buffer* first_arena, const Buffer* last_arena,
+                           const Buffer* new_arena);
 
     /// `in_place`: bind what can be in place even when Garlic (texture data, read once into an
     /// image: a VRAM copy of it would only cost an upload).

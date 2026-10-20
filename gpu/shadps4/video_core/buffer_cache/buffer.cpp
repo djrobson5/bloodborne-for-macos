@@ -84,6 +84,10 @@ void UniqueBuffer::Destroy() {
 void UniqueBuffer::Create(vk::BufferCreateInfo& buffer_ci, MemoryType mem_type,
                           VmaAllocationInfo* out_alloc_info) {
     const bool with_bda = bool(buffer_ci.usage & vk::BufferUsageFlagBits::eShaderDeviceAddress);
+    // bbport macOS: no sparse buffers; the arena gets its own VRAM (Metal commits it on first use).
+    if (mem_type == MemoryType::Sparse && DenseArenas()) {
+        mem_type = MemoryType::DeviceLocal;
+    }
     if (mem_type != MemoryType::Sparse) {
         const VmaAllocationCreateFlags bda_flag =
             with_bda ? VMA_ALLOCATION_CREATE_DEDICATED_MEMORY_BIT : 0;

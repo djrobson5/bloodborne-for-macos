@@ -43,6 +43,15 @@ inline bool GuestInPlace() {
 }
 /// The driver cannot bind guest memory to the arena: BB_GUEST_IN_PLACE stays off from now on.
 void DisableGuestInPlace();
+
+namespace Detail {
+inline bool dense_arenas = false; ///< set once by BufferCache, before the first arena
+} // namespace Detail
+/// bbport macOS: the device has no sparse buffers (MoltenVK). An arena is an ordinary buffer with
+/// all of its memory, every block resident from the start (BufferCache::EnsureResident).
+inline bool DenseArenas() {
+    return Detail::dense_arenas;
+}
 /// Whether CPU writes to GPU memory are caught by page protection. Off with BB_GUEST_IN_PLACE: the
 /// GPU side learns of writes from the writers (file reads, the game's resource loaders, its own
 /// DMA and command writes); BB_WRITE_TRACKING=1 brings the protection back.
