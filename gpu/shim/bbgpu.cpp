@@ -14,6 +14,7 @@
 #include <algorithm>
 #include <atomic>
 #include <condition_variable>
+#include <functional>
 #include <fstream>
 #include <iterator>
 #include <boost/asio/io_context.hpp>
@@ -321,6 +322,22 @@ static void StartProfileWriter() {
 }
 #endif
 
+#ifdef __APPLE__
+static std::mutex g_main_job_mutex;
+static std::condition_variable g_main_job_cv;
+static std::function<void()> g_main_job;
+
+extern "C" void bbgpu_main_thread_loop(void) {
+    std::function<void()> job;
+    {
+        std::unique_lock lock{g_main_job_mutex};
+        g_main_job_cv.wait(lock, [] { return bool(g_main_job); });
+        job = std::move(g_main_job);
+    }
+    job(); // the window's event loop: ends the process when the window closes
+}
+#endif
+
 extern "C" int bbgpu_init(const BbGpuConfig* config) {
     BbSettings::Load();
     // The fault handlers are registered before any guest thread runs: the registry is a std::set
@@ -339,7 +356,7 @@ extern "C" int bbgpu_init(const BbGpuConfig* config) {
     Core::Emulator::FillElfInfo(*config);
     const std::string title = config->title ? config->title : "Bloodborne";
     const s32 width = config->width, height = config->height;
-    g_window_thread = std::thread([title, width, height] {
+    auto window_loop = [title, width, height] {
         Common::SetCurrentThreadName("bb:window");
         auto* window = new Frontend::WindowSDL(width, height, title.c_str());
         {
@@ -371,8 +388,19 @@ extern "C" int bbgpu_init(const BbGpuConfig* config) {
         }
         std::fflush(stdout);
         std::_Exit(0);
-    });
+    };
+#ifdef __APPLE__
+    // Cocoa windows and their events belong to the process's main thread: it waits in
+    // bbgpu_main_thread_loop (probe.c runs the game on a thread of its own there).
+    {
+        std::scoped_lock lock{g_main_job_mutex};
+        g_main_job = window_loop;
+    }
+    g_main_job_cv.notify_all();
+#else
+    g_window_thread = std::thread(window_loop);
     g_window_thread.detach();
+#endif
     {
         std::unique_lock lock{g_window_mutex};
         g_window_cv.wait(lock, [] { return g_window_ready; });

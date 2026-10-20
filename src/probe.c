@@ -927,6 +927,31 @@ int main(int argc, char **argv) {
 }
 #define main loader_main
 #endif
+#ifdef __APPLE__
+/* Cocoa windows belong to the process's main thread, which the window's event loop keeps
+ * (bbgpu_main_thread_loop); the loader, and the game's main thread after it, run on a thread of
+ * their own, as on Windows. */
+static int loader_main(int argc, char **argv);
+static int main_argc;
+static char **main_argv;
+static void *loader_thread(void *unused) {
+    (void)unused;
+    pthread_setname_np("main"); /* the game's main loop (BB_SAMPLE_THREADS=main) */
+    exit(loader_main(main_argc, main_argv));
+}
+int main(int argc, char **argv) {
+    main_argc = argc; main_argv = argv;
+    pthread_attr_t attr;
+    pthread_attr_init(&attr);
+    pthread_attr_setstacksize(&attr, (size_t)64 << 20);
+    pthread_t thread;
+    if (pthread_create(&thread, &attr, loader_thread, NULL)) fail("cannot start the loader thread");
+    pthread_attr_destroy(&attr);
+    bbgpu_main_thread_loop(); /* returns only by ending the process */
+    return 0;
+}
+#define main loader_main
+#endif
 
 int main(int argc, char **argv) {
     setvbuf(stdout, NULL, _IONBF, 0);

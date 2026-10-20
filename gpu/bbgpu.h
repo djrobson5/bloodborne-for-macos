@@ -19,6 +19,11 @@ void bbgpu_register_kernel(void);
 /* Start networking after game metadata, guest TLS and linked modules are ready. */
 void bbgpu_start_online(void);
 /* Creates window, Vulkan device, presenter and GPU command processor. */
+#ifdef __APPLE__
+/* The process's main thread runs the window's event loop here (Cocoa allows no other); it waits
+ * until bbgpu_init, called on the loader's thread, has a window to create. */
+void bbgpu_main_thread_loop(void);
+#endif
 int bbgpu_init(const BbGpuConfig *config);
 /* Function for an imported NID ("NID#lib#mod"), or 0 when the GPU library does not provide it. */
 uintptr_t bbgpu_resolve(const char *scoped_nid);

@@ -271,12 +271,23 @@ bool Instance::CreateDevice() {
                "Required Vulkan extension unavailable: {}", VK_EXT_ROBUSTNESS_2_EXTENSION_NAME);
 
     const auto robustness2_features = feature_chain.get<vk::PhysicalDeviceRobustness2FeaturesEXT>();
+#ifdef __APPLE__
+    // bbport: MoltenVK offers robustness2 with only some of its features. The missing ones are
+    // left off (out-of-bounds accesses are then the driver's own behaviour) instead of stopping.
+    LOG_WARNING(Render_Vulkan, "robustness2 on this device: robustBufferAccess2={} robustImageAccess2={} nullDescriptor={}",
+                bool(robustness2_features.robustBufferAccess2), bool(robustness2_features.robustImageAccess2),
+                bool(robustness2_features.nullDescriptor));
+    std::printf("GPU: robustness2 robustBufferAccess2=%d robustImageAccess2=%d nullDescriptor=%d robustBufferAccess=%d\n",
+                int(robustness2_features.robustBufferAccess2), int(robustness2_features.robustImageAccess2),
+                int(robustness2_features.nullDescriptor), int(features.robustBufferAccess));
+#else
     ASSERT_MSG(robustness2_features.robustBufferAccess2,
                "Required Vulkan feature unavailable: robustBufferAccess2");
     ASSERT_MSG(robustness2_features.robustImageAccess2,
                "Required Vulkan feature unavailable: robustImageAccess2");
     ASSERT_MSG(robustness2_features.nullDescriptor,
                "Required Vulkan feature unavailable: nullDescriptor");
+#endif
 
     // Optional
 #ifdef __APPLE__
@@ -593,9 +604,9 @@ bool Instance::CreateDevice() {
             .depthClipEnable = true,
         },
         vk::PhysicalDeviceRobustness2FeaturesEXT{
-            .robustBufferAccess2 = true,
-            .robustImageAccess2 = true,
-            .nullDescriptor = true,
+            .robustBufferAccess2 = robustness2_features.robustBufferAccess2,
+            .robustImageAccess2 = robustness2_features.robustImageAccess2,
+            .nullDescriptor = robustness2_features.nullDescriptor,
         },
         vk::PhysicalDeviceVertexInputDynamicStateFeaturesEXT{
             .vertexInputDynamicState = true,

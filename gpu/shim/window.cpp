@@ -115,6 +115,12 @@ WindowSDL::WindowSDL(s32 width_, s32 height_, const char* title) : width{width_}
         window_info.type = WindowSystemType::X11;
         window_info.display_connection = SDL_GetPointerProperty(wp, SDL_PROP_WINDOW_X11_DISPLAY_POINTER, nullptr);
         window_info.render_surface = reinterpret_cast<void*>(SDL_GetNumberProperty(wp, SDL_PROP_WINDOW_X11_WINDOW_NUMBER, 0));
+#ifdef __APPLE__
+    } else if (driver && !std::strcmp(driver, "cocoa")) {
+        // macOS: the Vulkan surface (MoltenVK) draws into the CAMetalLayer of an SDL Metal view.
+        window_info.type = WindowSystemType::Metal;
+        window_info.render_surface = SDL_Metal_GetLayer(SDL_Metal_CreateView(window));
+#endif
     } else if (driver && !std::strcmp(driver, "wayland")) {
         window_info.type = WindowSystemType::Wayland;
         window_info.display_connection = SDL_GetPointerProperty(wp, SDL_PROP_WINDOW_WAYLAND_DISPLAY_POINTER, nullptr);
