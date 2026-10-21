@@ -1,6 +1,7 @@
 // SPDX-FileCopyrightText: Copyright 2024 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <array>
 #include <cstdio>
 #include <boost/container/static_vector.hpp>
 #include <fmt/format.h>
@@ -19,6 +20,10 @@
 #include "video_core/renderer_vulkan/vk_platform.h"
 
 #include <vk_mem_alloc.h>
+#ifdef __APPLE__
+#include <vulkan/vulkan_metal.h>
+#include "video_core/renderer_vulkan/vk_metal_heap.h"
+#endif
 
 namespace Vulkan {
 
@@ -293,6 +298,10 @@ bool Instance::CreateDevice() {
 #ifdef __APPLE__
     // Required whenever the device offers it (MoltenVK).
     add_extension(VK_KHR_PORTABILITY_SUBSET_EXTENSION_NAME);
+    // bbport: device memory from untracked Metal heaps (CreateAllocator, vk_metal_heap.h).
+    metal_heaps = vk12_props.driverID == vk::DriverId::eMoltenvk &&
+                  add_extension(VK_EXT_METAL_OBJECTS_EXTENSION_NAME) &&
+                  add_extension(VK_EXT_EXTERNAL_MEMORY_METAL_EXTENSION_NAME);
 #endif
     maintenance_5 = add_extension(VK_KHR_MAINTENANCE_5_EXTENSION_NAME);
     maintenance_8 = add_extension(VK_KHR_MAINTENANCE_8_EXTENSION_NAME);
@@ -823,11 +832,94 @@ void VmaDeviceUsage(u64& block_bytes, u64& allocation_bytes) {
     }
 }
 
+#ifdef __APPLE__
+namespace {
+// bbport macOS (BB_UNTRACKED_HEAPS=0 turns it off): VMA's device memory comes from untracked
+// Metal heaps (vk_metal_heap.h), imported through VK_EXT_external_memory_metal.
+PFN_vkAllocateMemory driver_allocate_memory;
+void* metal_device;
+std::array<VkMemoryPropertyFlags, VK_MAX_MEMORY_TYPES> memory_type_flags;
+
+VKAPI_ATTR VkResult VKAPI_CALL AllocateFromUntrackedHeap(VkDevice device,
+                                                         const VkMemoryAllocateInfo* info,
+                                                         const VkAllocationCallbacks* callbacks,
+                                                         VkDeviceMemory* memory) {
+    const VkMemoryPropertyFlags flags = memory_type_flags[info->memoryTypeIndex];
+    // Lazily allocated memory is memoryless (no heap). MoltenVK gives a dedicated image its own
+    // texture instead of a heap. Anything else in the chain (imports, exports) is left alone.
+    bool own_heap = !(flags & VK_MEMORY_PROPERTY_LAZILY_ALLOCATED_BIT);
+    for (auto* next = static_cast<const VkBaseInStructure*>(info->pNext); next;
+         next = next->pNext) {
+        if (next->sType == VK_STRUCTURE_TYPE_MEMORY_DEDICATED_ALLOCATE_INFO) {
+            own_heap &= reinterpret_cast<const VkMemoryDedicatedAllocateInfo*>(next)->image ==
+                        VK_NULL_HANDLE;
+        } else if (next->sType != VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_FLAGS_INFO) {
+            own_heap = false;
+        }
+    }
+    void* heap = own_heap ? MetalHeap::CreateUntracked(metal_device, info->allocationSize,
+                                                       flags & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT)
+                          : nullptr;
+    if (!heap) {
+        return driver_allocate_memory(device, info, callbacks, memory);
+    }
+    static const bool reported = [heap] {
+        std::printf("GPU memory: untracked Metal heaps (BB_UNTRACKED_HEAPS=0 turns them off), "
+                    "buffers in them untracked: %s\n",
+                    MetalHeap::PlacesUntracked(heap) ? "yes" : "NO");
+        return true;
+    }();
+    (void)reported;
+    const VkImportMemoryMetalHandleInfoEXT import = {
+        .sType = VK_STRUCTURE_TYPE_IMPORT_MEMORY_METAL_HANDLE_INFO_EXT,
+        .pNext = info->pNext,
+        .handleType = VK_EXTERNAL_MEMORY_HANDLE_TYPE_MTLHEAP_BIT_EXT,
+        .handle = heap,
+    };
+    VkMemoryAllocateInfo heap_info = *info;
+    heap_info.pNext = &import;
+    VkResult result = driver_allocate_memory(device, &heap_info, callbacks, memory);
+    MetalHeap::Release(heap); // MoltenVK holds its own reference
+    if (result != VK_SUCCESS) {
+        result = driver_allocate_memory(device, info, callbacks, memory);
+    }
+    return result;
+}
+} // namespace
+#endif
+
 void Instance::CreateAllocator() {
-    const VmaVulkanFunctions functions = {
+    VmaVulkanFunctions functions = {
         .vkGetInstanceProcAddr = VULKAN_HPP_DEFAULT_DISPATCHER.vkGetInstanceProcAddr,
         .vkGetDeviceProcAddr = VULKAN_HPP_DEFAULT_DISPATCHER.vkGetDeviceProcAddr,
     };
+#ifdef __APPLE__
+    const char* untracked_heaps = std::getenv("BB_UNTRACKED_HEAPS");
+    if (metal_heaps && !(untracked_heaps && untracked_heaps[0] == '0')) {
+        VkExportMetalDeviceInfoEXT device_info = {
+            .sType = VK_STRUCTURE_TYPE_EXPORT_METAL_DEVICE_INFO_EXT,
+        };
+        VkExportMetalObjectsInfoEXT objects = {
+            .sType = VK_STRUCTURE_TYPE_EXPORT_METAL_OBJECTS_INFO_EXT,
+            .pNext = &device_info,
+        };
+        const auto export_objects = reinterpret_cast<PFN_vkExportMetalObjectsEXT>(
+            VULKAN_HPP_DEFAULT_DISPATCHER.vkGetDeviceProcAddr(*device, "vkExportMetalObjectsEXT"));
+        if (export_objects) {
+            export_objects(*device, &objects);
+        }
+        if (device_info.mtlDevice) {
+            metal_device = device_info.mtlDevice;
+            driver_allocate_memory = VULKAN_HPP_DEFAULT_DISPATCHER.vkAllocateMemory;
+            const auto props = physical_device.getMemoryProperties();
+            for (u32 i = 0; i < props.memoryTypeCount; ++i) {
+                memory_type_flags[i] =
+                    static_cast<VkMemoryPropertyFlags>(props.memoryTypes[i].propertyFlags);
+            }
+            functions.vkAllocateMemory = AllocateFromUntrackedHeap;
+        }
+    }
+#endif
     // bbport: new device memory per frame (BB_FRAME_LOG alloc_mb).
     static const VmaDeviceMemoryCallbacks memory_callbacks = {
         .pfnAllocate = [](VmaAllocator, uint32_t, VkDeviceMemory, VkDeviceSize size, void*) {

@@ -616,6 +616,7 @@ private:
     vk::Queue graphics_queue;
     vk::Queue readback_queue;
     bool guest_memory_export{};
+    bool metal_heaps{}; // bbport macOS: untracked Metal heaps for device memory (CreateAllocator)
     u32 readback_family_index = NoFamily;
     std::vector<vk::PhysicalDevice> physical_devices;
     std::vector<std::string> available_extensions;

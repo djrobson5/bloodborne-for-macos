@@ -2,6 +2,10 @@
 # drivers, adapted to the native_probe runtime through shims in shim/.
 cmake_minimum_required(VERSION 3.24)
 project(bbgpu LANGUAGES C CXX)
+if (APPLE)
+    # vk_metal_heap.mm: Metal calls for the untracked device memory heaps.
+    enable_language(OBJCXX)
+endif()
 set(CMAKE_CXX_STANDARD 23)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_POSITION_INDEPENDENT_CODE ON)
@@ -256,6 +260,10 @@ target_link_libraries(bbgpu PUBLIC Vulkan::Headers fmt::fmt Boost::headers magic
     tsl::robin_map GPUOpen::VulkanMemoryAllocator PkgConfig::XXHASH PkgConfig::SDL3 PkgConfig::FFMPEG miniz::miniz Zydis::Zydis sirit)
 if (APPLE)
     target_link_libraries(bbgpu PUBLIC xbyak::xbyak)
+    target_sources(bbgpu PRIVATE shadps4/video_core/renderer_vulkan/vk_metal_heap.mm)
+    set_source_files_properties(shadps4/video_core/renderer_vulkan/vk_metal_heap.mm PROPERTIES
+        COMPILE_OPTIONS "-fno-objc-arc")
+    target_link_libraries(bbgpu PUBLIC "-Wl,-framework,Metal" "-Wl,-framework,Foundation")
     include(cmake/LinkClosure.cmake)
     bb_write_link_closure(bbgpu ${CMAKE_CURRENT_BINARY_DIR}/bbgpu_link.txt)
 elseif (WIN32)
