@@ -1902,7 +1902,7 @@ void Rasterizer::DrawRecord(const GraphicsPipeline* pipeline, const PreparedDraw
     }
 
     if (needs_barrier) {
-        runtime.FlushBarriers();
+        runtime.FlushBarriers(Runtime::FlushScope::Conflicts);
     }
 
     // bbport: screen-space (clip disabled) draws into the upscaler's output-size images.
@@ -2150,16 +2150,20 @@ void Rasterizer::DrawIndirectRecord(const GraphicsPipeline* pipeline, bool is_in
     const auto [buffer, base] =
         buffer_cache.ObtainBuffer(indirect.args, stride * max_count, false);
     needs_barrier |= runtime.IsBufferAccessed(buffer, base, stride * max_count);
+    NoteInputRead(buffer, base, stride * max_count, vk::PipelineStageFlagBits2::eDrawIndirect,
+                  vk::AccessFlagBits2::eIndirectCommandRead);
 
     const VideoCore::Buffer* count_buffer;
     u64 count_offset;
     if (count_address != 0) {
         std::tie(count_buffer, count_offset) = buffer_cache.ObtainBuffer(count_address, 4, false);
         needs_barrier |= runtime.IsBufferAccessed(count_buffer, count_offset, 4);
+        NoteInputRead(count_buffer, count_offset, 4, vk::PipelineStageFlagBits2::eDrawIndirect,
+                      vk::AccessFlagBits2::eIndirectCommandRead);
     }
 
     if (needs_barrier) {
-        runtime.FlushBarriers();
+        runtime.FlushBarriers(Runtime::FlushScope::Conflicts);
     }
 
     // bbport: screen-space (clip disabled) draws into the upscaler's output-size images.
@@ -2289,7 +2293,7 @@ void Rasterizer::DispatchRecord(const ComputePipeline* pipeline) {
     }
 
     if (needs_barrier) {
-        runtime.FlushBarriers();
+        runtime.FlushBarriers(Runtime::FlushScope::Conflicts);
     }
 
     scheduler.EndRendering();
@@ -2355,9 +2359,11 @@ void Rasterizer::DispatchIndirectRecord(const ComputePipeline* pipeline, VAddr a
 
     const auto [buffer, base] = buffer_cache.ObtainBuffer(address + offset, size, false);
     needs_barrier |= runtime.IsBufferAccessed(buffer, base, size);
+    NoteInputRead(buffer, base, size, vk::PipelineStageFlagBits2::eDrawIndirect,
+                  vk::AccessFlagBits2::eIndirectCommandRead);
 
     if (needs_barrier) {
-        runtime.FlushBarriers();
+        runtime.FlushBarriers(Runtime::FlushScope::Conflicts);
     }
 
     scheduler.EndRendering();
@@ -2961,6 +2967,9 @@ void Rasterizer::ResolveVertexBuffers(const GraphicsPipeline* pipeline,
         std::tie(range.buffer, range.offset) =
             buffer_cache.ObtainBuffer(range.base_address, size, false);
         needs_barrier |= runtime.IsBufferAccessed(range.buffer, range.offset, size);
+        NoteInputRead(range.buffer, range.offset, size,
+                      vk::PipelineStageFlagBits2::eVertexAttributeInput,
+                      vk::AccessFlagBits2::eVertexAttributeRead);
     }
 
     // Bind vertex buffers
@@ -3020,6 +3029,8 @@ void Rasterizer::ResolveIndexBuffer(u32 index_offset) {
     const auto [buffer, offset] =
         buffer_cache.ObtainBuffer(index_address, index_buffer_size, false);
     needs_barrier |= runtime.IsBufferAccessed(buffer, offset, index_buffer_size);
+    NoteInputRead(buffer, offset, index_buffer_size, vk::PipelineStageFlagBits2::eIndexInput,
+                  vk::AccessFlagBits2::eIndexRead);
     index_bind = {buffer->Handle(), offset, index_type};
 }
 
@@ -3027,16 +3038,21 @@ void Rasterizer::ResetBindings(bool is_compute) {
     for (auto& image_id : bound_images) {
         texture_cache.GetImage(image_id).binding = {};
     }
-    for (const auto [buffer, offset, size, is_written] : bound_buffers) {
-        const auto dst_stage = is_compute ? vk::PipelineStageFlagBits2::eComputeShader
-                                          : vk::PipelineStageFlagBits2::eAllGraphics;
+    for (const auto [buffer, offset, size, is_written, stage] : bound_buffers) {
+        const auto dst_stage = is_compute ? vk::PipelineStageFlagBits2::eComputeShader : stage;
         const auto write_flag =
             is_written ? vk::AccessFlagBits2::eShaderWrite : vk::AccessFlagBits2::eNone;
         runtime.AccessBuffer(buffer, offset, size, dst_stage,
                              vk::AccessFlagBits2::eShaderRead | write_flag);
     }
+    // bbport: vertex, index and indirect argument reads are tracked too, so that a later write
+    // to them is found (a flush for writes alone leaves reads pending).
+    for (const auto& input : input_reads) {
+        runtime.AccessBuffer(input.buffer, input.offset, input.size, input.stage, input.access);
+    }
     bound_images.clear();
     bound_buffers.clear();
+    input_reads.clear();
     needs_barrier = false;
 }
 
@@ -3357,7 +3373,8 @@ void Rasterizer::BindBuffers(const Shader::Info& stage, const PreparedStage* pre
                 }
                 push_data.AddOffset(binding.buffer, adjust);
                 buffer_infos.emplace_back(buffer->Handle(), offset_aligned, size + adjust);
-                bound_buffers.emplace_back(buffer, offset, size, desc.is_written);
+                bound_buffers.emplace_back(buffer, offset, size, desc.is_written,
+                                           BufferStage(stage.sw_stage));
                 if (desc.is_written) {
                     // Raw storage-buffer writes can also make an aliased cached image stale.
                     const VideoCore::InvalidateReason reason{"storage buffer"};

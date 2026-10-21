@@ -110,9 +110,10 @@ static bool MultiCopy(Rasterizer& rasterizer, const VideoCore::Buffer* src,
     }
     scheduler.EndRendering();
     const u64 src_size = src_max - src_min, dst_size = dst_max - dst_min;
-    if (runtime.IsBufferAccessed(src, src_min, src_size) ||
-        runtime.IsBufferAccessed(dst, dst_min, dst_size, true)) {
-        runtime.FlushBarriers();
+    // Both checks run: the second one notes a write after a read (FlushScope::Conflicts).
+    if (runtime.IsBufferAccessed(src, src_min, src_size) |
+        runtime.IsCopyDestinationAccessed(dst, copies, dst_min, dst_max)) {
+        runtime.FlushBarriers(Runtime::FlushScope::Conflicts);
     }
     const u32 count = static_cast<u32>(copies.size());
     scheduler.RecordCrumb({.name = "HLE copy shader"}, [src = src->Handle(), dst = dst->Handle(), table = stream.Handle(), src_min,

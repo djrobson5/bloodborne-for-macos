@@ -573,8 +573,32 @@ private:
         u64 offset;
         u32 size;
         bool is_written;
+        vk::PipelineStageFlags2 stage; ///< the shader stage that reads it (barrier source)
     };
     boost::container::static_vector<BoundBuffer, Shader::NUM_BUFFERS> bound_buffers;
+    /// bbport: vertex, index and indirect argument buffers the next draw reads.
+    struct InputRead {
+        const VideoCore::Buffer* buffer;
+        u64 offset;
+        u64 size;
+        vk::PipelineStageFlags2 stage;
+        vk::AccessFlags2 access;
+    };
+    std::vector<InputRead> input_reads;
+    void NoteInputRead(const VideoCore::Buffer* buffer, u64 offset, u64 size,
+                       vk::PipelineStageFlags2 stage, vk::AccessFlags2 access) {
+        input_reads.push_back({buffer, offset, size, stage, access});
+    }
+    static vk::PipelineStageFlags2 BufferStage(Shader::SwStage stage) {
+        switch (stage) {
+        case Shader::SwStage::Fragment:
+            return vk::PipelineStageFlagBits2::eFragmentShader;
+        case Shader::SwStage::Compute:
+            return vk::PipelineStageFlagBits2::eComputeShader;
+        default:
+            return vk::PipelineStageFlagBits2::ePreRasterizationShaders;
+        }
+    }
 
     u32 set_write_index{};
     Pipeline::DescriptorWrites set_writes;

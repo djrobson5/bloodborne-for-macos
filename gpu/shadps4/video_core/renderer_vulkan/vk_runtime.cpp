@@ -1,6 +1,8 @@
 // SPDX-FileCopyrightText: Copyright 2025 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <array>
+#include <bit>
 #include <boost/container/small_vector.hpp>
 #include <chrono>
 #include <cstdlib>
@@ -135,8 +137,9 @@ void Runtime::CopyBuffer(const VideoCore::Buffer* src, const VideoCore::Buffer* 
 
     bool needs_flush{};
     if (bounded) {
-        needs_flush = IsBufferAccessed(src, src_min, src_max - src_min) ||
-                      IsBufferAccessed(dst, dst_min, dst_max - dst_min, true);
+        // Both checks run: the second one notes a write after a read (FlushScope::Conflicts).
+        needs_flush = IsBufferAccessed(src, src_min, src_max - src_min) |
+                      IsCopyDestinationAccessed(dst, copies, dst_min, dst_max);
     } else {
         for (const auto& copy : copies) {
             needs_flush |= IsBufferAccessed(src, copy.srcOffset, copy.size);
@@ -144,7 +147,7 @@ void Runtime::CopyBuffer(const VideoCore::Buffer* src, const VideoCore::Buffer* 
         }
     }
     if (needs_flush) {
-        FlushBarriers();
+        FlushBarriers(FlushScope::Conflicts);
     }
 
     scheduler.Record([src_handle = src->Handle(), dst_handle = dst->Handle(),
@@ -171,7 +174,7 @@ void Runtime::FillBuffer(const VideoCore::Buffer* dst, u64 offset, u64 size, u32
     scheduler.EndRendering();
 
     if (IsBufferAccessed(dst, offset, size, true)) {
-        FlushBarriers();
+        FlushBarriers(FlushScope::Conflicts);
     }
 
     scheduler.Record([handle = dst->Handle(), offset, size, value](vk::CommandBuffer cmdbuf) {
@@ -193,7 +196,7 @@ void Runtime::CopyFromGuestChunk(vk::Buffer src, const VideoCore::Buffer* dst,
         needs_flush |= IsBufferAccessed(dst, copy.dstOffset, copy.size, true);
     }
     if (needs_flush) {
-        FlushBarriers();
+        FlushBarriers(FlushScope::Conflicts);
     }
     scheduler.Record([src, dst_handle = dst->Handle(),
                       regions = scheduler.RecordData(copies)](vk::CommandBuffer cmdbuf) {
@@ -211,7 +214,7 @@ void Runtime::UpdateBuffer(const VideoCore::Buffer* dst, u64 offset, std::span<c
     }
     scheduler.EndRendering();
     if (IsBufferAccessed(dst, offset, data.size(), true)) {
-        FlushBarriers();
+        FlushBarriers(FlushScope::Conflicts);
     }
     constexpr std::size_t Piece = 32 * 1024; // vkCmdUpdateBuffer takes 64 KiB at most
     for (std::size_t at = 0; at < data.size(); at += Piece) {
@@ -229,7 +232,7 @@ void Runtime::InlineData(VideoCore::Buffer* dst, u64 offset, u32 value) {
     scheduler.EndRendering();
 
     if (IsBufferAccessed(dst, offset, sizeof(value), true)) {
-        FlushBarriers();
+        FlushBarriers(FlushScope::Conflicts);
     }
 
     scheduler.Record([handle = dst->Handle(), offset, value](vk::CommandBuffer cmdbuf) {
@@ -438,7 +441,8 @@ void Runtime::CopyImageWithBuffer(VideoCore::Image* src, VideoCore::Image* dst,
                 vk::AccessFlagBits2::eTransferRead);
     needs_flush |= Transit(dst, vk::ImageLayout::eTransferDstOptimal,
                            vk::PipelineStageFlagBits2::eCopy, vk::AccessFlagBits2::eTransferWrite);
-    needs_flush |= IsBufferAccessed(buffer, offset, copy_size);
+    // The copies write the staging range: a read of it is a conflict too.
+    needs_flush |= IsBufferAccessed(buffer, offset, copy_size, true);
     if (needs_flush) {
         FlushBarriers();
     }
@@ -786,6 +790,35 @@ void Runtime::SetBackingSamples(VideoCore::Image* image, u32 num_samples, bool c
     backing = new_backing;
 }
 
+static bool PreciseBarriers() {
+    static const bool enabled = [] {
+        const char* env = std::getenv("BB_PRECISE_BARRIERS");
+        return !env || env[0] != '0';
+    }();
+    // Experiment bit 512: off while the game runs (A/B).
+    return enabled && !BbToggle::Experiment(512);
+}
+
+/// The read classes (bits: vertex, fragment, compute, transfer) of the GPU work in `stages`, as
+/// MoltenVK's barriers wait for it.
+static u32 ReadClasses(vk::PipelineStageFlags2 stages) {
+    using S = vk::PipelineStageFlagBits2;
+    if (stages & (S::eAllCommands | S::eTopOfPipe | S::eBottomOfPipe) || !stages) {
+        return 0xF;
+    }
+    const bool v = bool(stages & (S::eVertexAttributeInput | S::eIndexInput | S::eVertexInput |
+                                  S::eVertexShader | S::ePreRasterizationShaders |
+                                  S::eDrawIndirect | S::eAllGraphics));
+    const bool f = bool(stages & (S::eFragmentShader | S::eEarlyFragmentTests |
+                                  S::eLateFragmentTests | S::eColorAttachmentOutput |
+                                  S::eAllGraphics));
+    const bool c = bool(stages & S::eComputeShader);
+    const bool t = bool(stages & (S::eCopy | S::eClear | S::eBlit | S::eResolve |
+                                  S::eAllTransfer));
+    const u32 classes = u32(v) | u32(f) << 1 | u32(c) << 2 | u32(t) << 3;
+    return classes ? classes : 0xF;
+}
+
 bool Runtime::IsBufferAccessed(const VideoCore::Buffer* handle, u64 offset, u64 size,
                                bool check_read_access) {
     const AddressRange range = {
@@ -794,8 +827,54 @@ bool Runtime::IsBufferAccessed(const VideoCore::Buffer* handle, u64 offset, u64 
         .range_end = offset + size - 1,
     };
     bool has_access = barrier_tracker.FindRange(range, Access::Write);
-    if (check_read_access && !has_access) {
-        has_access |= barrier_tracker.FindRange(range, Access::Read);
+    if (check_read_access) {
+        // Every read class is checked, even after a write was found: a flush for conflicts
+        // waits only for the classes found (FlushScope::Conflicts).
+        u32 conflicts = 0;
+        for (u32 i = 0; i < NumReadClasses; ++i) {
+            if (!read_trackers[i].Empty() && read_trackers[i].FindRange(range, Access::Read)) {
+                conflicts |= 1u << i;
+            }
+        }
+        if (conflicts) {
+            read_conflicts.fetch_or(conflicts, std::memory_order_relaxed);
+            has_access = true;
+        }
+    }
+    return has_access;
+}
+
+bool Runtime::IsCopyDestinationAccessed(const VideoCore::Buffer* dst,
+                                        std::span<const vk::BufferCopy> copies, u64 dst_min,
+                                        u64 dst_max) {
+    if (!PreciseBarriers()) {
+        return IsBufferAccessed(dst, dst_min, dst_max - dst_min, true);
+    }
+    const auto resource = reinterpret_cast<u64>(dst);
+    const AddressRange bound = {resource, dst_min, dst_max - 1};
+    bool has_access = barrier_tracker.FindRange(bound, Access::Write);
+    u32 candidates = 0;
+    for (u32 i = 0; i < NumReadClasses; ++i) {
+        if (!read_trackers[i].Empty() && read_trackers[i].FindRange(bound, Access::Read)) {
+            candidates |= 1u << i;
+        }
+    }
+    u32 conflicts = 0;
+    for (const auto& copy : copies) {
+        const AddressRange region = {resource, copy.dstOffset, copy.dstOffset + copy.size - 1};
+        for (u32 classes = candidates & ~conflicts; classes; classes &= classes - 1) {
+            const u32 i = std::countr_zero(classes);
+            if (read_trackers[i].FindRange(region, Access::Read)) {
+                conflicts |= 1u << i;
+            }
+        }
+        if (conflicts == candidates) {
+            break;
+        }
+    }
+    if (conflicts) {
+        read_conflicts.fetch_or(conflicts, std::memory_order_relaxed);
+        has_access = true;
     }
     return has_access;
 }
@@ -813,46 +892,52 @@ void Runtime::AccessBuffer(const VideoCore::Buffer* handle, u64 offset, u64 size
         vk::AccessFlagBits2::eUniformRead | vk::AccessFlagBits2::eShaderRead |
         vk::AccessFlagBits2::eColorAttachmentRead |
         vk::AccessFlagBits2::eDepthStencilAttachmentRead | vk::AccessFlagBits2::eTransferRead |
-        vk::AccessFlagBits2::eMemoryRead;
+        vk::AccessFlagBits2::eMemoryRead | vk::AccessFlagBits2::eIndirectCommandRead;
 
     constexpr static vk::AccessFlags2 WRITE_MASK =
         vk::AccessFlagBits2::eShaderWrite | vk::AccessFlagBits2::eColorAttachmentWrite |
         vk::AccessFlagBits2::eDepthStencilAttachmentWrite | vk::AccessFlagBits2::eTransferWrite |
         vk::AccessFlagBits2::eMemoryWrite | vk::AccessFlagBits2::eTransformFeedbackWriteEXT;
 
-    // bbport: reads are tracked at 4 KiB granularity. Constant data comes from ring allocations
-    // at a new offset every draw; rounded, they land in ranges already present and the
-    // insert returns early instead of growing the tree until the next barrier flush.
-    // Wider read ranges only add barriers, never drop one.
-    if (!(src_access & WRITE_MASK) && !BbToggle::Disabled(BbToggle::CoarseReadTracking)) {
+    // bbport: without precise barriers, reads are tracked at 4 KiB granularity. Constant data
+    // comes from ring allocations at a new offset every draw; rounded, they land in ranges
+    // already present and the insert returns early instead of growing the tree until the next
+    // barrier flush. Wider read ranges only add barriers, never drop one; with precise barriers
+    // those false writes after reads (HLE copies next to constants) cost what they save.
+    if (!(src_access & WRITE_MASK) && !PreciseBarriers() &&
+        !BbToggle::Disabled(BbToggle::CoarseReadTracking)) {
         range.range_start &= ~u64{0xFFF};
         range.range_end |= 0xFFF;
     }
-    const auto insert = [&](Access access) {
+    // code: the tracker (a read class, or NumReadClasses for the writes).
+    const auto insert = [&](BarrierTracker& tracker, Access access, u32 code) {
         if (BbToggle::Disabled(BbToggle::AccessMemo)) {
-            barrier_tracker.InsertRange(range, access);
+            tracker.InsertRange(range, access);
             return;
         }
         u64 hash = range.resource ^ range.range_start * 0x9E3779B97F4A7C15ull ^
-                   range.range_end << 13 ^ u64(access) << 61;
+                   range.range_end << 13 ^ u64(code) << 59;
         hash = (hash ^ hash >> 31) * 0xFF51AFD7ED558CCDull;
         auto& memo = access_memo[(hash ^ hash >> 29) % access_memo.size()];
         if (memo.epoch == access_epoch && memo.resource == range.resource &&
             memo.start == range.range_start && memo.end == range.range_end &&
-            memo.access == u32(access)) {
+            memo.access == code) {
             return;
         }
-        barrier_tracker.InsertRange(range, access);
-        memo = {range.resource, range.range_start, range.range_end, access_epoch, u32(access)};
+        tracker.InsertRange(range, access);
+        memo = {range.resource, range.range_start, range.range_end, access_epoch, code};
     };
     if (src_access & WRITE_MASK) {
-        insert(Access::Write);
+        insert(barrier_tracker, Access::Write, NumReadClasses);
+        write_stages |= src_stage;
     }
     if (src_access & READ_MASK) {
-        insert(Access::Read);
+        for (u32 classes = ReadClasses(src_stage); classes; classes &= classes - 1) {
+            const u32 i = std::countr_zero(classes);
+            insert(read_trackers[i], Access::Read, i);
+            read_stages[i] |= src_stage;
+        }
     }
-
-    memory_barrier.srcStageMask |= src_stage;
     memory_barrier.srcAccessMask |= src_access & WRITE_MASK;
 }
 
@@ -899,9 +984,61 @@ static void NoteBarrierInPass(const vk::DependencyInfo& dep_info) {
     kinds.clear();
 }
 
-void Runtime::FlushBarriers() {
+// BB_FRAME_STATS: barrier flushes per second, every 5 s: for conflicts (precise) or full; the
+// read classes conflicts waited for; the source stages by MoltenVK fence class.
+static void NoteFlush(bool precise, bool in_pass, u32 conflicts, vk::PipelineStageFlags2 src) {
+    static u64 flushes[2], in_passes[2], waited[4];
+    static std::array<std::array<u64, 16>, 2> sources{};
+    static auto window = std::chrono::steady_clock::now();
+    const u32 k = precise ? 0 : 1;
+    ++flushes[k];
+    in_passes[k] += in_pass;
+    ++sources[k][src ? ReadClasses(src) : 0];
+    for (u32 i = 0; precise && i < 4; ++i) {
+        waited[i] += (conflicts >> i) & 1;
+    }
+    const auto now = std::chrono::steady_clock::now();
+    if (now - window < std::chrono::seconds(5)) {
+        return;
+    }
+    const double seconds = std::chrono::duration<double>(now - window).count();
+    std::printf("Barrier flushes per second: %.0f for conflicts (%.0f in a pass; writes after "
+                "reads of class V %.0f, F %.0f, C %.0f, T %.0f), %.0f full (%.0f in a pass)\n",
+                flushes[0] / seconds, in_passes[0] / seconds, waited[0] / seconds,
+                waited[1] / seconds, waited[2] / seconds, waited[3] / seconds,
+                flushes[1] / seconds, in_passes[1] / seconds);
+    for (u32 j = 0; j < 2; ++j) {
+        std::printf("  %s source stages:", j ? "full" : "conflicts");
+        for (u32 m = 0; m < 16; ++m) {
+            if (sources[j][m]) {
+                std::printf(" %s%s%s%s%s %.0f,", m & 1 ? "V" : "", m & 2 ? "F" : "",
+                            m & 4 ? "C" : "", m & 8 ? "T" : "", m ? "" : "-",
+                            sources[j][m] / seconds);
+            }
+        }
+        std::printf("\n");
+    }
+    sources = {};
+    flushes[0] = flushes[1] = in_passes[0] = in_passes[1] = 0;
+    waited[0] = waited[1] = waited[2] = waited[3] = 0;
+    window = now;
+}
+
+void Runtime::FlushBarriers(FlushScope scope) {
     BeforeImageAccess();
     vk::DependencyInfo dep_info{};
+
+    // bbport: a flush for conflicts waits for the stages that wrote and those of the read classes
+    // a write conflicted with; the other reads stay tracked.
+    const bool precise = scope == FlushScope::Conflicts && PreciseBarriers();
+    const u32 conflicts = read_conflicts.load(std::memory_order_relaxed);
+    vk::PipelineStageFlags2 stages = write_stages;
+    for (u32 i = 0; i < NumReadClasses; ++i) {
+        if (!precise || (conflicts >> i & 1)) {
+            stages |= read_stages[i];
+        }
+    }
+    memory_barrier.srcStageMask = stages;
 
     if (memory_barrier.srcStageMask) {
         dep_info.pMemoryBarriers = &memory_barrier;
@@ -916,7 +1053,8 @@ void Runtime::FlushBarriers() {
         return;
     }
 
-    if (scheduler.IsRendering()) {
+    const bool in_pass = scheduler.IsRendering();
+    if (in_pass) {
         NoteBarrierInPass(dep_info);
     }
     scheduler.EndRendering();
@@ -947,11 +1085,26 @@ void Runtime::FlushBarriers() {
         });
     }
 
+    if (BbStats::enabled) {
+        NoteFlush(precise, in_pass, conflicts,
+                  dep_info.memoryBarrierCount ? stages : vk::PipelineStageFlags2{});
+    }
     memory_barrier.srcStageMask = vk::PipelineStageFlagBits2::eNone;
     memory_barrier.srcAccessMask = vk::AccessFlagBits2::eNone;
 
     image_barriers.clear();
     barrier_tracker.Clear();
+    write_stages = vk::PipelineStageFlagBits2::eNone;
+    // The barrier waited for every earlier command in its source stages: the reads of those
+    // stages are done.
+    for (u32 i = 0; i < NumReadClasses; ++i) {
+        if ((stages & read_stages[i]) == read_stages[i]) {
+            read_trackers[i].Clear();
+            read_stages[i] = vk::PipelineStageFlagBits2::eNone;
+        }
+    }
+    read_conflicts.store(0, std::memory_order_relaxed);
+    // Memoized inserts of cleared ranges are stale (reads are inserted again as no-ops).
     ++access_epoch;
 }
 

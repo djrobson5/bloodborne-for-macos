@@ -3,6 +3,8 @@
 
 #pragma once
 
+#include <array>
+#include <atomic>
 #include "common/types.h"
 #include "video_core/buffer_cache/buffer.h"
 #include "video_core/renderer_vulkan/vk_barrier_tracker.h"
@@ -101,7 +103,19 @@ public:
     bool IsBufferAccessed(const VideoCore::Buffer* handle, u64 offset, u64 size,
                           bool check_read_access = false);
 
-    void FlushBarriers();
+    /// bbport: IsBufferAccessed(dst, dst_min, dst_max - dst_min, true) for the destinations of
+    /// many copies: reads the bounding range overlaps are checked against the regions themselves
+    /// (a read between them is no write after a read).
+    bool IsCopyDestinationAccessed(const VideoCore::Buffer* dst,
+                                   std::span<const vk::BufferCopy> copies, u64 dst_min,
+                                   u64 dst_max);
+
+    /// bbport: Conflicts: the caller flushes for the conflicts IsBufferAccessed found. The
+    /// barrier waits for the stages that wrote and those of the reads a write conflicted with;
+    /// other reads stay pending for later writes (BB_PRECISE_BARRIERS). A barrier from all
+    /// graphics stages makes MoltenVK's next vertex stage wait for the last fragment stage.
+    enum class FlushScope { All, Conflicts };
+    void FlushBarriers(FlushScope scope = FlushScope::All);
 
     /// bbport: runs before this thread changes image state (layouts, pending image
     /// barriers): the rasterizer joins its texture binding helper there (BindHelper).
@@ -125,6 +139,14 @@ private:
     BarrierTracker barrier_tracker;
     VideoCore::Image::Barriers image_barriers;
     vk::MemoryBarrier2 memory_barrier{};
+    /// bbport: barrier_tracker holds the writes; the reads are tracked by the GPU work a barrier
+    /// waits for (MoltenVK's fences: vertex, fragment, compute, transfer), so that a write after
+    /// a read waits only for the stages of the reads it overwrites.
+    static constexpr u32 NumReadClasses = 4;
+    std::array<BarrierTracker, NumReadClasses> read_trackers;
+    std::array<vk::PipelineStageFlags2, NumReadClasses> read_stages{};
+    vk::PipelineStageFlags2 write_stages{};
+    std::atomic<u32> read_conflicts{0}; ///< read classes IsBufferAccessed found writes after
     // bbport: ranges inserted into barrier_tracker since its last Clear(); re-inserting a
     // contained range is a no-op, and draws re-bind the same ranges constantly.
     struct AccessMemo {
