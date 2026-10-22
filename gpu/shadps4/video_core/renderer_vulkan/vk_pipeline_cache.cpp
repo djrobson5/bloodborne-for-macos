@@ -1029,7 +1029,8 @@ PipelineCache::Result PipelineCache::GetProgram(PipelineSelection& sel, HwStage 
         auto spec = Shader::StageSpecialization(new_program->info, runtime_info, profile, start);
         const auto perm_hash = HashCombine(params.hash, 0);
 
-        RegisterShaderMeta(new_program->info, spec.fetch_shader_data, spec, perm_hash, 0);
+        RegisterShaderMeta(new_program->info, spec.fetch_shader_data, spec, perm_hash, 0,
+                           CodegenFlags());
         new_program->AddPermut(module, std::move(spec));
         new_program->info_template = std::make_unique<Shader::Info>(new_program->info);
         Program* program = new_program.get();
@@ -1070,7 +1071,8 @@ PipelineCache::Result PipelineCache::GetProgram(PipelineSelection& sel, HwStage 
         auto new_info = Shader::Info(hw_stage, sw_stage, params);
         module = CompileModule(new_info, runtime_info, params.code, perm_idx, binding);
 
-        RegisterShaderMeta(info, spec.fetch_shader_data, spec, perm_hash, perm_idx);
+        RegisterShaderMeta(info, spec.fetch_shader_data, spec, perm_hash, perm_idx,
+                           CodegenFlags());
         std::unique_lock lk{programs_mutex};
         program->AddPermut(module, std::move(spec));
     } else {

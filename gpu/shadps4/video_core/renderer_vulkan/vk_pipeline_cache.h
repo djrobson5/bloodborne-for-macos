@@ -179,6 +179,12 @@ public:
         return profile;
     }
 
+    /// Profile options that change the emitted SPIR-V but are not in StageSpecialization.
+    /// Stored with each cached shader so a different setting never reuses its binary.
+    u32 CodegenFlags() const {
+        return u32{profile.fragment_contraction} | u32{profile.named_entry_points} << 1;
+    }
+
 private:
     void CreateNativeCache();
     void SaveNativeCache();

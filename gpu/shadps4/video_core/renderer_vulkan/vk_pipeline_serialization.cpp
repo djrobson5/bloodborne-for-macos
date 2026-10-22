@@ -18,7 +18,7 @@ namespace Serialization {
 /* You should increment versions below once corresponding serialization scheme is changed. */
 static constexpr u32 ShaderBinaryVersion = 7u; // bbport: interpolated integer fix (Pascal)
 static constexpr u32 MotionShaderBinaryVersion = 8u; // runtime address descriptor, set 1
-static constexpr u32 ShaderMetaVersion = 7u; // bbport: ImageResource::needs_native
+static constexpr u32 ShaderMetaVersion = 8u; // bbport: profile codegen flags
 static constexpr u32 PipelineKeyVersion = 6u; // pointer-free pipeline state + generated fragment
 } // namespace Serialization
 
@@ -65,7 +65,7 @@ void RegisterPipelineData(const GraphicsPipelineKey& key, u64 hash,
 void RegisterShaderMeta(const Shader::Info& info,
                         const std::optional<Shader::Gcn::FetchShaderData>& fetch_shader_data,
                         const Shader::StageSpecialization& spec, size_t perm_hash,
-                        size_t perm_idx) {
+                        size_t perm_idx, u32 codegen_flags) {
     if (!Storage::DataBase::Instance().IsOpened()) {
         return;
     }
@@ -78,6 +78,7 @@ void RegisterShaderMeta(const Shader::Info& info,
                                spec.runtime_info.hw.vs.motion_vectors;
     meta.Write(vertex_motion ? Serialization::MotionShaderBinaryVersion
                              : Serialization::ShaderBinaryVersion);
+    meta.Write(codegen_flags);
 
     meta.Write(perm_hash);
     meta.Write(perm_idx);
@@ -101,7 +102,8 @@ void RegisterShaderBinary(std::vector<u32>&& spv, u64 pgm_hash, size_t perm_idx)
 
 bool LoadShaderMeta(Serialization::Archive& ar, Shader::Info& info,
                     std::optional<Shader::Gcn::FetchShaderData>& fetch_shader_data,
-                    Shader::StageSpecialization& spec, size_t& perm_idx, u64 expected_hash) {
+                    Shader::StageSpecialization& spec, size_t& perm_idx, u64 expected_hash,
+                    u32 codegen_flags) {
     Serialization::Reader meta{ar};
 
     u32 meta_version{};
@@ -114,6 +116,13 @@ bool LoadShaderMeta(Serialization::Archive& ar, Shader::Info& info,
     meta.Read(binary_version);
     if (binary_version != Serialization::ShaderBinaryVersion &&
         binary_version != Serialization::MotionShaderBinaryVersion) {
+        return false;
+    }
+
+    // The SPIR-V was built under these profile options; another setting needs a recompile.
+    u32 codegen_flags_ar{};
+    meta.Read(codegen_flags_ar);
+    if (codegen_flags_ar != codegen_flags) {
         return false;
     }
 
@@ -321,7 +330,8 @@ bool PipelineCache::LoadPipelineStage(Serialization::Archive& ar, size_t stage, 
     spec.info = &program->info;
     std::optional<Shader::Gcn::FetchShaderData> fetch;
     size_t perm_idx{};
-    if (!LoadShaderMeta(ar, program->info, fetch, spec, perm_idx, expected_hash)) {
+    if (!LoadShaderMeta(ar, program->info, fetch, spec, perm_idx, expected_hash,
+                        CodegenFlags())) {
         return false;
     }
 
