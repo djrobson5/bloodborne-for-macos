@@ -690,8 +690,12 @@ void Runtime::ResolveImage(VideoCore::Image* src, VideoCore::Image* dst,
 }
 
 bool Runtime::FoldClears() {
-    // Experiment bit 1<<29 of BB_TOGGLE_FILE (A/B while the game runs).
-    return BbToggle::Experiment(1ull << 29);
+    static const bool enabled = [] {
+        const char* env = std::getenv("BB_FOLD_CLEARS");
+        return !env || env[0] != '0';
+    }();
+    // Experiment bit 1<<29: off while the game runs (A/B).
+    return enabled && !BbToggle::Experiment(1ull << 29);
 }
 
 void Runtime::FlushPendingClear(VideoCore::Image* image) {

@@ -64,7 +64,8 @@ public:
                  std::optional<VideoCore::SubresourceRange> subres_range = {},
                  bool keep_pending_clear = false);
 
-    /// bbport (clear folding, experiment bit 1<<29): whole-image colour clears wait on the image
+    /// bbport (clear folding; BB_FOLD_CLEARS=0 or experiment bit 1<<29 turns it off): whole-image
+    /// colour clears wait on the image
     /// (BackingImage::clear_pending) for the next render pass that draws to it, which clears
     /// with its load operation instead: no clear encoder writing the image and the pass
     /// loading it back on a tile-based GPU. Every other access records the clear first.
