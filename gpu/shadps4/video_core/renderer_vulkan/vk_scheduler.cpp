@@ -175,6 +175,14 @@ Scheduler::Scheduler(const Instance& instance, bool threaded_recording)
 Scheduler::~Scheduler() {
     if (!workers.empty()) {
         SyncRecording();
+        // bbport t20: the queued submissions go out, then the submission thread ends (before
+        // the members its submissions use).
+        WaitSubmitQueue();
+        if (submit_thread.joinable()) {
+            submit_thread.request_stop();
+            submit_queue_cv.notify_all();
+            submit_thread.join();
+        }
         for (auto& worker : workers) {
             worker->thread.request_stop(); // wakes its wait on worker->cv
         }
@@ -681,6 +689,10 @@ void Scheduler::KickRecording(bool force) {
     HandOver();
 }
 
+namespace {
+bool FramesAheadAllowsEarlySubmit();
+} // namespace
+
 bool Scheduler::EarlySubmitDue() const {
     static const u32 env_segments = [] {
         const char* env = std::getenv("BB_EARLY_SUBMIT");
@@ -691,9 +703,10 @@ bool Scheduler::EarlySubmitDue() const {
         }
         return segments;
     }();
-    const u32 segments = env_segments ? env_segments
-                         : BbToggle::Experiment(1ull << 37) ? 4u
-                                                            : 0u;
+    const u32 segments =
+        env_segments ? env_segments
+        : BbToggle::Experiment(1ull << 37) && FramesAheadAllowsEarlySubmit() ? 4u
+                                                                              : 0u;
     return segments != 0 && async_submit && !direct_segment && current_segment + 1 >= segments;
 }
 
@@ -1252,56 +1265,144 @@ void Scheduler::SubmitAsync(SubmitInfo& info) {
     // with the other submissions and after the copies and signals queued before it).
     RecordOrdered([this, submitted = batch, info = std::move(info), signal_value]() mutable {
         BbCopy::WaitAsync();
-        std::array<vk::CommandBuffer, MaxSegments> cmdbufs;
-        u32 num_cmdbufs = 0;
-        for (u32 i = 0; i < MaxSegments; ++i) {
-            if (submitted->segments[i]) {
-                cmdbufs[num_cmdbufs++] = submitted->segments[i];
+        // bbport t20: vkQueueSubmit is where MoltenVK encodes the Metal commands (~9 ms a frame
+        // under Rosetta). Run here, it held up every ordered task queued after it: the fence
+        // signals and host copies stage B waits for, and the guest's GPU idle. With the
+        // submission thread (bit 1<<37, BB_SUBMIT_THREAD=1) only the submissions wait for each
+        // other. Waits on these ticks stay correct: the CPU waits are timeline semaphore waits
+        // (Semaphore::Wait, waiting before the signal is submitted is allowed), and the presenter
+        // waits for submitted_tick before it submits on the same queue (WaitSubmitted).
+        auto submit = [this, submitted, info = std::move(info), signal_value]() mutable {
+            std::array<vk::CommandBuffer, MaxSegments> cmdbufs;
+            u32 num_cmdbufs = 0;
+            for (u32 i = 0; i < MaxSegments; ++i) {
+                if (submitted->segments[i]) {
+                    cmdbufs[num_cmdbufs++] = submitted->segments[i];
+                }
             }
+            recorded_segments.fetch_add(num_cmdbufs, std::memory_order_relaxed);
+            recorded_submissions.fetch_add(1, std::memory_order_relaxed);
+            static constexpr std::array<vk::PipelineStageFlags, 4> wait_stage_masks = {
+                vk::PipelineStageFlagBits::eAllCommands,
+                vk::PipelineStageFlagBits::eColorAttachmentOutput,
+                vk::PipelineStageFlagBits::eAllCommands,
+                vk::PipelineStageFlagBits::eAllCommands,
+            };
+            const vk::TimelineSemaphoreSubmitInfo timeline_si = {
+                .waitSemaphoreValueCount = info.num_wait_semas,
+                .pWaitSemaphoreValues = info.wait_ticks.data(),
+                .signalSemaphoreValueCount = info.num_signal_semas,
+                .pSignalSemaphoreValues = info.signal_ticks.data(),
+            };
+            const vk::SubmitInfo submit_info = {
+                .pNext = &timeline_si,
+                .waitSemaphoreCount = info.num_wait_semas,
+                .pWaitSemaphores = info.wait_semas.data(),
+                .pWaitDstStageMask = wait_stage_masks.data(),
+                .commandBufferCount = num_cmdbufs,
+                .pCommandBuffers = cmdbufs.data(),
+                .signalSemaphoreCount = info.num_signal_semas,
+                .pSignalSemaphores = info.signal_semas.data(),
+            };
+            {
+                std::scoped_lock lk{submit_mutex};
+                for (auto& operation : info.before_submit) {
+                    operation();
+                }
+                const auto result = instance.GetGraphicsQueue().submit(submit_info, info.fence);
+                if (result == vk::Result::eErrorDeviceLost) {
+                    Breadcrumbs::ReportDeviceLost("submit");
+                }
+                ASSERT_MSG(result != vk::Result::eErrorDeviceLost, "Device lost during submit");
+            }
+            submitted_tick.store(signal_value, std::memory_order_release);
+            submitted_tick.notify_all();
+            std::scoped_lock lk{recorder_mutex};
+            free_batches.push_back(submitted);
+        };
+        if (SubmitThreadWanted()) {
+            QueueSubmission(std::move(submit));
+        } else {
+            WaitSubmitQueue(); // after the ones queued while it was on: in order
+            submit();
         }
-        recorded_segments.fetch_add(num_cmdbufs, std::memory_order_relaxed);
-        recorded_submissions.fetch_add(1, std::memory_order_relaxed);
-        static constexpr std::array<vk::PipelineStageFlags, 4> wait_stage_masks = {
-            vk::PipelineStageFlagBits::eAllCommands,
-            vk::PipelineStageFlagBits::eColorAttachmentOutput,
-            vk::PipelineStageFlagBits::eAllCommands,
-            vk::PipelineStageFlagBits::eAllCommands,
-        };
-        const vk::TimelineSemaphoreSubmitInfo timeline_si = {
-            .waitSemaphoreValueCount = info.num_wait_semas,
-            .pWaitSemaphoreValues = info.wait_ticks.data(),
-            .signalSemaphoreValueCount = info.num_signal_semas,
-            .pSignalSemaphoreValues = info.signal_ticks.data(),
-        };
-        const vk::SubmitInfo submit_info = {
-            .pNext = &timeline_si,
-            .waitSemaphoreCount = info.num_wait_semas,
-            .pWaitSemaphores = info.wait_semas.data(),
-            .pWaitDstStageMask = wait_stage_masks.data(),
-            .commandBufferCount = num_cmdbufs,
-            .pCommandBuffers = cmdbufs.data(),
-            .signalSemaphoreCount = info.num_signal_semas,
-            .pSignalSemaphores = info.signal_semas.data(),
-        };
-        {
-            std::scoped_lock lk{submit_mutex};
-            for (auto& operation : info.before_submit) {
-                operation();
-            }
-            const auto result = instance.GetGraphicsQueue().submit(submit_info, info.fence);
-            if (result == vk::Result::eErrorDeviceLost) {
-                Breadcrumbs::ReportDeviceLost("submit");
-            }
-            ASSERT_MSG(result != vk::Result::eErrorDeviceLost, "Device lost during submit");
-        }
-        submitted_tick.store(signal_value, std::memory_order_release);
-        submitted_tick.notify_all();
-        std::scoped_lock lk{recorder_mutex};
-        free_batches.push_back(submitted);
     });
     KickRecording(true);
     AllocateWorkerCommandBuffers();
     PopPendingOperations();
+}
+
+namespace {
+/// bbport t20: BB_FRAMES_AHEAD as the presenter reads it (default 1). With 2 or more (or 0, no
+/// bound) the early submissions and the submission thread hitched: ~125 frames of 40-48 ms in
+/// 5 s at the lamp, 49-53 instead of 60 FPS (exp/t20 ab5/ab6). Bit 1<<37 stays off there.
+bool FramesAheadAllowsEarlySubmit() {
+    static const bool allowed = [] {
+        const char* env = std::getenv("BB_FRAMES_AHEAD");
+        const int frames_ahead = env ? std::max(0, std::atoi(env)) : 1;
+        if (frames_ahead != 1) {
+            std::printf("GPU: BB_FRAMES_AHEAD=%d: experiment bit 1<<37 (early submissions, "
+                        "submission thread) stays off; it hitches with frames ahead of the GPU\n",
+                        frames_ahead);
+        }
+        return frames_ahead == 1;
+    }();
+    return allowed;
+}
+} // namespace
+
+bool Scheduler::SubmitThreadWanted() {
+    static const int env = [] {
+        const char* value = std::getenv("BB_SUBMIT_THREAD");
+        return value ? (value[0] == '1' ? 1 : 0) : -1;
+    }();
+    if (env != -1) {
+        return env == 1;
+    }
+    return BbToggle::Experiment(1ull << 37) && FramesAheadAllowsEarlySubmit();
+}
+
+void Scheduler::QueueSubmission(Common::UniqueFunction<void>&& submit) {
+    {
+        std::scoped_lock lk{submit_queue_mutex};
+        if (!submit_thread.joinable()) {
+            submit_thread = std::jthread(std::bind_front(&Scheduler::SubmitThread, this));
+        }
+        submit_queue.push_back(std::move(submit));
+    }
+    submit_queue_cv.notify_all();
+}
+
+void Scheduler::WaitSubmitQueue() {
+    std::unique_lock lk{submit_queue_mutex};
+    submit_queue_cv.wait(lk, [this] { return submit_queue.empty() && !submit_running; });
+}
+
+void Scheduler::SubmitThread(std::stop_token stoken) {
+    Common::SetCurrentThreadName("bb:VkSubmit");
+    BbThreads::MakeCritical();
+    while (true) {
+        Common::UniqueFunction<void> submit;
+        {
+            std::unique_lock lk{submit_queue_mutex};
+            // Stops only once the queue is empty: the destructor drains it first anyway.
+            submit_queue_cv.wait(lk, stoken, [this] { return !submit_queue.empty(); });
+            if (submit_queue.empty()) {
+                return; // stop requested
+            }
+            submit = std::move(submit_queue.front());
+            submit_queue.pop_front();
+            submit_running = true;
+        }
+        // Errors end the process here as they did on the recording thread (ASSERT_MSG on a lost
+        // device); vulkan-hpp returns results, it does not throw.
+        submit();
+        {
+            std::scoped_lock lk{submit_queue_mutex};
+            submit_running = false;
+        }
+        submit_queue_cv.notify_all();
+    }
 }
 
 void Scheduler::PriorityPendingOpsThread(std::stop_token stoken) {

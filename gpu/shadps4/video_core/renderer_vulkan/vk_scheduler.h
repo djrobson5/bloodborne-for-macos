@@ -1129,6 +1129,14 @@ private:
     /// BB_ASYNC_SUBMIT: hands the submission to the recording threads (it goes out once its
     /// segments are recorded) instead of waiting for them here.
     void SubmitAsync(SubmitInfo& info);
+    /// bbport t20: the submission thread (bb:VkSubmit) runs queued vkQueueSubmits in order
+    /// (bit 1<<37 with BB_FRAMES_AHEAD 1, or BB_SUBMIT_THREAD=1).
+    static bool SubmitThreadWanted();
+    void QueueSubmission(Common::UniqueFunction<void>&& submit);
+    /// Waits until the queued submissions went out.
+    void WaitSubmitQueue();
+    void SubmitThread(std::stop_token stoken);
+
 
     std::unique_ptr<RecordChunk> AcquireChunk();
 
@@ -1251,6 +1259,12 @@ private:
     std::mutex priority_pending_ops_mutex;
     std::condition_variable_any priority_pending_ops_cv;
     std::jthread priority_pending_ops_thread;
+    std::mutex submit_queue_mutex;
+    std::condition_variable_any submit_queue_cv;
+    std::deque<Common::UniqueFunction<void>> submit_queue; ///< guarded by submit_queue_mutex
+    bool submit_running = false;                           ///< guarded by submit_queue_mutex
+    std::jthread submit_thread; ///< started on the first queued submission
+
     RenderState render_state;
     bool is_rendering = false;
     // bbport: threaded recording. Commands go into chunks of the current segment; segments are
