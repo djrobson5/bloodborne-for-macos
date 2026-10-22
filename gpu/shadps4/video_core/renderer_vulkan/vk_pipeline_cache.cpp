@@ -469,6 +469,12 @@ PipelineCache::PipelineCache(const Instance& instance_, Scheduler& scheduler_,
         .needs_unorm_fixup = instance.GetDriverID() == vk::DriverId::eMesaKosmickrisp,
         .needs_clip_distance_emulation = instance.GetDriverID() == vk::DriverId::eNvidiaProprietary,
         .supports_shader_stencil_export = instance_.IsShaderStencilExportSupported(),
+        .fragment_contraction = [&] {
+            if (const char* env = std::getenv("BB_FS_CONTRACT")) {
+                return env[0] == '1';
+            }
+            return instance.GetDriverID() == vk::DriverId::eMoltenvk;
+        }(),
         .named_entry_points = [] {
             const char* env = std::getenv("BB_SHADER_NAMES");
             return env && env[0] == '1';

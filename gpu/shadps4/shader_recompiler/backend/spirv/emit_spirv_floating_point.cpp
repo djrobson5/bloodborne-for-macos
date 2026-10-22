@@ -7,6 +7,11 @@
 namespace Shader::Backend::SPIRV {
 
 Id Decorate(EmitContext& ctx, IR::Inst* inst, Id op) {
+    // bbport: a depth-exporting shader keeps exact GCN rounding (depth tests compare it).
+    if (ctx.profile.fragment_contraction && ctx.sw_stage == SwStage::Fragment &&
+        !ctx.info.stores.GetAny(IR::Attribute::Depth)) {
+        return op;
+    }
     ctx.Decorate(op, spv::Decoration::NoContraction);
     return op;
 }

@@ -57,6 +57,11 @@ struct Profile {
     bool needs_unorm_fixup{};
     bool needs_clip_distance_emulation{};
     bool supports_shader_stencil_export{};
+    /// bbport: fragment shaders leave float add/sub/mul/div without NoContraction (except
+    /// depth-exporting ones). SPIRV-Cross emits NoContraction as calls of [[clang::optnone]] fma
+    /// helpers (spvFMul/spvFAdd), and on Metal those made the G-buffer shaders' binaries ~3x
+    /// larger and fragment time ~4x longer. BB_FS_CONTRACT=0/1 overrides (on for MoltenVK).
+    bool fragment_contraction{};
     /// bbport: debug (BB_SHADER_NAMES=1): entry points are named after the guest program
     /// (EntryPointName), so Metal traces and MoltenVK MSL dumps show which shader ran.
     bool named_entry_points{};
