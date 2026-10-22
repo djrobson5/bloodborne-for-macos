@@ -336,14 +336,16 @@ void Occlusion::Shared::Process(const Pending& dump) {
                     vk::QueryResultFlagBits::e64 | vk::QueryResultFlagBits::eWithAvailability);
             };
             vk::Result result = read();
-            // bbport t20 (experiment bit 1<<38): MoltenVK marks occlusion queries available in
+            // bbport t20 (on by default; BB_OCCLUSION_WAIT_US=0 or experiment bit 1<<38 turns
+            // it off): MoltenVK marks occlusion queries available in
             // the Metal command buffer's completion handler, which runs after the GPU signals
             // the timeline semaphore this resolve waited for. Read at once, hundreds of queries
             // a frame came back unavailable and read visible; the extra draws slowed the GPU,
             // the results came later still, and the lamp scene stayed in a heavy state (~1400
             // draws a frame instead of ~1180, every result counted visible for three frames by
             // the hysteresis). The resolve thread waits for the handler instead, briefly.
-            if (result == vk::Result::eNotReady && BbToggle::Experiment(1ull << 38)) {
+            if (result == vk::Result::eNotReady && AvailabilityWait().count() > 0 &&
+                !BbToggle::Experiment(1ull << 38)) {
                 ++avail_waits;
                 const auto give_up = std::chrono::steady_clock::now() + AvailabilityWait();
                 while (result == vk::Result::eNotReady &&

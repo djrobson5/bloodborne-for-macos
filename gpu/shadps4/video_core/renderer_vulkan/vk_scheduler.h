@@ -1130,7 +1130,7 @@ private:
     /// segments are recorded) instead of waiting for them here.
     void SubmitAsync(SubmitInfo& info);
     /// bbport t20: the submission thread (bb:VkSubmit) runs queued vkQueueSubmits in order
-    /// (bit 1<<37 with BB_FRAMES_AHEAD 1, or BB_SUBMIT_THREAD=1).
+    /// (on by default with BB_FRAMES_AHEAD 1; BB_SUBMIT_THREAD=0/1 or bit 1<<37 overrides).
     static bool SubmitThreadWanted();
     void QueueSubmission(Common::UniqueFunction<void>&& submit);
     /// Waits until the queued submissions went out.
@@ -1185,7 +1185,7 @@ private:
 
     /// Cuts the command stream after the current segment when it is long enough.
     void MaybeSplit();
-    /// bbport t20: whether a cut ends the submission (MaybeSplit; BB_EARLY_SUBMIT, bit 1<<37).
+    /// bbport t20: whether a cut ends the submission (MaybeSplit; BB_EARLY_SUBMIT, bit 1<<37 turns it off).
     [[nodiscard]] bool EarlySubmitDue() const;
 
     /// Hands the current segment's chunks and the ordered chunks to the recording threads.

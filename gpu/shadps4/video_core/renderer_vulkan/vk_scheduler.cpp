@@ -691,6 +691,16 @@ void Scheduler::KickRecording(bool force) {
 
 namespace {
 bool FramesAheadAllowsEarlySubmit();
+
+/// bbport t20: early submissions and the submission thread, on by default; BB_EARLY_SUBMIT=0 or
+/// experiment bit 1<<37 turns both off (so does BB_FRAMES_AHEAD other than 1).
+bool EarlySubmitOn() {
+    static const bool env_on = [] {
+        const char* env = std::getenv("BB_EARLY_SUBMIT");
+        return !env || env[0] != '0';
+    }();
+    return env_on && !BbToggle::Experiment(1ull << 37) && FramesAheadAllowsEarlySubmit();
+}
 } // namespace
 
 bool Scheduler::EarlySubmitDue() const {
@@ -703,10 +713,7 @@ bool Scheduler::EarlySubmitDue() const {
         }
         return segments;
     }();
-    const u32 segments =
-        env_segments ? env_segments
-        : BbToggle::Experiment(1ull << 37) && FramesAheadAllowsEarlySubmit() ? 4u
-                                                                              : 0u;
+    const u32 segments = env_segments ? env_segments : EarlySubmitOn() ? 4u : 0u;
     return segments != 0 && async_submit && !direct_segment && current_segment + 1 >= segments;
 }
 
@@ -721,7 +728,7 @@ void Scheduler::MaybeSplit() {
         return;
     }
     if (EarlySubmitDue()) {
-        // bbport t20 (experiment bit 1<<37, or BB_EARLY_SUBMIT=<segments>): the cut ends the
+        // bbport t20 (on by default, BB_EARLY_SUBMIT=<segments>; EarlySubmitOn): the cut ends the
         // submission instead. MoltenVK encodes a submission's Metal commands inside
         // vkQueueSubmit, on one thread (~9 ms a frame of 1400 draws under Rosetta, after the
         // frame's last segment was recorded: the guest waited for it). Submitted every few
@@ -1268,7 +1275,7 @@ void Scheduler::SubmitAsync(SubmitInfo& info) {
         // bbport t20: vkQueueSubmit is where MoltenVK encodes the Metal commands (~9 ms a frame
         // under Rosetta). Run here, it held up every ordered task queued after it: the fence
         // signals and host copies stage B waits for, and the guest's GPU idle. With the
-        // submission thread (bit 1<<37, BB_SUBMIT_THREAD=1) only the submissions wait for each
+        // submission thread (on by default, BB_SUBMIT_THREAD=0 off) only the submissions wait for each
         // other. Waits on these ticks stay correct: the CPU waits are timeline semaphore waits
         // (Semaphore::Wait, waiting before the signal is submitted is allowed), and the presenter
         // waits for submitted_tick before it submits on the same queue (WaitSubmitted).
@@ -1335,14 +1342,14 @@ void Scheduler::SubmitAsync(SubmitInfo& info) {
 namespace {
 /// bbport t20: BB_FRAMES_AHEAD as the presenter reads it (default 1). With 2 or more (or 0, no
 /// bound) the early submissions and the submission thread hitched: ~125 frames of 40-48 ms in
-/// 5 s at the lamp, 49-53 instead of 60 FPS (exp/t20 ab5/ab6). Bit 1<<37 stays off there.
+/// 5 s at the lamp, 49-53 instead of 60 FPS (exp/t20 ab5/ab6). Early submits stay off there.
 bool FramesAheadAllowsEarlySubmit() {
     static const bool allowed = [] {
         const char* env = std::getenv("BB_FRAMES_AHEAD");
         const int frames_ahead = env ? std::max(0, std::atoi(env)) : 1;
         if (frames_ahead != 1) {
-            std::printf("GPU: BB_FRAMES_AHEAD=%d: experiment bit 1<<37 (early submissions, "
-                        "submission thread) stays off; it hitches with frames ahead of the GPU\n",
+            std::printf("GPU: BB_FRAMES_AHEAD=%d: early submissions and the submission "
+                        "thread stay off; it hitches with frames ahead of the GPU\n",
                         frames_ahead);
         }
         return frames_ahead == 1;
@@ -1359,7 +1366,7 @@ bool Scheduler::SubmitThreadWanted() {
     if (env != -1) {
         return env == 1;
     }
-    return BbToggle::Experiment(1ull << 37) && FramesAheadAllowsEarlySubmit();
+    return EarlySubmitOn();
 }
 
 void Scheduler::QueueSubmission(Common::UniqueFunction<void>&& submit) {

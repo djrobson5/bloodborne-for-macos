@@ -292,8 +292,13 @@ const Shader::RuntimeInfo& PipelineCache::BuildRuntimeInfo(PipelineSelection& se
             info.hw.vs.codegen =
                 Shader::VertexCodegen::Contract | Shader::VertexCodegen::InvariantPosition;
         }
-        // bbport: experiment bit 31, a plain store of the motion position (VertexCodegen).
-        if (sel.motion && BbToggle::Experiment(1ull << 31)) {
+        // bbport: a plain store of the motion position (VertexCodegen), on by default
+        // (-0.5 ms GPU); BB_MOTION_PLAIN_STORE=0 or experiment bit 31 turns it off.
+        static const bool plain_store = [] {
+            const char* env = std::getenv("BB_MOTION_PLAIN_STORE");
+            return !env || env[0] != '0';
+        }();
+        if (sel.motion && plain_store && !BbToggle::Experiment(1ull << 31)) {
             info.hw.vs.codegen |= Shader::VertexCodegen::MotionPlainStore;
         }
         break;
@@ -817,14 +822,19 @@ bool PipelineCache::RefreshGraphicsKey(PipelineSelection& sel) {
 
     if (sel.motion) {
         constexpr u32 mv = Shader::MotionVectors::Output;
-        // bbport: experiment bit 36. The loop above stops at the shader's last exported MRT,
+        // bbport: on by default; BB_MOTION_SLOT_FIX=0 or experiment bit 36 turns it off.
+        // The loop above stops at the shader's last exported MRT,
         // so a bound guest target between it and the motion slot (G-buffer: MRT 6) keeps the
         // format of the first pass with write mask 0, while the render pass leaves that
         // attachment out. Metal then lays out tile memory differently for the pipeline and
         // the pass: the motion attachment's writes land 8 bytes off (RGBA32F: the vector in
         // b/a, validity and depth lost, so no object vector ever passed the compose pass).
         // Unused attachments before the motion slot get no format, as in the render pass.
-        if (BbToggle::Experiment(1ull << 36)) {
+        static const bool slot_fix = [] {
+            const char* env = std::getenv("BB_MOTION_SLOT_FIX");
+            return !env || env[0] != '0';
+        }();
+        if (slot_fix && !BbToggle::Experiment(1ull << 36)) {
             for (u32 cb = std::bit_width(key.mrt_mask); cb < mv; ++cb) {
                 key.color_buffers[cb] = {};
                 key.write_masks[cb] = {};
