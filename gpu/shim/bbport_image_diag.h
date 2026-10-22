@@ -23,7 +23,7 @@ namespace BbImageDiag {
 /// another format are appended to it (guest address, format, size); with BB_IMAGE_COMPRESS=1, it
 /// lists the images that keep their full usage.
 ///
-/// BB_IMAGE_COMPRESS=1 (t23 bound test): colour images from 512 wide, not in the keys file, are
+/// BB_IMAGE_COMPRESS=1 (t23 bound test): colour images from 1280 wide, not in the keys file, are
 /// created without Storage and with a format list of their own format and its sRGB/linear twin,
 /// so Metal may compress them. Returns the list to chain, or null for the usual image.
 const vk::ImageFormatListCreateInfo* CompressList(const VideoCore::ImageInfo& info);
@@ -31,5 +31,8 @@ const vk::ImageFormatListCreateInfo* CompressList(const VideoCore::ImageInfo& in
 bool Enabled();
 void OnCreate(const Vulkan::Instance& instance, const VideoCore::Image& image);
 void OnView(const VideoCore::Image& image, vk::Format view_format, bool storage);
+/// Whether `image` has Storage usage, for a host pass (`pass`) that writes it. The diagnostic
+/// records such images like views that need storage; a compressed one counts as a miss.
+bool HasStorage(const VideoCore::Image& image, const char* pass);
 
 } // namespace BbImageDiag

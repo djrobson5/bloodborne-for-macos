@@ -163,7 +163,7 @@ void MaybeReportLocked() {
 } // namespace
 
 const vk::ImageFormatListCreateInfo* CompressList(const VideoCore::ImageInfo& info) {
-    if (!CompressOn() || info.props.is_block || info.props.is_depth || info.size.width < 512 ||
+    if (!CompressOn() || info.props.is_block || info.props.is_depth || info.size.width < 1280 ||
         KeptKeys().contains(KeyOf(info))) {
         return nullptr;
     }
@@ -284,6 +284,25 @@ void OnView(const VideoCore::Image& image, vk::Format view_format, bool storage)
         }
     }
     MaybeReportLocked();
+}
+
+bool HasStorage(const VideoCore::Image& image, const char* pass) {
+    const bool has = bool(image.usage_flags & vk::ImageUsageFlagBits::eStorage);
+    if (!Enabled()) {
+        return has;
+    }
+    std::scoped_lock lock{mutex};
+    if (has) {
+        RecordKeyLocked(image.info);
+    } else if (const auto it = images.find(image.image_uid);
+               it != images.end() && it->second.compressed && !it->second.storage) {
+        it->second.storage = true; // reported once per image
+        ++misses;
+        std::printf("Image compress miss: %s %ux%u at %#llx: %s skipped (no Storage)\n",
+                    vk::to_string(image.info.pixel_format).c_str(), image.info.size.width,
+                    image.info.size.height, (unsigned long long)image.info.guest_address, pass);
+    }
+    return has;
 }
 
 } // namespace BbImageDiag
