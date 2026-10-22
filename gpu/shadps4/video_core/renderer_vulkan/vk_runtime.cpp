@@ -245,8 +245,12 @@ void Runtime::InlineData(VideoCore::Buffer* dst, u64 offset, u32 value) {
 
 bool Runtime::Transit(VideoCore::Image* image, vk::ImageLayout dst_layout,
                       vk::PipelineStageFlags2 dst_stage, vk::AccessFlags2 dst_access,
-                      std::optional<VideoCore::SubresourceRange> subres_range) {
+                      std::optional<VideoCore::SubresourceRange> subres_range,
+                      bool keep_pending_clear) {
     BeforeImageAccess();
+    if (image->backing && image->backing->clear_pending && !keep_pending_clear) {
+        FlushPendingClear(image);
+    }
     if (scene_targets) scene_targets->NativeAccess(*image, dst_access);
     const size_t prev_num_barriers = static_cast<size_t>(image_barriers.size());
     image->GetBarriers(image_barriers, dst_layout, dst_access, dst_stage, subres_range);
@@ -685,9 +689,52 @@ void Runtime::ResolveImage(VideoCore::Image* src, VideoCore::Image* dst,
     dst->flags &= ~VideoCore::ImageFlagBits::Dirty;
 }
 
+bool Runtime::FoldClears() {
+    // Experiment bit 1<<29 of BB_TOGGLE_FILE (A/B while the game runs).
+    return BbToggle::Experiment(1ull << 29);
+}
+
+void Runtime::FlushPendingClear(VideoCore::Image* image) {
+    auto& backing = *image->backing;
+    backing.clear_pending = false;
+    scheduler.EndRendering();
+    // Barriers already queued for this image (a pass begin that kept the clear pending) go
+    // out first: two transitions of one subresource in one barrier batch are unordered.
+    if (!image_barriers.empty()) {
+        FlushBarriers();
+    }
+    const VideoCore::SubresourceRange range = {.base = {}, .extent = image->info.resources};
+    if (Transit(image, vk::ImageLayout::eTransferDstOptimal, vk::PipelineStageFlagBits2::eClear,
+                vk::AccessFlagBits2::eTransferWrite, range)) {
+        FlushBarriers();
+    }
+    const vk::ImageSubresourceRange vk_range = {
+        .aspectMask = vk::ImageAspectFlagBits::eColor,
+        .baseMipLevel = 0,
+        .levelCount = range.extent.levels,
+        .baseArrayLayer = 0,
+        .layerCount = range.extent.layers,
+    };
+    scheduler.Record([image = image->GetImage(), color = backing.pending_clear,
+                      vk_range](vk::CommandBuffer cmdbuf) {
+        cmdbuf.clearColorImage(image, vk::ImageLayout::eTransferDstOptimal, color, vk_range);
+    });
+}
+
 void Runtime::ClearImage(VideoCore::Image* dst, const VideoCore::SubresourceRange& range,
                          const vk::ClearValue& clear_value) {
     scheduler.EndRendering();
+    // bbport: clear folding (FoldClears). Images with a scene proxy are sampled through it
+    // without a Transit of the native image: those clear now.
+    if (FoldClears() && dst->backing && !dst->scene_proxy && !dst->info.props.is_depth &&
+        range.base == VideoCore::SubresourceBase{} && range.extent == dst->info.resources) {
+        BeforeImageAccess();
+        dst->backing->clear_pending = true;
+        dst->backing->pending_clear = clear_value.color;
+        dst->flags |= VideoCore::ImageFlagBits::GpuModified;
+        dst->flags &= ~VideoCore::ImageFlagBits::Dirty;
+        return;
+    }
 
     const bool needs_flush =
         Transit(dst, vk::ImageLayout::eTransferDstOptimal, vk::PipelineStageFlagBits2::eClear,

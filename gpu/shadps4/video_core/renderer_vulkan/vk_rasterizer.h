@@ -321,6 +321,15 @@ private:
     void NotifyUiDraw(const GraphicsPipeline* pipeline);
     RenderState BeginRendering(const GraphicsPipeline* pipeline);
     RenderState BeginRenderingFull(const GraphicsPipeline* pipeline);
+    /// bbport (clear folding, Runtime::FoldClears): scheduler.BeginRendering(state), the pending
+    /// clears BeginRenderingFull kept for this pass loaded with its clear values when it starts.
+    void BeginPass(const RenderState& state);
+    struct FoldClaim {
+        VideoCore::ImageId id;
+        const void* backing;
+        u32 cb;
+    };
+    boost::container::static_vector<FoldClaim, 8> fold_claims;
     /// bbport: a draw continuing the open render pass with the same inputs gets the same render
     /// state (RenderStateMemo); nothing can have broken the pass in between (barriers, copies and
     /// dispatches end it).

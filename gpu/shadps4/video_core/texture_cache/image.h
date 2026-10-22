@@ -189,6 +189,11 @@ public:
         boost::container::small_vector<ImageViewId, 4> image_view_ids;
         u32 last_view = 0; ///< bbport: index of the view FindView returned last
         u32 num_samples;
+        /// bbport (clear folding, Runtime::ClearImage): a whole-image colour clear not recorded
+        /// yet. The next render pass that has the image as its only full-size attachment loads
+        /// it with this clear value; any other access records the clear first (Runtime::Transit).
+        bool clear_pending = false;
+        vk::ClearColorValue pending_clear{};
     };
     std::deque<BackingImage> backing_images;
     boost::container::static_vector<u64, 16> mip_hashes{};

@@ -2056,7 +2056,7 @@ void Rasterizer::DrawRecord(const GraphicsPipeline* pipeline, const PreparedDraw
     }
     UpdateDynamicState(pipeline, is_indexed);
     MarkPass(pipeline, state);
-    scheduler.BeginRendering(state);
+    BeginPass(state);
 
     const auto& vs_info = pipeline->GetStage(Shader::SwStage::Vertex);
     const auto& fetch_shader = pipeline->GetFetchShader();
@@ -2251,7 +2251,7 @@ void Rasterizer::DrawIndirectRecord(const GraphicsPipeline* pipeline, bool is_in
     }
     UpdateDynamicState(pipeline, is_indexed);
     MarkPass(pipeline, state);
-    scheduler.BeginRendering(state);
+    BeginPass(state);
 
     ASSERT(stride == (is_indexed ? sizeof(VkDrawIndexedIndirectCommand)
                                  : sizeof(VkDrawIndirectCommand)));
@@ -2700,7 +2700,7 @@ bool Rasterizer::TexturesBindableOnHelper(const Shader::Info& stage,
             image = &texture_cache.GetImage(image_id);
         }
         if (image->binding.needs_rebind || !texture_cache.IsUpToDate(image_id) ||
-            scene_targets->Tracks(image->image_uid) ||
+            image->backing->clear_pending || scene_targets->Tracks(image->image_uid) ||
             (upscaler->Enabled() && upscaler->RedirectsSampled(image_id))) {
             return false;
         }
@@ -4365,8 +4365,33 @@ bool Rasterizer::RevalidateBeginMemo(const BeginSignature& signature) {
     return true;
 }
 
+void Rasterizer::BeginPass(const RenderState& state) {
+    if (fold_claims.empty()) {
+        scheduler.BeginRendering(state);
+        return;
+    }
+    // The clears are still pending unless something accessed the images since (which recorded
+    // them); a pass already open with this state cannot hold an image with a pending clear
+    // (ClearImage ends the pass).
+    FoldedClears folded;
+    if (scheduler.WillBeginRendering(state)) {
+        for (const auto& claim : fold_claims) {
+            auto& image = texture_cache.GetImage(claim.id);
+            if (image.backing != claim.backing || !image.backing->clear_pending) {
+                continue;
+            }
+            image.backing->clear_pending = false;
+            folded.mask |= 1u << claim.cb;
+            folded.values[claim.cb] = image.backing->pending_clear;
+        }
+    }
+    fold_claims.clear();
+    scheduler.BeginRendering(state, folded);
+}
+
 RenderState Rasterizer::BeginRendering(const GraphicsPipeline* pipeline) {
     BB_SECTION(BeginRendering);
+    fold_claims.clear();
     // bbport: RenderStateMemo (see BeginMemo).
     const bool memo_on = !BbToggle::Disabled(BbToggle::RenderStateMemo) && !FrameCapture::Active();
     if (BbStats::enabled && ((begin_memo_hits + begin_memo_misses) & 0x3FFFF) == 0x3FFFF) {
@@ -4525,6 +4550,31 @@ RenderState Rasterizer::BeginRenderingFull(const GraphicsPipeline* pipeline) {
     state.height = instance.GetMaxFramebufferHeight();
     state.num_layers = std::numeric_limits<u16>::max();
     state.num_color_attachments = std::bit_width(key.mrt_mask);
+    // bbport: clear folding (Runtime::FoldClears). A pending clear becomes this pass's load
+    // operation only when the render area (computed below as here) covers its whole image;
+    // the others are recorded by the attachment's Transit.
+    bool fold_possible = false;
+    u32 fold_width = state.width, fold_height = state.height;
+    for (auto cb = 0u; cb < state.num_color_attachments && !reduced; ++cb) {
+        const auto& [id, desc] = cb_descs[cb];
+        if (!id) {
+            continue;
+        }
+        const auto& image = texture_cache.GetImage(id);
+        if (image.binding.needs_rebind) {
+            fold_possible = false;
+            break;
+        }
+        fold_possible |= image.backing && image.backing->clear_pending;
+        const u32 mip = desc.view_info.range.base.level;
+        fold_width = std::min<u32>(fold_width, std::max(image.info.size.width >> mip, 1u));
+        fold_height = std::min<u32>(fold_height, std::max(image.info.size.height >> mip, 1u));
+    }
+    if (fold_possible && db_desc.first) {
+        const auto& depth = texture_cache.GetImage(db_desc.first);
+        fold_width = std::min<u32>(fold_width, depth.info.size.width);
+        fold_height = std::min<u32>(fold_height, depth.info.size.height);
+    }
     for (auto cb = 0u; cb < state.num_color_attachments; ++cb) {
         auto& [image_id, desc] = cb_descs[cb];
         if (!image_id) {
@@ -4547,8 +4597,27 @@ RenderState Rasterizer::BeginRenderingFull(const GraphicsPipeline* pipeline) {
         const bool is_clear = texture_cache.IsMetaCleared(col_buf.CmaskAddress(), slice);
         texture_cache.TouchMeta(col_buf.CmaskAddress(), slice, false);
 
+        bool fold = false;
+        if (fold_possible && image->backing->clear_pending) {
+            const auto& info = image->info;
+            const auto& range = desc.view_info.range;
+            u32 uses = 0;
+            for (u32 other = 0; other < state.num_color_attachments; ++other) {
+                uses += cb_descs[other].first == image_id;
+            }
+            fold = !is_clear && !image->binding.is_bound && uses == 1 &&
+                   !(cb == 0 && upscaler->Enabled() && upscaler->RedirectsColor(image_id)) &&
+                   image->backing->num_samples == 1 &&
+                   info.resources.levels == 1 && info.resources.layers == 1 &&
+                   range.base == VideoCore::SubresourceBase{} && range.extent == info.resources &&
+                   image_view.info.format == info.pixel_format &&
+                   info.size.width == fold_width && info.size.height == fold_height;
+        }
         if (reduced) {
             // The native image is resolved lazily when a shader/copy actually reads it.
+            if (image->backing->clear_pending) {
+                runtime.FlushPendingClear(image);
+            }
         } else if (image->binding.is_bound) {
             ASSERT_MSG(!image->binding.force_general,
                        "Having image both as storage and render target is unsupported");
@@ -4567,7 +4636,10 @@ RenderState Rasterizer::BeginRenderingFull(const GraphicsPipeline* pipeline) {
                                              vk::PipelineStageFlagBits2::eColorAttachmentOutput,
                                              vk::AccessFlagBits2::eColorAttachmentWrite |
                                                  vk::AccessFlagBits2::eColorAttachmentRead,
-                                             desc.view_info.range);
+                                             desc.view_info.range, fold);
+            if (fold) {
+                fold_claims.push_back({image_id, image->backing, cb});
+            }
         }
 
         state.width = std::min<u32>(state.width, std::max(image->info.size.width >> mip, 1u));
@@ -4590,6 +4662,8 @@ RenderState Rasterizer::BeginRenderingFull(const GraphicsPipeline* pipeline) {
         image->usage.render_target = 1u;
         if (cb == 0 && upscaler->Enabled()) {
             color_redirected = upscaler->RedirectColor(image_id, desc.view_info, redirect);
+            ASSERT_MSG(!color_redirected || fold_claims.empty() || fold_claims.front().cb != 0,
+                       "Clear folded into a redirected colour target");
             if (color_redirected) {
                 guest_extent = {image->info.size.width, image->info.size.height};
                 original_color = {attachment.image_view, attachment.image_layout};

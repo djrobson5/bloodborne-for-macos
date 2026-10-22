@@ -117,6 +117,9 @@ public:
     bool RedirectColor(VideoCore::ImageId color, const VideoCore::ImageViewInfo& view,
                        Target& target);
     bool RedirectDepth(VideoCore::ImageId depth, Target& target);
+    /// bbport (clear folding): whether RedirectColor would redirect `color` now, without its
+    /// side effects (a pending clear of a redirected image cannot become the pass's load).
+    [[nodiscard]] bool RedirectsColor(VideoCore::ImageId color) const;
     /// A sampled image replaced by the upscaled frame (the display pass).
     bool RedirectSampled(VideoCore::ImageId image, const VideoCore::ImageViewInfo& info,
                          vk::ImageView& view, vk::ImageLayout& layout);

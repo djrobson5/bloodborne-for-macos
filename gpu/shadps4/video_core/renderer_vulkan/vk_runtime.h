@@ -57,9 +57,20 @@ public:
     /// bbport: `data` written into `dst` by the GPU in stream order (vkCmdUpdateBuffer pieces).
     void UpdateBuffer(const VideoCore::Buffer* dst, u64 offset, std::span<const u8> data);
 
+    /// bbport: a clear pending on the image (ClearImage, clear folding) is recorded first,
+    /// unless `keep_pending_clear`: the render pass begin that will load the image with it.
     bool Transit(VideoCore::Image* image, vk::ImageLayout dst_layout,
                  vk::PipelineStageFlags2 dst_stage, vk::AccessFlags2 dst_access,
-                 std::optional<VideoCore::SubresourceRange> subres_range = {});
+                 std::optional<VideoCore::SubresourceRange> subres_range = {},
+                 bool keep_pending_clear = false);
+
+    /// bbport (clear folding, experiment bit 1<<29): whole-image colour clears wait on the image
+    /// (BackingImage::clear_pending) for the next render pass that draws to it, which clears
+    /// with its load operation instead: no clear encoder writing the image and the pass
+    /// loading it back on a tile-based GPU. Every other access records the clear first.
+    static bool FoldClears();
+    /// Records the pending clear of `image` now (before the caller's own barriers).
+    void FlushPendingClear(VideoCore::Image* image);
 
     /// BB_GPU_PROFILE: a profiler segment for a transfer of `image` while it lives; the
     /// segment it interrupted continues afterwards.

@@ -269,6 +269,10 @@ static void NotePassBreak() {
 }
 
 void Scheduler::BeginRendering(const RenderState& new_state) {
+    BeginRendering(new_state, FoldedClears{});
+}
+
+void Scheduler::BeginRendering(const RenderState& new_state, const FoldedClears& folded) {
     if (is_rendering && render_state == new_state) {
         return;
     }
@@ -286,13 +290,19 @@ void Scheduler::BeginRendering(const RenderState& new_state) {
     std::array<vk::RenderingAttachmentInfo, 8> color_attachments;
     for (u32 i = 0; i < render_state.num_color_attachments; ++i) {
         const auto& cb = render_state.color_attachments[i];
+        // A folded clear stands for a clear command before this pass: it applies even when
+        // the pass resumes one a command stream cut closed.
+        const bool folded_clear = (folded.mask >> i) & 1;
         color_attachments[i] = vk::RenderingAttachmentInfo{
             .imageView = cb.image_view,
             .imageLayout = cb.image_layout,
-            .loadOp = cb.is_clear && !resume ? vk::AttachmentLoadOp::eClear
-                                             : vk::AttachmentLoadOp::eLoad,
+            .loadOp = folded_clear || (cb.is_clear && !resume) ? vk::AttachmentLoadOp::eClear
+                                                               : vk::AttachmentLoadOp::eLoad,
             .storeOp = vk::AttachmentStoreOp::eStore,
-            .clearValue = vk::ClearValue{.color = vk::ClearColorValue{.uint32 = cb.clear_value}},
+            .clearValue = vk::ClearValue{.color = folded_clear
+                                                      ? folded.values[i]
+                                                      : vk::ClearColorValue{.uint32 =
+                                                                                cb.clear_value}},
         };
     }
 

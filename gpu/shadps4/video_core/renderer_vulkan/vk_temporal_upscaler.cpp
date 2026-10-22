@@ -2255,6 +2255,15 @@ bool TemporalUpscaler::RedirectColor(VideoCore::ImageId color,
     return true;
 }
 
+bool TemporalUpscaler::RedirectsColor(VideoCore::ImageId color) const {
+    // RedirectColor's two redirecting branches.
+    if (ui_phase && color == ui_color) {
+        return true;
+    }
+    return display_redirect &&
+           FrameCapture::IsDisplayBuffer(texture_cache.GetImage(color).info.guest_address);
+}
+
 bool TemporalUpscaler::RedirectDepth(VideoCore::ImageId depth, Target& target) {
     if (!ui_phase || depth != ui_depth) {
         return false;

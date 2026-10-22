@@ -68,6 +68,12 @@ struct RenderState {
 };
 static_assert(std::has_unique_object_representations_v<RenderState>);
 
+/// bbport: whole-image clears a render pass begin takes over (Runtime::FoldClears).
+struct FoldedClears {
+    u32 mask = 0;
+    std::array<vk::ClearColorValue, 8> values{};
+};
+
 struct SubmitInfo {
     std::array<vk::Semaphore, 4> wait_semas;
     std::array<u64, 4> wait_ticks;
@@ -775,6 +781,9 @@ public:
 
     /// Starts a new rendering scope with provided state.
     void BeginRendering(const RenderState& new_state);
+    /// bbport (clear folding, Runtime::FoldClears): as above, the colour attachments in
+    /// `folded.mask` loaded with their clear values (when it starts a pass: the caller checks).
+    void BeginRendering(const RenderState& new_state, const FoldedClears& folded);
 
     /// Ends current rendering scope.
     void EndRendering();
