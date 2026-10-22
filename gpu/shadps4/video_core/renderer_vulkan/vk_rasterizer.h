@@ -372,7 +372,7 @@ private:
     void UpdateDynamicState(const GraphicsPipeline* pipeline, bool is_indexed) const;
     void UpdateViewportScissorState() const;
     void UpdateDepthStencilState() const;
-    void UpdatePrimitiveState(bool is_indexed) const;
+    void UpdatePrimitiveState(bool is_indexed, bool triangle_list) const;
     bool SkipNoopDraw(const GraphicsPipeline* pipeline) const;
     void UpdateRasterizationState() const;
     void UpdateColorBlendingState(const GraphicsPipeline* pipeline) const;

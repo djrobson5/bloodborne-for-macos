@@ -55,6 +55,9 @@ struct GraphicsPipelineKey {
         AmdGpu::ClipSpace clip_space : 1;
         AmdGpu::ProvokingVtxLast provoking_vtx_last : 1;
         u32 depth_clip_enable : 1;
+        /// bbport: Shader::TessAsVertexPattern: tessellation drawn as a triangle list by the
+        /// domain shader run as the vertex shader, without the other tessellation stages.
+        u32 tess_as_vertex : 2;
     };
 
     GraphicsPipelineKey() {

@@ -1,12 +1,15 @@
 // SPDX-FileCopyrightText: Copyright 2024 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <bit>
 #include <span>
 #include <type_traits>
 #include <utility>
 #include <vector>
+#include <boost/container/small_vector.hpp>
 #include <magic_enum/magic_enum.hpp>
 
+#include "common/alignment.h"
 #include "common/assert.h"
 #include "common/func_traits.h"
 #include "shader_recompiler/backend/spirv/emit_spirv.h"
@@ -18,6 +21,9 @@
 #include "shader_recompiler/runtime_info.h"
 
 namespace Shader::Backend::SPIRV {
+
+const VectorIds& GetAttributeType(EmitContext& ctx, AmdGpu::NumberFormat fmt);
+
 namespace {
 
 static constexpr spv::ExecutionMode GetInputPrimitiveType(AmdGpu::PrimitiveType type) {
@@ -226,6 +232,104 @@ Id DefineMain(EmitContext& ctx, const IR::Program& program) {
     return main;
 }
 
+/// bbport: a domain shader run as the vertex shader (SwTessEvalRuntimeInfo::as_vertex), so the
+/// draw stays inside the render pass: MoltenVK runs a tessellated draw's vertex and control
+/// stages as a compute pass, which ends the Metal render pass and starts it again after.
+/// The draw has one instance per patch (its one control point is the vertex inputs, fetched at
+/// instance rate) and one vertex per corner of the tessellator's triangles, as a list. main sets
+/// the tess coord of draw vertex VertexIndex from the pattern, rebuilds the control point the
+/// local shader would have written (ls_out_map; the hull shader only copies it) and calls the
+/// domain shader, the function `body`.
+Id EmitTessAsVertexMain(EmitContext& ctx, Id body) {
+    const auto& tes = ctx.runtime_info.sw.tes;
+    // The tessellator's triangles as Metal produces them with MoltenVK (Vulkan's clockwise
+    // order becomes Metal's counter-clockwise; measured, 2026-10-21): the coordinates are its
+    // fixed-point values (1/3 is 0x3eaaaa00), the triangles counter-clockwise in (u, v).
+    const float third = std::bit_cast<float>(0x3eaaaa00u);
+    const float two_thirds = std::bit_cast<float>(0x3f2aab00u);
+    boost::container::small_vector<std::array<float, 2>, 36> corners;
+    const auto triangle = [&](std::array<float, 2> a, std::array<float, 2> b,
+                              std::array<float, 2> c) {
+        corners.push_back(a);
+        if (tes.tess_topology == AmdGpu::TessellationTopology::TriangleCcw) {
+            std::swap(b, c);
+        }
+        corners.push_back(b);
+        corners.push_back(c);
+    };
+    if (tes.as_vertex == TessAsVertexPattern::Quad1) {
+        // The diagonal from (1, 0) to (0, 1).
+        triangle({0.f, 0.f}, {1.f, 0.f}, {0.f, 1.f});
+        triangle({1.f, 0.f}, {1.f, 1.f}, {0.f, 1.f});
+    } else {
+        // Inner factor 1 with outer 3: the edges' 12 points fan around the centre.
+        const std::array<std::array<float, 2>, 12> ring = {{
+            {0.f, 0.f}, {third, 0.f}, {two_thirds, 0.f}, {1.f, 0.f},
+            {1.f, third}, {1.f, two_thirds}, {1.f, 1.f}, {two_thirds, 1.f},
+            {third, 1.f}, {0.f, 1.f}, {0.f, two_thirds}, {0.f, third},
+        }};
+        for (u32 i = 0; i < ring.size(); ++i) {
+            triangle({0.5f, 0.5f}, ring[i], ring[(i + 1) % ring.size()]);
+        }
+    }
+
+    const Id u32_type{ctx.U32[1]};
+    const Id f32_type{ctx.F32[1]};
+    const Id void_function{ctx.TypeFunction(ctx.void_id)};
+    const Id main{ctx.OpFunction(ctx.void_id, spv::FunctionControlMask::MaskNone, void_function)};
+    ctx.AddLabel(ctx.OpLabel());
+    const Id table_type{ctx.TypeArray(f32_type, ctx.ConstU32(u32(corners.size())))};
+    const Id table_pointer{ctx.TypePointer(spv::StorageClass::Function, table_type)};
+    std::array<Id, 2> tables;
+    for (u32 axis = 0; axis < 2; ++axis) {
+        boost::container::small_vector<Id, 36> values;
+        for (const auto& corner : corners) {
+            values.push_back(ctx.Constant(f32_type, corner[axis]));
+        }
+        tables[axis] = ctx.AddLocalVariable(
+            table_pointer, spv::StorageClass::Function,
+            ctx.ConstantComposite(table_type, std::span(values.data(), values.size())));
+    }
+    const Id corner{ctx.OpLoad(u32_type, ctx.as_vertex_index)};
+    const Id function_f32{ctx.TypePointer(spv::StorageClass::Function, f32_type)};
+    const Id u{ctx.OpLoad(f32_type, ctx.OpAccessChain(function_f32, tables[0], corner))};
+    const Id v{ctx.OpLoad(f32_type, ctx.OpAccessChain(function_f32, tables[1], corner))};
+    ctx.OpStore(ctx.tess_coord, ctx.OpCompositeConstruct(ctx.F32[3], u, v, ctx.f32_zero_value));
+
+    if (Sirit::ValidId(ctx.input_attr_array)) {
+        const u32 num_attrs = Common::AlignUp(tes.hs_output_cp_stride, 16) >> 4;
+        std::array<Id, 32> loaded{};
+        for (u32 index = 0; index < std::min<u32>(num_attrs * 4, tes.ls_out_map.size()); ++index) {
+            const u8 source = tes.ls_out_map[index];
+            Id value;
+            if (source == TessPassOne) {
+                value = ctx.Constant(f32_type, 1.0f);
+            } else if (source < TessPassZero) {
+                const u32 location = source / 4;
+                const auto fmt = AmdGpu::NumberFormat(tes.input_formats[location] - 1);
+                const auto& types = GetAttributeType(ctx, fmt);
+                if (!Sirit::ValidId(loaded[location])) {
+                    loaded[location] = ctx.OpLoad(types[4], ctx.as_vertex_inputs[location]);
+                }
+                value = ctx.OpCompositeExtract(types[1], loaded[location], source % 4);
+                if (types[1].value != f32_type.value) {
+                    value = ctx.OpBitcast(f32_type, value);
+                }
+            } else {
+                value = ctx.f32_zero_value; // TessPassZero, or never written
+            }
+            ctx.OpStore(ctx.OpAccessChain(ctx.tess_input_f32, ctx.input_attr_array,
+                                          ctx.u32_zero_value, ctx.ConstU32(index / 4),
+                                          ctx.ConstU32(index % 4)),
+                        value);
+        }
+    }
+    ctx.OpFunctionCall(ctx.void_id, body);
+    ctx.OpReturn();
+    ctx.OpFunctionEnd();
+    return main;
+}
+
 spv::ExecutionMode ExecutionMode(AmdGpu::TessellationType primitive) {
     switch (primitive) {
     case AmdGpu::TessellationType::Isoline:
@@ -408,6 +512,10 @@ void DefineEntryPoint(const Info& info, EmitContext& ctx, Id main) {
                              ctx.runtime_info.sw.tcs.NumOutputControlPoints());
         break;
     case SwStage::TessellationEval: {
+        if (ctx.runtime_info.sw.tes.as_vertex != TessAsVertexPattern::None) {
+            execution_model = spv::ExecutionModel::Vertex; // bbport: EmitTessAsVertexMain
+            break;
+        }
         execution_model = spv::ExecutionModel::TessellationEvaluation;
         ctx.AddExecutionMode(main, ExecutionMode(ctx.runtime_info.sw.tes.tess_type));
         ctx.AddExecutionMode(main, ExecutionMode(ctx.runtime_info.sw.tes.tess_partitioning));
@@ -658,7 +766,12 @@ void PatchPhiNodes(const IR::Program& program, EmitContext& ctx) {
 std::vector<u32> EmitSPIRV(const Profile& profile, const RuntimeInfo& runtime_info,
                            const IR::Program& program, Bindings& binding) {
     EmitContext ctx{profile, runtime_info, program.info, binding};
-    const Id main{DefineMain(ctx, program)};
+    Id main{DefineMain(ctx, program)};
+    if (program.info.sw_stage == SwStage::TessellationEval &&
+        runtime_info.sw.tes.as_vertex != TessAsVertexPattern::None) {
+        ctx.Name(main, "domain_main");
+        main = EmitTessAsVertexMain(ctx, main);
+    }
     DefineEntryPoint(program.info, ctx, main);
     SetupCapabilities(program.info, profile, runtime_info, ctx);
     SetupFloatMode(ctx, profile, runtime_info, main);

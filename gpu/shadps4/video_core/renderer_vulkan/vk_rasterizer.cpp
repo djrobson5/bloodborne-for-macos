@@ -1799,7 +1799,8 @@ void Rasterizer::Draw(bool is_indexed, u32 index_offset, const PreparedDraw* pre
             return;
         }
     }
-    const GraphicsPipeline* pipeline = pipeline_cache.GetGraphicsPipeline({}, prepared);
+    const GraphicsPipeline* pipeline =
+        pipeline_cache.GetGraphicsPipeline({.indexed = is_indexed}, prepared);
     const PreparedDraw* used_prepared = pipeline_cache.UsedPrepared();
     if (prepared) {
         draw_prep->Count(pipeline != nullptr &&
@@ -2079,6 +2080,23 @@ void Rasterizer::DrawRecord(const GraphicsPipeline* pipeline, const PreparedDraw
     const u32 num_instances = regs.num_instances.NumInstances();
     const u32 first_vertex = vertex_offset;
     const u32 first_instance = instance_offset;
+    // bbport: tessellation as a triangle list (PipelineCache::TessAsVertexWanted): one instance
+    // per patch, whose one control point is fetched at instance rate from the first vertex on,
+    // and one vertex per corner of the tessellator's triangles (EmitTessAsVertexMain).
+    const auto tess_as_vertex = Shader::TessAsVertexPattern(pipeline->GetGraphicsKey().tess_as_vertex);
+    const u32 tess_corners = tess_as_vertex == Shader::TessAsVertexPattern::Quad1 ? 6u : 36u;
+    if (tess_as_vertex != Shader::TessAsVertexPattern::None &&
+        (is_indexed || num_instances != 1)) [[unlikely]] {
+        static std::once_flag logged;
+        std::call_once(logged, [&] {
+            LOG_ERROR(Render_Vulkan, "Tessellation as vertices for a draw it doesn't fit "
+                                     "(indexed {}, instances {}): left out",
+                      is_indexed, num_instances);
+        });
+        ResetBindings(false);
+        scheduler.KickRecording();
+        return;
+    }
     const auto* ps_info = pipeline->GetStages()[u32(Shader::SwStage::Fragment)];
     const Breadcrumbs::Crumb crumb{
         .kind = is_indexed ? Breadcrumbs::Kind::DrawIndexed : Breadcrumbs::Kind::Draw,
@@ -2097,7 +2115,9 @@ void Rasterizer::DrawRecord(const GraphicsPipeline* pipeline, const PreparedDraw
         if (query.pool) {
             cmdbuf.beginQuery(query.pool, query.index, query.flags);
         }
-        if (is_indexed) {
+        if (tess_as_vertex != Shader::TessAsVertexPattern::None) {
+            cmdbuf.draw(tess_corners, num_indices, 0, first_vertex);
+        } else if (is_indexed) {
             cmdbuf.drawIndexed(num_indices, num_instances, 0, s32(first_vertex), first_instance);
         } else {
             cmdbuf.draw(num_indices, num_instances, first_vertex, first_instance);
@@ -2148,6 +2168,7 @@ void Rasterizer::DrawIndirect(bool is_indexed, VAddr arg_address, u32 offset, u3
     const DrawIndirectParams params = {
         .vertex_sgpr_offset = vertex_sgpr_offset,
         .instance_sgpr_offset = instance_sgpr_offset,
+        .indirect = true,
     };
     const GraphicsPipeline* pipeline = pipeline_cache.GetGraphicsPipeline(params);
     if (!pipeline) {
@@ -5085,7 +5106,7 @@ void Rasterizer::UpdateDynamicState(const GraphicsPipeline* pipeline, const bool
     BB_SECTION(UpdateDynamicState);
     UpdateViewportScissorState();
     UpdateDepthStencilState();
-    UpdatePrimitiveState(is_indexed);
+    UpdatePrimitiveState(is_indexed, pipeline->GetGraphicsKey().tess_as_vertex != 0);
     UpdateRasterizationState();
     UpdateColorBlendingState(pipeline);
 
@@ -5329,8 +5350,11 @@ void Rasterizer::UpdateDepthStencilState() const {
     }
 }
 
-void Rasterizer::UpdatePrimitiveState(const bool is_indexed) const {
+void Rasterizer::UpdatePrimitiveState(const bool is_indexed, const bool triangle_list) const {
     const auto& regs = Regs();
+    // bbport: tessellation drawn as a triangle list (PipelineCache::TessAsVertexWanted).
+    const auto primitive_type =
+        triangle_list ? AmdGpu::PrimitiveType::TriangleList : regs.primitive_type;
     auto& dynamic_state = scheduler.GetDynamicState();
 
     const auto is_list_topology = [](const AmdGpu::PrimitiveType type) {
@@ -5349,8 +5373,8 @@ void Rasterizer::UpdatePrimitiveState(const bool is_indexed) const {
 
     const auto prim_restart =
         (regs.enable_primitive_restart & 1) != 0 &&
-        (instance.IsListRestartSupported() || !is_list_topology(regs.primitive_type)) &&
-        (instance.IsPatchListRestartSupported() || !is_patch_list_topology(regs.primitive_type));
+        (instance.IsListRestartSupported() || !is_list_topology(primitive_type)) &&
+        (instance.IsPatchListRestartSupported() || !is_patch_list_topology(primitive_type));
     ASSERT_MSG(!is_indexed || !prim_restart || regs.primitive_restart_index == 0xFFFF ||
                    regs.primitive_restart_index == 0xFFFFFFFF,
                "Primitive restart index other than -1 is not supported yet");

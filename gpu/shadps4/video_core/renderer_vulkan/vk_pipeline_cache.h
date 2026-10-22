@@ -74,6 +74,9 @@ struct Program {
 struct DrawIndirectParams {
     u16 vertex_sgpr_offset;
     u32 instance_sgpr_offset;
+    // bbport: what PipelineCache::TessAsVertexWanted needs to know of the draw.
+    bool indirect;
+    bool indexed;
 };
 
 } // namespace Vulkan
@@ -94,6 +97,10 @@ struct PipelineSelection {
     std::optional<Shader::Gcn::FetchShaderData> fetch_shader{};
     GraphicsPipelineKey graphics_key{};
     bool motion = false;
+    /// bbport: the domain shader as the vertex shader (PipelineCache::TessAsVertexWanted).
+    Shader::TessAsVertexPattern tess_as_vertex{};
+    std::array<u8, 32> tess_input_formats{};
+    std::array<u8, 32> tess_ls_out_map{};
     DrawIndirectParams draw_indirect_params{};
     struct PrepWorker* worker{}; ///< set: read-only selection for a draw-preparation worker
 };
@@ -195,6 +202,7 @@ private:
 
     bool RefreshGraphicsKey(PipelineSelection& sel);
     bool RefreshGraphicsStages(PipelineSelection& sel);
+    bool TessAsVertexWanted(PipelineSelection& sel) const;
     bool RefreshComputeKey();
 
     void DumpShader(std::span<const u32> code, u64 hash, Shader::HwStage stage, size_t perm_idx,

@@ -18,8 +18,8 @@ namespace Serialization {
 /* You should increment versions below once corresponding serialization scheme is changed. */
 static constexpr u32 ShaderBinaryVersion = 7u; // bbport: interpolated integer fix (Pascal)
 static constexpr u32 MotionShaderBinaryVersion = 8u; // runtime address descriptor, set 1
-static constexpr u32 ShaderMetaVersion = 8u; // bbport: profile codegen flags
-static constexpr u32 PipelineKeyVersion = 6u; // pointer-free pipeline state + generated fragment
+static constexpr u32 ShaderMetaVersion = 9u; // bbport: tessellation as vertices (Info, TES runtime)
+static constexpr u32 PipelineKeyVersion = 7u; // bbport: GraphicsPipelineKey::tess_as_vertex
 } // namespace Serialization
 
 namespace Vulkan {

@@ -11,6 +11,8 @@
 #include "shader_recompiler/ir/program.h"
 #include "shader_recompiler/profile.h"
 #include "shader_recompiler/recompiler.h"
+#include <cmath>
+#include <optional>
 
 namespace Shader {
 
@@ -58,6 +60,181 @@ void EmitControlFlowGraph(IR::Program& program, Pools& pools, Gcn::CFG& cfg,
         }
     }
     program.post_order_blocks = Shader::IR::PostOrder(program.blocks.front());
+}
+
+/// bbport: tessellation drawn without the tessellation stages (TessAsVertex in
+/// vk_pipeline_cache.cpp) runs the domain shader as the vertex shader, which then needs what
+/// the local and hull shaders would have handed it. Only shaders that move data and write
+/// constant factors qualify: everything they do is checked here, anything else (memory
+/// accesses, arithmetic, control flow) leaves them out (Info::ls_pass_through/hs_pass_through).
+static void AnalyzeTessPassThrough(const IR::Program& program, Info& info) {
+    using IR::Opcode;
+    const bool local = info.hw_stage == HwStage::Local;
+    const bool hull = info.hw_stage == HwStage::Hull;
+    if (!local && !hull) {
+        return;
+    }
+    // A local shader's F32 value as a vertex input component or a constant.
+    const auto source = [](const IR::Value& value) -> std::optional<u8> {
+        IR::Value v = value;
+        std::optional<u32> element;
+        for (int depth = 0; depth < 8; ++depth) {
+            if (v.IsImmediate()) {
+                if (element || v.Type() != IR::Type::F32) {
+                    return std::nullopt;
+                }
+                const f32 f = v.F32();
+                if (f == 0.0f && !std::signbit(f)) {
+                    return TessPassZero;
+                }
+                return f == 1.0f ? std::optional<u8>{TessPassOne} : std::nullopt;
+            }
+            const IR::Inst* inst = v.Inst();
+            switch (inst->GetOpcode()) {
+            case Opcode::GetAttribute: {
+                const IR::Attribute attr = inst->Arg(0).Attribute();
+                if (element || !IR::IsParam(attr) || !inst->Arg(1).IsImmediate() ||
+                    !inst->Arg(2).IsImmediate() || inst->Arg(2).U32() != 0) {
+                    return std::nullopt;
+                }
+                const u32 location = u32(attr) - u32(IR::Attribute::Param0);
+                const u32 comp = inst->Arg(1).U32();
+                if (location >= 32 || comp >= 4) {
+                    return std::nullopt;
+                }
+                return u8(location * 4 + comp);
+            }
+            case Opcode::CompositeExtractF32x2:
+            case Opcode::CompositeExtractF32x3:
+            case Opcode::CompositeExtractF32x4:
+                if (element || !inst->Arg(1).IsImmediate()) {
+                    return std::nullopt;
+                }
+                element = inst->Arg(1).U32();
+                v = inst->Arg(0);
+                continue;
+            case Opcode::CompositeConstructF32x2:
+            case Opcode::CompositeConstructF32x3:
+            case Opcode::CompositeConstructF32x4:
+                if (!element || *element >= inst->NumArgs()) {
+                    return std::nullopt;
+                }
+                v = inst->Arg(*element);
+                element.reset();
+                continue;
+            case Opcode::CompositeShuffleF32x2:
+            case Opcode::CompositeShuffleF32x3:
+            case Opcode::CompositeShuffleF32x4: {
+                const u32 n = inst->GetOpcode() == Opcode::CompositeShuffleF32x2   ? 2
+                              : inst->GetOpcode() == Opcode::CompositeShuffleF32x3 ? 3
+                                                                                   : 4;
+                if (!element || *element >= n || !inst->Arg(2 + *element).IsImmediate()) {
+                    return std::nullopt;
+                }
+                const u32 pick = inst->Arg(2 + *element).U32();
+                if (pick >= 2 * n) {
+                    return std::nullopt;
+                }
+                v = inst->Arg(pick < n ? 0 : 1);
+                element = pick % n;
+                continue;
+            }
+            default:
+                return std::nullopt;
+            }
+        }
+        return std::nullopt;
+    };
+    std::array<u8, 32> ls_map;
+    ls_map.fill(TessPassUndefined);
+    std::array<float, 6> factors{};
+    u32 factors_set = 0;
+    for (const IR::Block* block : program.blocks) {
+        for (const IR::Inst& inst : block->Instructions()) {
+            switch (inst.GetOpcode()) {
+            case Opcode::Prologue:
+            case Opcode::Epilogue:
+            case Opcode::Void:
+            case Opcode::Phi:
+            case Opcode::GetAttribute:
+            case Opcode::GetAttributeU32:
+            case Opcode::GetTessGenericAttribute:
+            case Opcode::CompositeExtractF32x2:
+            case Opcode::CompositeExtractF32x3:
+            case Opcode::CompositeExtractF32x4:
+            case Opcode::CompositeConstructF32x2:
+            case Opcode::CompositeConstructF32x3:
+            case Opcode::CompositeConstructF32x4:
+            case Opcode::CompositeShuffleF32x2:
+            case Opcode::CompositeShuffleF32x3:
+            case Opcode::CompositeShuffleF32x4:
+                break; // values only: what reaches an output is checked there
+            case Opcode::SetAttribute: {
+                if (!local) {
+                    return;
+                }
+                const IR::Attribute attr = inst.Arg(0).Attribute();
+                const auto src = source(inst.Arg(1));
+                if (!IR::IsParam(attr) || !inst.Arg(2).IsImmediate() || !src) {
+                    return;
+                }
+                const u32 index = (u32(attr) - u32(IR::Attribute::Param0)) * 4 + inst.Arg(2).U32();
+                if (index >= ls_map.size()) {
+                    return;
+                }
+                ls_map[index] = *src;
+                break;
+            }
+            case Opcode::SetTcsGenericAttribute: {
+                // out[invocation][attr][comp] = in[invocation or 0][attr][comp]
+                if (!hull || !inst.Arg(1).IsImmediate() || !inst.Arg(2).IsImmediate() ||
+                    inst.Arg(0).IsImmediate()) {
+                    return;
+                }
+                const IR::Inst* load = inst.Arg(0).Inst();
+                if (load->GetOpcode() != Opcode::GetTessGenericAttribute ||
+                    !load->Arg(1).IsImmediate() || !load->Arg(2).IsImmediate() ||
+                    load->Arg(1).U32() != inst.Arg(1).U32() ||
+                    load->Arg(2).U32() != inst.Arg(2).U32()) {
+                    return;
+                }
+                const IR::Value vertex = load->Arg(0);
+                const bool own = !vertex.IsImmediate() &&
+                                 vertex.Inst()->GetOpcode() == Opcode::GetAttributeU32 &&
+                                 vertex.Inst()->Arg(0).Attribute() == IR::Attribute::InvocationId;
+                if (!own && !(vertex.IsImmediate() && vertex.U32() == 0)) {
+                    return;
+                }
+                break;
+            }
+            case Opcode::SetPatch: {
+                if (!hull) {
+                    return;
+                }
+                const IR::Patch patch = inst.Arg(0).Patch();
+                if (IR::IsGeneric(patch)) {
+                    break; // per-patch outputs: the pipeline cache requires a TES not reading them
+                }
+                const u32 index = u32(patch) - u32(IR::Patch::TessellationLodLeft);
+                if (index >= factors.size() || !inst.Arg(1).IsImmediate()) {
+                    return;
+                }
+                factors[index] = inst.Arg(1).F32();
+                factors_set |= 1u << index;
+                break;
+            }
+            default:
+                return;
+            }
+        }
+    }
+    if (local) {
+        info.ls_out_map = ls_map;
+        info.ls_pass_through = true;
+    } else if (factors_set == 0x3f) {
+        info.hs_tess_factors = factors;
+        info.hs_pass_through = true;
+    }
 }
 
 IR::Program TranslateProgram(const std::span<const u32>& code, Pools& pools, Info& info,
@@ -144,6 +321,7 @@ IR::Program TranslateProgram(const std::span<const u32>& code, Pools& pools, Inf
         Shader::Optimization::InterpolatedIntegerPass(program);
     }
     Shader::Optimization::CollectShaderInfoPass(program, profile);
+    AnalyzeTessPassThrough(program, info);
     Shader::IR::DumpProgram(program, info);
 
     return program;

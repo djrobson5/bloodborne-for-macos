@@ -389,6 +389,11 @@ const Shader::RuntimeInfo& PipelineCache::BuildRuntimeInfo(PipelineSelection& se
         info.sw.tes.tess_type = regs.tess_config.type;
         info.sw.tes.tess_topology = regs.tess_config.topology;
         info.sw.tes.tess_partitioning = regs.tess_config.partitioning;
+        if (sel.tess_as_vertex != Shader::TessAsVertexPattern::None) {
+            info.sw.tes.as_vertex = sel.tess_as_vertex;
+            info.sw.tes.input_formats = sel.tess_input_formats;
+            info.sw.tes.ls_out_map = sel.tess_ls_out_map;
+        }
         break;
     }
     default:
@@ -564,7 +569,8 @@ const GraphicsPipeline* PipelineCache::GetGraphicsPipeline(const DrawIndirectPar
                                                            const PreparedDraw* prepared) {
     used_prepared = nullptr;
     if (prepared) {
-        if (const auto* pipeline = TryPreparedPipeline(*prepared)) {
+        if (const auto* pipeline = TryPreparedPipeline(*prepared);
+            pipeline && !(pipeline->GetGraphicsKey().tess_as_vertex && params.indexed)) {
             used_prepared = prepared;
             return pipeline;
         }
@@ -697,8 +703,15 @@ bool PipelineCache::RefreshGraphicsKey(PipelineSelection& sel) {
     }
 
     // Compile and bind shader stages
+    sel.tess_as_vertex = Shader::TessAsVertexPattern::None;
     if (!RefreshGraphicsStages(sel)) {
         return false;
+    }
+    if (TessAsVertexWanted(sel)) {
+        key.tess_as_vertex = u32(sel.tess_as_vertex);
+        if (!RefreshGraphicsStages(sel)) {
+            return false;
+        }
     }
     if (motion_possible) {
         const auto* vs = sel.infos[static_cast<u32>(Shader::SwStage::Vertex)];
@@ -805,6 +818,79 @@ bool PipelineCache::RefreshGraphicsKey(PipelineSelection& sel) {
         }
     }
 
+    return true;
+}
+
+/// bbport: tessellation drawn without the tessellation stages. MoltenVK runs a tessellated
+/// draw's vertex and control stages as a compute pass, which ends the Metal render pass and
+/// starts it again after: ~55 draws a frame in the heavy scene (particle quads), each with a
+/// stall behind it (T13). The domain shader runs as the vertex shader instead, once per corner
+/// of the tessellator's triangles (EmitTessAsVertexMain), for draws whose local shader only
+/// moves vertex inputs and whose hull shader only copies its one control point and writes
+/// constant factors one of the patterns covers (AnalyzeTessPassThrough). Direct non-indexed
+/// draws of one instance: the vertex inputs are fetched at instance rate, one patch each.
+/// The lookups of the first pass are what this checks; the caller compiles again with it.
+/// Heavy scene, live A/B: 39.5 -> 41.5 FPS (2026-10-21). BB_TESS_AS_VERTEX=0 turns it off, and
+/// so does experiment bit 1<<24 while the game runs (the toggle file's second number).
+bool PipelineCache::TessAsVertexWanted(PipelineSelection& sel) const {
+    using Shader::TessAsVertexPattern;
+    static const bool enabled = [] {
+        const char* env = std::getenv("BB_TESS_AS_VERTEX");
+        return !env || env[0] != '0';
+    }();
+    const auto& regs = *sel.regs;
+    constexpr u32 AutoIndex = 2; // VGT_DRAW_INITIATOR.SOURCE_SELECT = DI_SRC_SEL_AUTO_INDEX
+    const auto* ls = sel.infos[u32(SwStage::Vertex)];
+    const auto* hs = sel.infos[u32(SwStage::TessellationControl)];
+    const auto* tes = sel.infos[u32(SwStage::TessellationEval)];
+    if (!enabled || BbToggle::Experiment(1ull << 24) ||
+        regs.stage_enable.raw != AmdGpu::ShaderStageEnable::VgtStages::LsHs ||
+        regs.primitive_type != AmdGpu::PrimitiveType::PatchPrimitive ||
+        sel.draw_indirect_params.indirect || sel.draw_indirect_params.indexed ||
+        (regs.draw_initiator & 3) != AutoIndex || regs.num_instances.NumInstances() != 1 ||
+        regs.ls_hs_config.hs_input_control_points != 1 ||
+        regs.ls_hs_config.hs_output_control_points != 1 ||
+        regs.tess_config.type != AmdGpu::TessellationType::Quad ||
+        regs.tess_config.partitioning != AmdGpu::TessellationPartitioning::Integer ||
+        (regs.tess_config.topology != AmdGpu::TessellationTopology::TriangleCw &&
+         regs.tess_config.topology != AmdGpu::TessellationTopology::TriangleCcw) ||
+        !ls || !hs || !tes || !ls->ls_pass_through || !hs->hs_pass_through ||
+        tes->uses_patches != 0 || tes->loads.GetAny(Shader::IR::Attribute::PrimitiveId) ||
+        !sel.fetch_shader) {
+        return false;
+    }
+    for (const auto* stage : {ls, hs}) {
+        if (!stage->buffers.empty() || !stage->images.empty() || !stage->samplers.empty() ||
+            !stage->fmasks.empty()) {
+            return false;
+        }
+    }
+    const auto& f = hs->hs_tess_factors;
+    TessAsVertexPattern pattern = TessAsVertexPattern::None;
+    if (f[4] == 1.0f && f[5] == 1.0f && f[0] == f[1] && f[0] == f[2] && f[0] == f[3]) {
+        pattern = f[0] == 1.0f   ? TessAsVertexPattern::Quad1
+                  : f[0] == 3.0f ? TessAsVertexPattern::Quad3
+                                 : TessAsVertexPattern::None;
+    }
+    if (pattern == TessAsVertexPattern::None) {
+        return false;
+    }
+    std::array<u8, 32> formats{};
+    for (const auto& attrib : sel.fetch_shader->attributes) {
+        if (attrib.semantic >= formats.size() ||
+            attrib.GetStepRate() != Shader::Gcn::VertexAttribute::InstanceIdType::None) {
+            return false;
+        }
+        formats[attrib.semantic] = u8(u32(attrib.GetSharp(*ls).GetNumberFmt()) + 1);
+    }
+    for (const u8 source : ls->ls_out_map) {
+        if (source < Shader::TessPassZero && formats[source / 4] == 0) {
+            return false;
+        }
+    }
+    sel.tess_as_vertex = pattern;
+    sel.tess_input_formats = formats;
+    sel.tess_ls_out_map = ls->ls_out_map; // the local shader binds after the domain shader
     return true;
 }
 

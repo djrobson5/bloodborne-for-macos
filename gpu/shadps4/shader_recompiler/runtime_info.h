@@ -4,6 +4,7 @@
 #pragma once
 
 #include <algorithm>
+#include <array>
 #include <span>
 #include "common/types.h"
 #include "shader_recompiler/frontend/tessellation.h"
@@ -160,11 +161,25 @@ struct SwTessControlRuntimeInfo {
     }
 };
 
+/// bbport: tessellation drawn without the tessellation stages: the patterns the domain shader
+/// runs for as the vertex shader (one patch of one control point per instance, the tessellator's
+/// triangles as a list; EmitTessAsVertexMain).
+enum class TessAsVertexPattern : u8 {
+    None,
+    Quad1, ///< quad domain, outer and inner factors 1: 2 triangles
+    Quad3, ///< quad domain, outer factors 3, inner 1: 12 triangles around the centre
+};
+
 struct SwTessEvalRuntimeInfo {
     u32 hs_output_cp_stride;
     AmdGpu::TessellationType tess_type;
     AmdGpu::TessellationTopology tess_topology;
     AmdGpu::TessellationPartitioning tess_partitioning;
+    TessAsVertexPattern as_vertex{};
+    /// With as_vertex: per vertex input location its AmdGpu::NumberFormat + 1 (0: none), and
+    /// the local shader's outputs (Info::ls_out_map), which the domain shader reads.
+    std::array<u8, 32> input_formats{};
+    std::array<u8, 32> ls_out_map{};
 
     bool operator==(const SwTessEvalRuntimeInfo&) const noexcept = default;
 };

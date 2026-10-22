@@ -138,10 +138,10 @@ Id EmitGetAttribute(EmitContext& ctx, IR::Attribute attr, u32 comp, u32 index) {
     }
     case IR::Attribute::TessellationEvaluationPointU:
         return ctx.OpLoad(ctx.F32[1],
-                          ctx.OpAccessChain(ctx.input_f32, ctx.tess_coord, ctx.u32_zero_value));
+                          ctx.OpAccessChain(ctx.tess_input_f32, ctx.tess_coord, ctx.u32_zero_value));
     case IR::Attribute::TessellationEvaluationPointV:
         return ctx.OpLoad(ctx.F32[1],
-                          ctx.OpAccessChain(ctx.input_f32, ctx.tess_coord, ctx.ConstU32(1U)));
+                          ctx.OpAccessChain(ctx.tess_input_f32, ctx.tess_coord, ctx.ConstU32(1U)));
     case IR::Attribute::BaryCoordSmooth:
         if (ctx.profile.supports_amd_shader_explicit_vertex_parameter) {
             return ctx.OpLoad(ctx.F32[1], ctx.OpAccessChain(ctx.input_f32, ctx.bary_coord_smooth,
@@ -344,7 +344,9 @@ void EmitSetAttribute(EmitContext& ctx, IR::Attribute attr, Id value, u32 elemen
 }
 
 Id EmitGetTessGenericAttribute(EmitContext& ctx, Id vertex_index, Id attr_index, Id comp_index) {
-    const auto attr_comp_ptr = ctx.TypePointer(spv::StorageClass::Input, ctx.F32[1]);
+    const auto attr_comp_ptr = ctx.sw_stage == SwStage::TessellationEval
+                                   ? ctx.tess_input_f32
+                                   : ctx.TypePointer(spv::StorageClass::Input, ctx.F32[1]);
     return ctx.OpLoad(ctx.F32[1], ctx.OpAccessChain(attr_comp_ptr, ctx.input_attr_array,
                                                     vertex_index, attr_index, comp_index));
 }

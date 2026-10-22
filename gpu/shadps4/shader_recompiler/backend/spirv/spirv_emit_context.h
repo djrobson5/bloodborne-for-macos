@@ -251,6 +251,12 @@ public:
     Id primitive_id{};
     Id vertex_index{};
     Id instance_id{};
+    /// bbport: a domain shader run as the vertex shader (SwTessEvalRuntimeInfo::as_vertex):
+    /// the tess coord and the input control point are private variables EmitTessAsVertexMain
+    /// fills from these vertex shader inputs; tess_input_f32 is the pointer type for both.
+    Id tess_input_f32{};
+    Id as_vertex_index{};
+    std::array<Id, 32> as_vertex_inputs{};
     Id push_data_block{};
     // bbport: object motion vectors (runtime_info.h, MotionVectors).
     Id motion_out_cur{};

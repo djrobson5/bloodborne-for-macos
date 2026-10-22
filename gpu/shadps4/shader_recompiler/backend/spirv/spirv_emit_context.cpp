@@ -554,8 +554,27 @@ void EmitContext::DefineInputs() {
         break;
     }
     case SwStage::TessellationEval: {
-        tess_coord = DefineInput(F32[3], std::nullopt, spv::BuiltIn::TessCoord);
-        primitive_id = DefineVariable(U32[1], spv::BuiltIn::PrimitiveId, spv::StorageClass::Input);
+        const auto& tes = runtime_info.sw.tes;
+        const bool as_vertex = tes.as_vertex != TessAsVertexPattern::None;
+        tess_input_f32 = as_vertex ? TypePointer(spv::StorageClass::Private, F32[1]) : input_f32;
+        if (as_vertex) {
+            // bbport: the vertex shader's own inputs; the domain shader's are private.
+            tess_coord = DefineVariable(F32[3], std::nullopt, spv::StorageClass::Private);
+            as_vertex_index =
+                DefineVariable(U32[1], spv::BuiltIn::VertexIndex, spv::StorageClass::Input);
+            for (u32 location = 0; location < tes.input_formats.size(); ++location) {
+                if (tes.input_formats[location] == 0) {
+                    continue;
+                }
+                const auto fmt = AmdGpu::NumberFormat(tes.input_formats[location] - 1);
+                as_vertex_inputs[location] = DefineInput(GetAttributeType(*this, fmt)[4], location);
+                Name(as_vertex_inputs[location], fmt::format("vs_in_attr{}", location));
+            }
+        } else {
+            tess_coord = DefineInput(F32[3], std::nullopt, spv::BuiltIn::TessCoord);
+            primitive_id =
+                DefineVariable(U32[1], spv::BuiltIn::PrimitiveId, spv::StorageClass::Input);
+        }
 
         const u32 num_attrs = Common::AlignUp(runtime_info.sw.tes.hs_output_cp_stride, 16) >> 4;
         if (num_attrs > 0) {
@@ -563,7 +582,9 @@ void EmitContext::DefineInputs() {
             // The input vertex count isn't statically known, so make length 32 (what
             // glslang does)
             const Id patch_array_type{TypeArray(per_vertex_type, ConstU32(32u))};
-            input_attr_array = DefineInput(patch_array_type, 0);
+            input_attr_array =
+                as_vertex ? DefineVariable(patch_array_type, std::nullopt, spv::StorageClass::Private)
+                          : DefineInput(patch_array_type, 0);
             Name(input_attr_array, "in_attrs");
         }
 

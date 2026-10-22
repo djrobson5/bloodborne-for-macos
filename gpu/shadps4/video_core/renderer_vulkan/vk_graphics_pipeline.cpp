@@ -196,7 +196,14 @@ GraphicsPipeline::GraphicsPipeline(
         .pVertexAttributeDescriptions = sdata.vertex_attributes.data(),
     };
 
-    const auto topology = LiverpoolToVK::PrimitiveType(key.prim_type);
+    // bbport: tessellation as a triangle list (PipelineCache::TessAsVertexWanted).
+    const bool tess_as_vertex = key.tess_as_vertex != 0;
+    if (tess_as_vertex && !preloading) {
+        LOG_INFO(Render_Vulkan, "Tessellation as vertices: domain shader {:#x}, pattern {}",
+                 infos[u32(Shader::SwStage::TessellationEval)]->pgm_hash, u32(key.tess_as_vertex));
+    }
+    const auto topology = tess_as_vertex ? vk::PrimitiveTopology::eTriangleList
+                                         : LiverpoolToVK::PrimitiveType(key.prim_type);
     const vk::PipelineInputAssemblyStateCreateInfo input_assembly = {
         .topology = topology,
     };
@@ -288,7 +295,14 @@ GraphicsPipeline::GraphicsPipeline(
                                   : "main";
     }
     auto stage = u32(Shader::SwStage::Vertex);
-    if (infos[stage]) {
+    if (tess_as_vertex) {
+        // The domain shader is the vertex shader; the local and hull shaders only moved data.
+        shader_stages.emplace_back(vk::PipelineShaderStageCreateInfo{
+            .stage = vk::ShaderStageFlagBits::eVertex,
+            .module = modules[u32(Shader::SwStage::TessellationEval)],
+            .pName = "main",
+        });
+    } else if (infos[stage]) {
         shader_stages.emplace_back(vk::PipelineShaderStageCreateInfo{
             .stage = vk::ShaderStageFlagBits::eVertex,
             .module = modules[stage],
@@ -304,7 +318,8 @@ GraphicsPipeline::GraphicsPipeline(
         });
     }
     stage = u32(Shader::SwStage::TessellationControl);
-    if (infos[stage]) {
+    if (tess_as_vertex) {
+    } else if (infos[stage]) {
         shader_stages.emplace_back(vk::PipelineShaderStageCreateInfo{
             .stage = vk::ShaderStageFlagBits::eTessellationControl,
             .module = modules[stage],
@@ -323,7 +338,8 @@ GraphicsPipeline::GraphicsPipeline(
         });
     }
     stage = u32(Shader::SwStage::TessellationEval);
-    if (infos[stage]) {
+    if (tess_as_vertex) {
+    } else if (infos[stage]) {
         shader_stages.emplace_back(vk::PipelineShaderStageCreateInfo{
             .stage = vk::ShaderStageFlagBits::eTessellationEvaluation,
             .module = modules[stage],
@@ -683,8 +699,10 @@ void GraphicsPipeline::GetVertexInputs(
         bindings.push_back(Binding{
             .binding = attrib.semantic,
             .stride = buffer.GetStride(),
-            .inputRate = step_rate == InstanceIdType::None ? vk::VertexInputRate::eVertex
-                                                           : vk::VertexInputRate::eInstance,
+            // bbport: tessellation as a triangle list: one instance per patch (one vertex).
+            .inputRate = step_rate == InstanceIdType::None && !key.tess_as_vertex
+                             ? vk::VertexInputRate::eVertex
+                             : vk::VertexInputRate::eInstance,
         });
         const u32 divisor = step_rate == InstanceIdType::OverStepRate0
                                 ? step_rate_0
@@ -723,7 +741,10 @@ void GraphicsPipeline::BuildDescSetLayout(bool preloading) {
         if (!stage) {
             continue;
         }
-        const auto stage_bit = LogicalStageToStageBit[u32(stage->sw_stage)];
+        auto stage_bit = LogicalStageToStageBit[u32(stage->sw_stage)];
+        if (key.tess_as_vertex && stage->sw_stage == Shader::SwStage::TessellationEval) {
+            stage_bit = vk::ShaderStageFlagBits::eVertex; // bbport: run as the vertex shader
+        }
         for (const auto& buffer : stage->buffers) {
             const auto sharp =
                 preloading ? AmdGpu::Buffer{}
