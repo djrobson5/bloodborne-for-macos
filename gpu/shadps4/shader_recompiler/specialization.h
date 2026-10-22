@@ -343,7 +343,7 @@ struct StageSpecialization {
             put(std::bit_cast<u32>(fs.en_flags) & 0xffffu,
                 std::bit_cast<u32>(fs.addr_flags) & 0xffffu, fs.num_inputs, fs.z_export_format,
                 fs.num_samples, fs.mrtz_mask, fs.front_face_all_bits, fs.dual_source_blending,
-                fs.clip_distance_emulation, fs.motion_vectors);
+                fs.clip_distance_emulation, fs.motion_vectors, fs.motion_format);
             const u32 num_inputs = std::min<u32>(fs.num_inputs, u32(fs.inputs.size()));
             for (u32 i = 0; i < num_inputs; ++i) {
                 const auto& input = fs.inputs[i];

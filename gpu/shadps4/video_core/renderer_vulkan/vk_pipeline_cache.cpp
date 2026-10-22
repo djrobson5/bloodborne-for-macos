@@ -817,6 +817,21 @@ bool PipelineCache::RefreshGraphicsKey(PipelineSelection& sel) {
 
     if (sel.motion) {
         constexpr u32 mv = Shader::MotionVectors::Output;
+        // bbport: experiment bit 36. The loop above stops at the shader's last exported MRT,
+        // so a bound guest target between it and the motion slot (G-buffer: MRT 6) keeps the
+        // format of the first pass with write mask 0, while the render pass leaves that
+        // attachment out. Metal then lays out tile memory differently for the pipeline and
+        // the pass: the motion attachment's writes land 8 bytes off (RGBA32F: the vector in
+        // b/a, validity and depth lost, so no object vector ever passed the compose pass).
+        // Unused attachments before the motion slot get no format, as in the render pass.
+        if (BbToggle::Experiment(1ull << 36)) {
+            for (u32 cb = std::bit_width(key.mrt_mask); cb < mv; ++cb) {
+                key.color_buffers[cb] = {};
+                key.write_masks[cb] = {};
+                key.blend_controls[cb] = {};
+                key.color_samples[cb] = 0;
+            }
+        }
         // 2: packed (R32G32_UINT, ObjectMotion::Attach); 1: RGBA32F.
         key.motion_vectors = sel.motion_packed ? 2 : 1;
         key.mrt_mask |= 1u << mv;
