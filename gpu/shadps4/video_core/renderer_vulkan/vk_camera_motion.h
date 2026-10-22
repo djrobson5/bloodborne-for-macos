@@ -36,6 +36,9 @@ public:
     /// This frame's object motion image (after RecordMotion), for the debug view; or null.
     vk::ImageView ObjectMotionView() const noexcept;
     vk::Image ObjectMotionImage(u32 width, u32 height) const noexcept;
+    /// ObjectMotionView holds packed vectors (Shader::MotionVectors, R32G32_UINT bits).
+    bool ObjectMotionPacked() const noexcept;
+    u32 ObjectMotionPixelBytes(u32 width, u32 height) const noexcept;
 
     void SetJitter(std::array<float, 2> value) noexcept {
         previous_jitter = jitter;
@@ -103,6 +106,7 @@ private:
     vk::UniqueDescriptorSetLayout motion_desc_layout;
     vk::UniquePipelineLayout motion_pipeline_layout;
     vk::UniquePipeline motion_pipeline;
+    vk::UniquePipeline motion_packed_pipeline; ///< PACKED_OBJECTS variant
 
     ObjectMotion* object_motion = nullptr;
     Camera current, previous;

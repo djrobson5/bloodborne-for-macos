@@ -13,8 +13,14 @@ layout(binding = 2, std430) readonly buffer PrevFrame { uint prev_frame[]; };
 layout(binding = 3, std430) writeonly buffer NextFrame { uint next_frame[]; };
 #else
 layout(binding = 1, rg16f) uniform writeonly image2D motion_img; // pixels, previous - current
+#ifdef PACKED_OBJECTS
+// Object motion from the G-buffer, packed (Shader::MotionVectors): x = half2 pixels,
+// y = written depth bits + 1, 0 without a valid vector.
+layout(binding = 2) uniform utexture2D object_tex;
+#else
 // Object motion from the G-buffer: rg pixels, b = valid, a = written depth.
 layout(binding = 2) uniform texture2D object_tex;
+#endif
 #endif
 
 layout(push_constant) uniform Constants {
@@ -24,7 +30,8 @@ layout(push_constant) uniform Constants {
     vec2 size;         // pixels
     vec2 jitter;       // current viewport shift in render pixels (x right, y down)
     vec2 previous_jitter;
-    uint mode;         // motion: 1 = object motion vectors available; debug: 0 motion, 1 raw
+    uint mode;         // motion: 1 = object motion vectors available (2: packed, the
+                       // PACKED_OBJECTS variant); debug: 0 motion, 1 raw
                        // depth, 2 view z / 50, 3 reprojected previous frame, 4 |difference|
 };
 
@@ -88,17 +95,27 @@ void main() {
     imageStore(color_img, pixel, vec4(mix(current.rgb, mv_color, 0.75), current.a));
 #else
     vec2 result = motion;
-    if (mode == 1) {
+    if (mode != 0) {
+#ifdef PACKED_OBJECTS
+        const uvec2 packed = texelFetch(object_tex, pixel, 0).rg;
+        const vec2 object_rg = unpackHalf2x16(packed.x);
+        const bool object_valid = packed.y != 0u;
+        const float object_depth = uintBitsToFloat(packed.y - 1u);
+#else
         const vec4 object_motion = texelFetch(object_tex, pixel, 0);
+        const vec2 object_rg = object_motion.rg;
+        const bool object_valid = object_motion.b > 0.99;
+        const float object_depth = object_motion.a;
+#endif
         // A later ordinary draw may have covered this pixel without touching the motion
         // target. Its final depth then differs from the depth stored with the vector.
         // Both depths are full precision. Do not accept an old foreground vector merely
         // because perspective depth compresses distant surfaces into a small interval.
         float depth_threshold = max(2e-7, (proj.z - depth) * 0.01);
-        if (object_motion.b > 0.99 && abs(object_motion.a - depth) < depth_threshold &&
-            !any(isnan(object_motion.rg)) &&
-            !any(isinf(object_motion.rg))) {
-            result = object_motion.rg;
+        if (object_valid && abs(object_depth - depth) < depth_threshold &&
+            !any(isnan(object_rg)) &&
+            !any(isinf(object_rg))) {
+            result = object_rg;
         }
     }
     imageStore(motion_img, pixel, vec4(result, 0.0, 0.0));

@@ -4167,7 +4167,7 @@ Rasterizer::BeginSignature Rasterizer::MakeBeginSignature(const GraphicsPipeline
     }
     sig.mrt_mask = key.mrt_mask;
     sig.num_samples = key.num_samples;
-    sig.motion = key.motion_vectors;
+    sig.motion = u8(key.motion_vectors); // 2: packed attachment, another image
     sig.scene_started = scene_started;
     sig.raster_scaling = upscaler->RasterScaling();
     sig.upscaler_state = upscaler->RedirectState();
@@ -4864,7 +4864,7 @@ RenderState Rasterizer::BeginRenderingFull(const GraphicsPipeline* pipeline) {
     }
     // bbport: object motion vector attachment of G-buffer pipelines.
     if (key.motion_vectors) {
-        object_motion->Attach(state, state.width, state.height);
+        object_motion->Attach(state, state.width, state.height, key.motion_vectors == 2);
     }
     return state;
 }

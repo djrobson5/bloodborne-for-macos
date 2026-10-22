@@ -44,8 +44,9 @@ public:
         return index_ranges.Get(key, frame, scan);
     }
 
-    /// Rendering of a motion pipeline: the motion attachment (render-target size).
-    void Attach(RenderState& state, u32 width, u32 height);
+    /// Rendering of a motion pipeline: the motion attachment (render-target size); packed:
+    /// the R32G32_UINT layout of Shader::MotionVectors (key.motion_vectors 2), else RGBA32F.
+    void Attach(RenderState& state, u32 width, u32 height, bool packed);
 
     /// Start of a frame (display pass).
     void OnFrameStart();
@@ -58,9 +59,19 @@ public:
     [[nodiscard]] vk::ImageView View() const noexcept {
         return read_target && read_target->view ? *read_target->view : vk::ImageView{};
     }
+    /// Whether the image of the last PrepareRead holds packed vectors (an unsigned integer
+    /// view: readers use their PACKED_OBJECTS shader variants).
+    [[nodiscard]] bool ReadPacked() const noexcept {
+        return read_target && read_target->packed;
+    }
     [[nodiscard]] vk::Image Image(u32 width, u32 height) const noexcept {
         const Target* target = Find(width, height);
         return target && target->written ? vk::Image(target->image) : vk::Image{};
+    }
+    /// Bytes per pixel of Image(width, height) (diagnostic dumps).
+    [[nodiscard]] u32 PixelBytes(u32 width, u32 height) const noexcept {
+        const Target* target = Find(width, height);
+        return target && target->packed ? 8 : 16;
     }
 
 private:
@@ -72,23 +83,29 @@ private:
         VideoCore::UniqueImage image;
         vk::UniqueImageView view;
         u32 width = 0, height = 0;
+        bool packed = false;  ///< R32G32_UINT (MotionVectors), else RGBA32F
         bool written = false; ///< this frame's vectors are in the image
         vk::ImageLayout layout = vk::ImageLayout::eUndefined;
         u64 used_frame = 0;
     };
     static constexpr u32 MaxTargets = 4;
 
+    /// The image of this size, preferring one written this frame (experiment bit 35 can switch
+    /// the format while the game runs: then both layouts may exist at one size).
     [[nodiscard]] const Target* Find(u32 width, u32 height) const noexcept {
+        const Target* found = nullptr;
         for (const auto& target : targets) {
-            if (target.image && target.width == width && target.height == height) {
-                return &target;
+            if (target.image && target.width == width && target.height == height &&
+                (!found || (target.written && !found->written) ||
+                 (target.written == found->written && target.used_frame > found->used_frame))) {
+                found = &target;
             }
         }
-        return nullptr;
+        return found;
     }
-    /// The image of this size, created when missing (replacing the one used longest ago; it is
-    /// destroyed once the GPU is done with it, without waiting).
-    Target& GetTarget(u32 width, u32 height);
+    /// The image of this size and layout, created when missing (replacing the one used longest
+    /// ago; it is destroyed once the GPU is done with it, without waiting).
+    Target& GetTarget(u32 width, u32 height, bool packed);
 
     const Instance& instance;
     Scheduler& scheduler;

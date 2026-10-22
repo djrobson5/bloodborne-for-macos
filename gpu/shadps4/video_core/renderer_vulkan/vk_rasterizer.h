@@ -339,7 +339,7 @@ private:
         u32 mrt_mask = 0;
         u32 num_samples = 0;
         std::array<u8, AmdGpu::NUM_COLOR_BUFFERS> color_samples{};
-        bool motion = false;
+        u8 motion = 0;
         bool scene_started = false;
         bool raster_scaling = false;
         u64 upscaler_state = 0;

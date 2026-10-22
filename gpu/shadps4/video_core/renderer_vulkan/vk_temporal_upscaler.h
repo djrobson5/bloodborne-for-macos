@@ -290,6 +290,7 @@ private:
     vk::UniqueDescriptorSetLayout merge_desc_layout;
     vk::UniquePipelineLayout merge_pipeline_layout;
     vk::UniquePipeline merge_pipeline;
+    vk::UniquePipeline merge_packed_pipeline; ///< PACKED_OBJECTS: packed object vectors
     std::array<VideoCore::UniqueImage, 2> taa_history;
     std::array<vk::UniqueImageView, 2> taa_history_views;
     u32 taa_next = 0;

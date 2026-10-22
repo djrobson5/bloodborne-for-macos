@@ -237,9 +237,10 @@ u32 ObjectMotion::PrepareDraw(const DrawInfo& draw) {
     return index;
 }
 
-ObjectMotion::Target& ObjectMotion::GetTarget(u32 width, u32 height) {
+ObjectMotion::Target& ObjectMotion::GetTarget(u32 width, u32 height, bool packed) {
     for (auto& target : targets) {
-        if (target.image && target.width == width && target.height == height) {
+        if (target.image && target.width == width && target.height == height &&
+            target.packed == packed) {
             target.used_frame = frame;
             return target;
         }
@@ -266,14 +267,16 @@ ObjectMotion::Target& ObjectMotion::GetTarget(u32 width, u32 height) {
     static u32 reports = 0;
     if (BbStats::enabled && reports < 16) {
         ++reports;
-        std::printf("Object motion: motion image %ux%u%s\n", width, height,
-                    slot->width ? " (replacing one)" : "");
+        std::printf("Object motion: motion image %ux%u%s%s\n", width, height,
+                    packed ? " packed" : "", slot->width ? " (replacing one)" : "");
     }
     const auto device = instance.GetDevice();
+    const vk::Format format =
+        packed ? vk::Format::eR32G32Uint : vk::Format::eR32G32B32A32Sfloat;
     slot->image = VideoCore::UniqueImage(device, instance.GetAllocator());
     slot->image.Create(vk::ImageCreateInfo{
         .imageType = vk::ImageType::e2D,
-        .format = vk::Format::eR32G32B32A32Sfloat,
+        .format = format,
         .extent = {width, height, 1},
         .mipLevels = 1,
         .arrayLayers = 1,
@@ -286,9 +289,10 @@ ObjectMotion::Target& ObjectMotion::GetTarget(u32 width, u32 height) {
     slot->view = Check(device.createImageViewUnique({
         .image = vk::Image(slot->image),
         .viewType = vk::ImageViewType::e2D,
-        .format = vk::Format::eR32G32B32A32Sfloat,
+        .format = format,
         .subresourceRange = {vk::ImageAspectFlagBits::eColor, 0, 1, 0, 1},
     }));
+    slot->packed = packed;
     slot->width = width;
     slot->height = height;
     slot->written = false;
@@ -297,9 +301,9 @@ ObjectMotion::Target& ObjectMotion::GetTarget(u32 width, u32 height) {
     return *slot;
 }
 
-void ObjectMotion::Attach(RenderState& state, u32 width, u32 height) {
+void ObjectMotion::Attach(RenderState& state, u32 width, u32 height, bool packed) {
     constexpr u32 slot = Shader::MotionVectors::Output;
-    Target& target = GetTarget(width, height);
+    Target& target = GetTarget(width, height, packed);
     auto& attachment = state.color_attachments[slot];
     attachment = {};
     attachment.image_view = *target.view;
@@ -341,7 +345,7 @@ vk::ImageView ObjectMotion::PrepareRead(u32 width, u32 height, bool& valid) {
         }
     }
     if (!target) {
-        target = &GetTarget(1, 1);
+        target = &GetTarget(1, 1, false);
     }
     valid = target->written && width == target->width && height == target->height;
     const vk::ImageMemoryBarrier2 barrier{

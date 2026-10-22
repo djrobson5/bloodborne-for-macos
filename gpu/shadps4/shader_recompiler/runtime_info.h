@@ -97,6 +97,12 @@ struct MotionVectors {
     static_assert(sizeof(Addresses) == 16);
     static constexpr u32 FlagStore = 1;
     static constexpr u32 FlagLoad = 2;
+    // Packed output (HwFragmentRuntimeInfo::motion_format == FormatPacked): R32G32_UINT,
+    // 8 bytes per pixel instead of RGBA32F's 16. x = packHalf2x16(motion), y = written depth
+    // bits + 1, or 0 when the vector is not valid (the cleared attachment reads as no vector).
+    // 2, not 1: exp/t14's unmerged motion_frag_coord flag used this byte, so caches written
+    // by that branch hold 1 there.
+    static constexpr u8 FormatPacked = 2;
 };
 
 /// bbport: HwVertexRuntimeInfo::codegen bits.
@@ -105,6 +111,10 @@ struct VertexCodegen {
     static constexpr u8 Contract = 1;
     /// The clip position is Invariant: Metal keeps it consistent between vertex functions.
     static constexpr u8 InvariantPosition = 2;
+    /// Object motion stores the clip position with one plain 16-byte store instead of four
+    /// atomic exchanges (all invocations of a vertex store the same value). Not 4: exp/t14's
+    /// unmerged MotionFragCoord used it, and caches written by that branch would match.
+    static constexpr u8 MotionPlainStore = 8;
 };
 
 struct HwLocalRuntimeInfo {
@@ -260,6 +270,9 @@ struct HwFragmentRuntimeInfo {
     bool clip_distance_emulation{false};
     /// bbport: writes the object motion vector to MotionVectors::Output.
     bool motion_vectors{false};
+    /// bbport: MotionVectors::FormatPacked: the motion vector goes out packed (R32G32_UINT);
+    /// 0: RGBA32F.
+    u8 motion_format{};
 
     bool operator==(const HwFragmentRuntimeInfo& other) const noexcept {
         return std::ranges::equal(color_buffers, other.color_buffers) &&
@@ -270,6 +283,7 @@ struct HwFragmentRuntimeInfo {
                dual_source_blending == other.dual_source_blending &&
                clip_distance_emulation == other.clip_distance_emulation &&
                motion_vectors == other.motion_vectors &&
+               motion_format == other.motion_format &&
                std::ranges::equal(inputs.begin(), inputs.begin() + num_inputs, other.inputs.begin(),
                                   other.inputs.begin() + num_inputs);
     }

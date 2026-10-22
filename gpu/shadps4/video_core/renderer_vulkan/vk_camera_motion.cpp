@@ -11,6 +11,7 @@
 
 #include "video_core/host_shaders/camera_motion_comp.h"
 #include "video_core/host_shaders/camera_motion_debug_comp.h"
+#include "video_core/host_shaders/camera_motion_packed_comp.h"
 #include "video_core/renderer_vulkan/vk_instance.h"
 #include "video_core/renderer_vulkan/vk_object_motion.h"
 #include "video_core/renderer_vulkan/vk_runtime.h"
@@ -110,15 +111,21 @@ CameraMotion::CameraMotion(const Instance& instance_, Scheduler& scheduler_,
             .pushConstantRangeCount = 1,
             .pPushConstantRanges = &range,
         }));
-        const auto motion_module = CompileSPV(CAMERA_MOTION_COMP, device);
-        motion_pipeline = Check(device.createComputePipelineUnique(
-            {}, vk::ComputePipelineCreateInfo{
-                    .stage = {.stage = vk::ShaderStageFlagBits::eCompute,
-                              .module = motion_module,
-                              .pName = "main"},
-                    .layout = *motion_pipeline_layout,
-                }));
-        device.destroyShaderModule(motion_module);
+        const auto create = [&](std::span<const u32> code) {
+            const auto module = CompileSPV(code, device);
+            auto pipeline = Check(device.createComputePipelineUnique(
+                {}, vk::ComputePipelineCreateInfo{
+                        .stage = {.stage = vk::ShaderStageFlagBits::eCompute,
+                                  .module = module,
+                                  .pName = "main"},
+                        .layout = *motion_pipeline_layout,
+                    }));
+            device.destroyShaderModule(module);
+            return pipeline;
+        };
+        motion_pipeline = create(CAMERA_MOTION_COMP);
+        // bbport: reads the packed object vectors (Shader::MotionVectors, experiment bit 35).
+        motion_packed_pipeline = create(CAMERA_MOTION_PACKED_COMP);
     }
     if (!debug_overlay) {
         return;
@@ -211,6 +218,14 @@ vk::ImageView CameraMotion::ObjectMotionView() const noexcept {
     return object_motion && object_motion->Enabled() ? object_motion->View() : vk::ImageView{};
 }
 
+bool CameraMotion::ObjectMotionPacked() const noexcept {
+    return object_motion && object_motion->Enabled() && object_motion->ReadPacked();
+}
+
+u32 CameraMotion::ObjectMotionPixelBytes(u32 width, u32 height) const noexcept {
+    return object_motion ? object_motion->PixelBytes(width, height) : 16;
+}
+
 vk::Image CameraMotion::ObjectMotionImage(u32 width, u32 height) const noexcept {
     return object_motion && object_motion->Enabled() ? object_motion->Image(width, height)
                                                       : vk::Image{};
@@ -220,8 +235,13 @@ void CameraMotion::RecordMotion(vk::ImageView depth_view, vk::ImageView motion_v
                                 u32 height) {
     CommitFrameCamera();
     bool object_valid = false;
-    const vk::ImageView object_view = object_motion && object_motion->Enabled()
+    vk::ImageView object_view = object_motion && object_motion->Enabled()
         ? object_motion->PrepareRead(width, height, object_valid) : depth_view;
+    // A packed (unsigned integer) image is bound only to the PACKED_OBJECTS variant.
+    const bool packed = object_motion && object_motion->Enabled() && object_motion->ReadPacked();
+    if (packed && !object_valid) {
+        object_view = depth_view;
+    }
     const PushConstants push{
         .reproject = Multiply(previous.view, current.inv_view),
         .proj = current.proj,
@@ -229,12 +249,13 @@ void CameraMotion::RecordMotion(vk::ImageView depth_view, vk::ImageView motion_v
         .size = {float(width), float(height)},
         .jitter = jitter,
         .previous_jitter = previous_jitter,
-        .mode = object_valid ? 1u : 0u,
+        .mode = object_valid ? (packed ? 2u : 1u) : 0u,
     };
     // bbport: everything the pass reads is captured: it may be recorded on a recording thread
     // while this thread goes on with the next frame's camera.
     scheduler.RecordCrumb({.name = "camera motion"}, [push, depth_view, motion_view, object_view, width, height,
-                      pipeline = *motion_pipeline,
+                      pipeline = packed && object_valid ? *motion_packed_pipeline
+                                                        : *motion_pipeline,
                       layout = *motion_pipeline_layout](vk::CommandBuffer cmdbuf) {
         const vk::DescriptorImageInfo depth_info{.imageView = depth_view,
                                                  .imageLayout = vk::ImageLayout::eGeneral};

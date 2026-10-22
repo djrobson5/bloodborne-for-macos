@@ -292,6 +292,10 @@ const Shader::RuntimeInfo& PipelineCache::BuildRuntimeInfo(PipelineSelection& se
             info.hw.vs.codegen =
                 Shader::VertexCodegen::Contract | Shader::VertexCodegen::InvariantPosition;
         }
+        // bbport: experiment bit 31, a plain store of the motion position (VertexCodegen).
+        if (sel.motion && BbToggle::Experiment(1ull << 31)) {
+            info.hw.vs.codegen |= Shader::VertexCodegen::MotionPlainStore;
+        }
         break;
     }
     case HwStage::Fragment: {
@@ -306,6 +310,7 @@ const Shader::RuntimeInfo& PipelineCache::BuildRuntimeInfo(PipelineSelection& se
                 : 1;
         info.hw.fs.z_export_format = regs.z_export_format;
         info.hw.fs.motion_vectors = sel.motion;
+        info.hw.fs.motion_format = sel.motion_packed ? Shader::MotionVectors::FormatPacked : 0;
         u8 stencil_ref_export_enable = regs.depth_shader_control.stencil_op_val_export_enable |
                                        regs.depth_shader_control.stencil_test_val_export_enable;
         info.hw.fs.mrtz_mask = regs.depth_shader_control.z_export_enable |
@@ -676,6 +681,7 @@ bool PipelineCache::RefreshGraphicsKey(PipelineSelection& sel) {
                           regs.stage_enable.raw == AmdGpu::ShaderStageEnable::VgtStages::Vs;
     }
     sel.motion = false;
+    sel.motion_packed = false;
 
     // First pass to fill render target information needed by shader recompiler
     for (s32 cb = 0; cb < AmdGpu::NUM_COLOR_BUFFERS && !skip_cb_binding; ++cb) {
@@ -759,6 +765,21 @@ bool PipelineCache::RefreshGraphicsKey(PipelineSelection& sel) {
         if (all_motion) {
             sel.motion = true;
         }
+        // bbport: the motion attachment packed to 8 bytes per pixel (MotionVectors, R32G32_UINT)
+        // instead of RGBA32F: it shares tile memory with five G-buffer targets. Experiment bit
+        // 35; decided once per selection, so the fragment shader and the key agree.
+        // A fragment shader that itself exports MRT 7 keeps that float output there instead
+        // of the motion vector (EmitContext): only the RGBA32F attachment matches it.
+        const auto* fs = sel.infos[static_cast<u32>(Shader::SwStage::Fragment)];
+        sel.motion_packed = sel.motion && BbToggle::Experiment(1ull << 35) && fs &&
+                            !fs->stores.GetAny(Shader::IR::Attribute::RenderTarget0 +
+                                               Shader::MotionVectors::Output);
+        static std::atomic<u32> mrt7_reports{0};
+        if (sel.motion && BbToggle::Experiment(1ull << 35) && !sel.motion_packed &&
+            mrt7_reports.fetch_add(1) < 8) {
+            std::printf("Object motion: fs %016llx exports MRT 7, motion stays RGBA32F\n",
+                        fs ? static_cast<unsigned long long>(fs->pgm_hash) : 0ull);
+        }
         if (sel.motion && !RefreshGraphicsStages(sel)) {
             return false;
         }
@@ -796,15 +817,25 @@ bool PipelineCache::RefreshGraphicsKey(PipelineSelection& sel) {
 
     if (sel.motion) {
         constexpr u32 mv = Shader::MotionVectors::Output;
-        key.motion_vectors = 1;
+        // 2: packed (R32G32_UINT, ObjectMotion::Attach); 1: RGBA32F.
+        key.motion_vectors = sel.motion_packed ? 2 : 1;
         key.mrt_mask |= 1u << mv;
         key.num_color_attachments = mv + 1;
         auto& color_buffer = key.color_buffers[mv];
-        color_buffer.data_format = AmdGpu::DataFormat::Format32_32_32_32;
-        color_buffer.num_format = AmdGpu::NumberFormat::Float;
+        color_buffer.data_format = sel.motion_packed ? AmdGpu::DataFormat::Format32_32
+                                                     : AmdGpu::DataFormat::Format32_32_32_32;
+        color_buffer.num_format =
+            sel.motion_packed ? AmdGpu::NumberFormat::Uint : AmdGpu::NumberFormat::Float;
         color_buffer.swizzle = AmdGpu::IdentityMapping;
-        key.write_masks[mv] = vk::ColorComponentFlagBits::eR | vk::ColorComponentFlagBits::eG |
-                              vk::ColorComponentFlagBits::eB | vk::ColorComponentFlagBits::eA;
+        if (sel.motion_packed) {
+            // Unsigned integer attachments cannot blend; the RGBA32F path keeps whatever
+            // blend_controls[7] holds from earlier draws (a latent bug, left unchanged here).
+            key.blend_controls[mv] = {};
+        }
+        key.write_masks[mv] = sel.motion_packed
+            ? vk::ColorComponentFlagBits::eR | vk::ColorComponentFlagBits::eG
+            : vk::ColorComponentFlagBits::eR | vk::ColorComponentFlagBits::eG |
+                  vk::ColorComponentFlagBits::eB | vk::ColorComponentFlagBits::eA;
         key.color_samples[mv] = 1;
     }
 

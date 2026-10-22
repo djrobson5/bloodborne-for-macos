@@ -20,6 +20,7 @@
 #include "bbport_toggles.h"
 #include "ffx_vk_portable.h"
 #include "video_core/host_shaders/upscale_merge_comp.h"
+#include "video_core/host_shaders/upscale_merge_packed_comp.h"
 #include "video_core/host_shaders/upscale_reactive_comp.h"
 #include "video_core/host_shaders/taa_comp.h"
 #include "video_core/host_shaders/taa_sharpen_comp.h"
@@ -704,6 +705,7 @@ void TemporalUpscaler::CreatePipelines() {
         }));
     }
     merge_pipeline = compute(UPSCALE_MERGE_COMP, *merge_pipeline_layout);
+    merge_packed_pipeline = compute(UPSCALE_MERGE_PACKED_COMP, *merge_pipeline_layout);
     storage_layout(3, reactive_desc_layout, reactive_pipeline_layout, 3 * sizeof(float));
     reactive_pipeline = compute(UPSCALE_REACTIVE_COMP, *reactive_pipeline_layout);
     storage_layout(2, taa_sharpen_desc_layout, taa_sharpen_pipeline_layout, sizeof(float));
@@ -1346,7 +1348,8 @@ void TemporalUpscaler::Run() {
                        {{input_depth, w, h, 4, "depth", "f32", vk::ImageAspectFlagBits::eDepth}});
             if (const auto object = camera_motion.ObjectMotionImage(w, h); object) {
                 DumpImages(instance, scheduler, cmdbuf, dump,
-                           {{object, w, h, 16, "objects", "rgba32f"}});
+                           {{object, w, h, camera_motion.ObjectMotionPixelBytes(w, h), "objects",
+                             camera_motion.ObjectMotionPixelBytes(w, h) == 8 ? "rg32ui" : "rgba32f"}});
             }
         }
         // The result replaces the scene color's RGB (its alpha carries data for the post).
@@ -1362,8 +1365,21 @@ void TemporalUpscaler::Run() {
                                                  .imageLayout = vk::ImageLayout::eGeneral};
         const vk::DescriptorImageInfo mask_info{.imageView = *reactive_view,
                                                 .imageLayout = vk::ImageLayout::eGeneral};
+        // Debug (menu or toggle 1 << 28): the reactive mask in red over a darkened frame;
+        // or the motion vectors (menu).
+        const int debug_view = BbSettings::Get().debug_view;
+        const u32 mode = has_reactive && (debug_view == BbSettings::DebugReactive ||
+                                          BbToggle::Disabled(1u << 28))
+                             ? 1
+                         : debug_view == BbSettings::DebugMotion ? 2
+                                                                 : 0;
         // Sampled for the debug view only; the object image falls back to the motion image.
-        const vk::ImageView objects = camera_motion.ObjectMotionView();
+        // Packed object vectors (an unsigned integer image) need the PACKED_OBJECTS variant.
+        const bool packed = mode == 2 && camera_motion.ObjectMotionPacked();
+        vk::ImageView objects = camera_motion.ObjectMotionView();
+        if (camera_motion.ObjectMotionPacked() && !packed) {
+            objects = vk::ImageView{};
+        }
         const vk::DescriptorImageInfo motion_info{.imageView = *motion_view,
                                                   .imageLayout = vk::ImageLayout::eGeneral};
         const vk::DescriptorImageInfo objects_info{
@@ -1391,15 +1407,8 @@ void TemporalUpscaler::Run() {
              .descriptorType = vk::DescriptorType::eSampledImage,
              .pImageInfo = &objects_info},
         }};
-        // Debug (menu or toggle 1 << 28): the reactive mask in red over a darkened frame;
-        // or the motion vectors (menu).
-        const int debug_view = BbSettings::Get().debug_view;
-        const u32 mode = has_reactive && (debug_view == BbSettings::DebugReactive ||
-                                          BbToggle::Disabled(1u << 28))
-                             ? 1
-                         : debug_view == BbSettings::DebugMotion ? 2
-                                                                 : 0;
-        cmdbuf.bindPipeline(vk::PipelineBindPoint::eCompute, *merge_pipeline);
+        cmdbuf.bindPipeline(vk::PipelineBindPoint::eCompute,
+                            packed ? *merge_packed_pipeline : *merge_pipeline);
         cmdbuf.pushDescriptorSetKHR(vk::PipelineBindPoint::eCompute, *merge_pipeline_layout, 0,
                                     writes);
         cmdbuf.pushConstants(*merge_pipeline_layout, vk::ShaderStageFlagBits::eCompute, 0,
@@ -2073,7 +2082,8 @@ void TemporalUpscaler::RunScaled() {
                 // inputs: only dump it when it matches, to avoid an out-of-bounds GPU copy.
                 if (const auto object = camera_motion.ObjectMotionImage(w, h); object) {
                     DumpImages(instance, scheduler, cmdbuf, dump,
-                               {{object, w, h, 16, "objects", "rgba32f"}});
+                               {{object, w, h, camera_motion.ObjectMotionPixelBytes(w, h), "objects",
+                                 camera_motion.ObjectMotionPixelBytes(w, h) == 8 ? "rg32ui" : "rgba32f"}});
                 }
             }
         }

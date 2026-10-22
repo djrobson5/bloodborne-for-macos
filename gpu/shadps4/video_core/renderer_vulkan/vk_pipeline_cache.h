@@ -100,6 +100,8 @@ struct PipelineSelection {
     std::optional<Shader::Gcn::FetchShaderData> fetch_shader{};
     GraphicsPipelineKey graphics_key{};
     bool motion = false;
+    /// bbport: packed motion attachment (key.motion_vectors 2), decided once per selection.
+    bool motion_packed = false;
     /// bbport: the domain shader as the vertex shader (PipelineCache::TessAsVertexWanted).
     Shader::TessAsVertexPattern tess_as_vertex{};
     std::array<u8, 32> tess_input_formats{};
