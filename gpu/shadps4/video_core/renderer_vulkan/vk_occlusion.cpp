@@ -7,6 +7,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <thread>
 
 #include "bbport_toggles.h"
 #include "core/memory.h"
@@ -92,11 +93,14 @@ struct Occlusion::Shared {
     u64 late = 0, foreign = 0, unbacked = 0, written_dumps = 0;
     u64 held_visible = 0; ///< blocks that measured nothing but read visible (hysteresis)
     u64 late_written = 0; ///< late dumps of known blocks written all the same
+    /// bbport t20 (bit 1<<38): reads that waited for MoltenVK to mark the queries available,
+    /// and those still unavailable when the wait ran out.
+    u64 avail_waits = 0, avail_timeouts = 0;
     std::atomic<u64> pool_full{0}, pred_sets{0}, pred_resolved{0}, pred_skipped{0},
         pred_drawn{0};
     std::chrono::steady_clock::time_point window = std::chrono::steady_clock::now();
     u64 window_frames = 0, window_draws = 0;
-    std::array<u64, 14> last{};
+    std::array<u64, 16> last{};
 
     void Resolve(u64 tick);
     void Process(const Pending& dump);
@@ -298,6 +302,17 @@ void Occlusion::Shared::Resolve(u64 tick) {
     Report();
 }
 
+namespace {
+/// bbport t20: how long a resolve waits for MoltenVK's availability (BB_OCCLUSION_WAIT_US, 4000).
+std::chrono::microseconds AvailabilityWait() {
+    static const auto wait = std::chrono::microseconds([] {
+        const char* env = std::getenv("BB_OCCLUSION_WAIT_US");
+        return env ? std::max(0, std::atoi(env)) : 4000;
+    }());
+    return wait;
+}
+} // namespace
+
 void Occlusion::Shared::Process(const Pending& dump) {
     ++dumps;
     bool bad = dump.poison;
@@ -315,9 +330,29 @@ void Occlusion::Shared::Process(const Pending& dump) {
             }
             // Without waiting: the GPU has finished the submission. A query a driver did not
             // resolve (AMD while the window is unfocused, KyoPS4x #220) reads visible.
-            const vk::Result result = device.getQueryPoolResults(
-                pool, start, count, 16ull * count, results.data(), 16,
-                vk::QueryResultFlagBits::e64 | vk::QueryResultFlagBits::eWithAvailability);
+            const auto read = [&] {
+                return device.getQueryPoolResults(
+                    pool, start, count, 16ull * count, results.data(), 16,
+                    vk::QueryResultFlagBits::e64 | vk::QueryResultFlagBits::eWithAvailability);
+            };
+            vk::Result result = read();
+            // bbport t20 (experiment bit 1<<38): MoltenVK marks occlusion queries available in
+            // the Metal command buffer's completion handler, which runs after the GPU signals
+            // the timeline semaphore this resolve waited for. Read at once, hundreds of queries
+            // a frame came back unavailable and read visible; the extra draws slowed the GPU,
+            // the results came later still, and the lamp scene stayed in a heavy state (~1400
+            // draws a frame instead of ~1180, every result counted visible for three frames by
+            // the hysteresis). The resolve thread waits for the handler instead, briefly.
+            if (result == vk::Result::eNotReady && BbToggle::Experiment(1ull << 38)) {
+                ++avail_waits;
+                const auto give_up = std::chrono::steady_clock::now() + AvailabilityWait();
+                while (result == vk::Result::eNotReady &&
+                       std::chrono::steady_clock::now() < give_up) {
+                    std::this_thread::sleep_for(std::chrono::microseconds(50));
+                    result = read();
+                }
+                avail_timeouts += result == vk::Result::eNotReady ? 1 : 0;
+            }
             for (u32 i = 0; i < count; ++i) {
                 const bool failed = result != vk::Result::eSuccess &&
                                     result != vk::Result::eNotReady;
@@ -441,7 +476,7 @@ void Occlusion::Shared::Report() {
     window = now;
     const u64 frames_now = BbStats::submit_done_calls.load(std::memory_order_relaxed);
     const u64 draws_now = BbStats::draws.load(std::memory_order_relaxed);
-    const std::array<u64, 14> now_counts{
+    const std::array<u64, 16> now_counts{
         dumps,
         queries,
         visible,
@@ -456,8 +491,10 @@ void Occlusion::Shared::Report() {
         pred_drawn.load(std::memory_order_relaxed),
         held_visible,
         late_written,
+        avail_waits,
+        avail_timeouts,
     };
-    std::array<double, 14> d{};
+    std::array<double, 16> d{};
     const double frames = std::max<double>(1.0, double(frames_now - window_frames));
     for (size_t i = 0; i < d.size(); ++i) {
         d[i] = double(now_counts[i] - last[i]) / frames;
@@ -467,11 +504,12 @@ void Occlusion::Shared::Report() {
                 "culled (%.0f%%), %.1f intervals read visible (%.1f queries unavailable), %.1f "
                 "dumps not written (totals: late %llu, reused memory %llu, unmapped %llu), pool "
                 "full %.1f; SET_PREDICATION %.1f (%.1f known), predicated draws %.1f skipped / "
-                "%.1f drawn; %.0f draws/frame; held visible %.1f, late written %.1f\n",
+                "%.1f drawn; %.0f draws/frame; held visible %.1f, late written %.1f; "
+                "availability waits %.1f, timed out %.1f\n",
                 d[0], d[1], d[2], d[3], pairs > 0 ? 100.0 * d[3] / pairs : 0.0, d[4], d[5], d[6],
                 (unsigned long long)late, (unsigned long long)foreign,
                 (unsigned long long)unbacked, d[7], d[8], d[9], d[10], d[11],
-                double(draws_now - window_draws) / frames, d[12], d[13]);
+                double(draws_now - window_draws) / frames, d[12], d[13], d[14], d[15]);
     std::fflush(stdout);
     last = now_counts;
     window_frames = frames_now;
