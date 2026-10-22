@@ -424,9 +424,9 @@ void CameraMotion::Overlay(VideoCore::ImageId frame) {
     const auto depth_format = depth.info.pixel_format;
     if ((depth_format != vk::Format::eD32Sfloat && depth_format != vk::Format::eD32SfloatS8Uint) ||
         color.info.pixel_format != vk::Format::eR8G8B8A8Unorm ||
-        !BbImageDiag::HasStorage(color, "camera motion overlay") ||
         color.info.size.width != depth.info.size.width ||
-        color.info.size.height != depth.info.size.height) {
+        color.info.size.height != depth.info.size.height ||
+        !BbImageDiag::EnsureStorage(color, "camera motion overlay")) {
         static bool warned = false;
         if (!warned) {
             warned = true;

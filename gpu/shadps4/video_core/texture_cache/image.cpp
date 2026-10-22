@@ -192,11 +192,6 @@ Image::Image(const Vulkan::Instance& instance, Vulkan::Runtime& runtime_,
     }
 
     usage_flags = ImageUsageFlags(instance, info);
-    // bbport t23 (BB_IMAGE_COMPRESS): no Storage and a format list, so Metal may compress it.
-    const vk::ImageFormatListCreateInfo* format_list = BbImageDiag::CompressList(info);
-    if (format_list) {
-        usage_flags &= ~vk::ImageUsageFlagBits::eStorage;
-    }
     format_features = FormatFeatureFlags(usage_flags);
     if (info.props.is_depth) {
         aspect_mask = vk::ImageAspectFlagBits::eDepth;
@@ -207,12 +202,18 @@ Image::Image(const Vulkan::Instance& instance, Vulkan::Runtime& runtime_,
 
     constexpr auto tiling = vk::ImageTiling::eOptimal;
     const auto supported_format = instance.GetSupportedFormat(info.pixel_format, format_features);
+    // bbport t23 (BB_IMAGE_COMPRESS): no Storage and a view format list, so Metal may compress
+    // it; the first view that needs more replaces the backing (Runtime::UpgradeBacking).
+    const vk::ImageFormatListCreateInfo* format_list =
+        supported_format == info.pixel_format ? BbImageDiag::CompressList(info) : nullptr;
+    const auto backing_usage =
+        format_list ? usage_flags & ~vk::ImageUsageFlagBits::eStorage : usage_flags;
     const vk::PhysicalDeviceImageFormatInfo2 format_info{
         .pNext = format_list,
         .format = supported_format,
         .type = ConvertImageType(info.type),
         .tiling = tiling,
-        .usage = usage_flags,
+        .usage = backing_usage,
         .flags = flags,
     };
     const auto image_format_properties = [&] {
@@ -242,7 +243,7 @@ Image::Image(const Vulkan::Instance& instance, Vulkan::Runtime& runtime_,
         .arrayLayers = static_cast<u32>(info.resources.layers),
         .samples = LiverpoolToVK::NumSamples(info.num_samples, supported_samples),
         .tiling = tiling,
-        .usage = usage_flags,
+        .usage = backing_usage,
         .initialLayout = vk::ImageLayout::eUndefined,
     };
 
@@ -250,6 +251,7 @@ Image::Image(const Vulkan::Instance& instance, Vulkan::Runtime& runtime_,
     backing->num_samples = info.num_samples;
     backing->image = UniqueImage{instance.GetDevice(), instance.GetAllocator()};
     backing->image.Create(image_ci);
+    backing->view_formats = format_list;
     BbImageDiag::OnCreate(instance, *this);
 
     Vulkan::SetObjectName(instance.GetDevice(), GetImage(),
@@ -275,10 +277,29 @@ ImageView& Image::FindView(const ImageViewInfo& view_info, bool ensure_guest_sam
         const auto view_id = backing->image_view_ids[backing->last_view];
         return (*slot_image_views)[view_id];
     }
+    if (NeedsFullUsage(view_info)) {
+        runtime->UpgradeBacking(this); // a new backing, without views yet
+    }
     const auto view_id = slot_image_views->insert(runtime->GetInstance(), view_info, *this);
     backing->image_view_infos.emplace_back(view_info);
     backing->image_view_ids.emplace_back(view_id);
     return (*slot_image_views)[view_id];
+}
+
+bool Image::NeedsFullUsage(const ImageViewInfo& view_info) const {
+    return NeedsFullUsage(view_info.format, view_info.is_storage);
+}
+
+bool Image::NeedsFullUsage(vk::Format view_format, bool storage) const {
+    const auto* list = backing ? backing->view_formats : nullptr;
+    if (!list) {
+        return false;
+    }
+    if (storage) {
+        return true;
+    }
+    const auto formats = std::span{list->pViewFormats, list->viewFormatCount};
+    return std::ranges::find(formats, view_format) == formats.end();
 }
 
 void Image::GetBarriers(Barriers& barriers, vk::ImageLayout dst_layout, vk::AccessFlags2 dst_mask,

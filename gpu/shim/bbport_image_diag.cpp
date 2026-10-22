@@ -13,6 +13,7 @@
 #include <unordered_map>
 
 #include "video_core/renderer_vulkan/vk_instance.h"
+#include "video_core/renderer_vulkan/vk_runtime.h"
 #include "video_core/texture_cache/image.h"
 #ifdef __APPLE__
 #include <vulkan/vulkan_metal.h>
@@ -35,7 +36,7 @@ struct ImageEntry {
     ClassKey key;
     bool storage = false;
     bool reinterpret = false;
-    bool compressed = false; ///< created without Storage (BB_IMAGE_COMPRESS)
+    bool compressed = false; ///< created lazy (BB_IMAGE_COMPRESS)
 };
 
 using GuestKey = std::tuple<u64, int, u32, u32>; // guest address, format, width, height
@@ -51,10 +52,20 @@ std::unordered_map<u64, ImageEntry> images; // by image_uid
 std::set<std::tuple<int, u32, u32, bool>> dumped;
 std::chrono::steady_clock::time_point last_report;
 u64 compressed_images = 0, misses = 0;
+u64 upgrades = 0, upgrades_copied = 0, upgraded_bytes = 0;
+std::set<GuestKey> learned; ///< upgraded this boot: later images of the key are created full
 
 const char* KeysPath() {
     static const char* path = std::getenv("BB_IMAGE_KEYS");
     return path;
+}
+
+u32 CompressMinWidth() {
+    static const u32 width = [] {
+        const char* env = std::getenv("BB_IMAGE_COMPRESS_MIN");
+        return env ? u32(std::strtoul(env, nullptr, 10)) : 1280u;
+    }();
+    return width;
 }
 
 bool CompressOn() {
@@ -84,8 +95,9 @@ const std::set<GuestKey>& KeptKeys() {
                 std::fclose(file);
             }
         }
-        std::printf("Image compress (BB_IMAGE_COMPRESS): %zu images keep full usage (%s)\n",
-                    result.size(), KeysPath() ? KeysPath() : "no BB_IMAGE_KEYS");
+        std::printf("Image compress (BB_IMAGE_COMPRESS): colour images from %u wide lazy; %zu "
+                    "keys created full (%s)\n",
+                    CompressMinWidth(), result.size(), KeysPath() ? KeysPath() : "no BB_IMAGE_KEYS");
         return result;
     }();
     return keys;
@@ -138,8 +150,10 @@ std::string Linear(vk::Format format) {
 void ReportLocked() {
     std::printf("Image diag (colour, non-block; cumulative): format WxH Llayers Mlevels: created, "
                 "MiB of the last, with storage views, with other-format views; %llu created "
-                "compressible, %llu misses\n",
-                (unsigned long long)compressed_images, (unsigned long long)misses);
+                "lazy, %llu upgraded (%llu copied, %.1f MiB), %llu misses\n",
+                (unsigned long long)compressed_images, (unsigned long long)upgrades,
+                (unsigned long long)upgrades_copied, double(upgraded_bytes) / 1048576.0,
+                (unsigned long long)misses);
     for (const auto& [key, stats] : classes) {
         const auto [format, width, height, layers, levels] = key;
         if (width < 256 && stats.storage == 0 && stats.reinterpret == 0) {
@@ -163,12 +177,15 @@ void MaybeReportLocked() {
 } // namespace
 
 const vk::ImageFormatListCreateInfo* CompressList(const VideoCore::ImageInfo& info) {
-    if (!CompressOn() || info.props.is_block || info.props.is_depth || info.size.width < 1280 ||
-        KeptKeys().contains(KeyOf(info))) {
+    if (!CompressOn() || info.props.is_block || info.props.is_depth ||
+        info.size.width < CompressMinWidth() || KeptKeys().contains(KeyOf(info))) {
         return nullptr;
     }
     static std::map<vk::Format, FormatList> lists; // node-stable: image_ci keeps the pointer
     std::scoped_lock lock{mutex};
+    if (learned.contains(KeyOf(info))) {
+        return nullptr;
+    }
     ++compressed_images;
     auto [it, inserted] = lists.try_emplace(info.pixel_format);
     if (inserted) {
@@ -238,8 +255,7 @@ void OnCreate(const Vulkan::Instance& instance, const VideoCore::Image& image) {
     auto& stats = classes[key];
     ++stats.created;
     stats.bytes += info.guest_size;
-    images[image.image_uid] = ImageEntry{
-        .key = key, .compressed = !(image.usage_flags & vk::ImageUsageFlagBits::eStorage)};
+    images[image.image_uid] = ImageEntry{.key = key, .compressed = image.backing->view_formats != nullptr};
     MaybeReportLocked();
 }
 
@@ -260,10 +276,10 @@ void OnView(const VideoCore::Image& image, vk::Format view_format, bool storage)
     auto& entry = it->second;
     auto& stats = classes[entry.key];
     RecordKeyLocked(image.info);
-    if (entry.compressed && ((storage && !entry.storage) || (reinterpret && !entry.reinterpret))) {
+    if (image.NeedsFullUsage(view_format, storage)) {
         ++misses;
         if (misses <= 10) {
-            std::printf("Image compress miss: %s %ux%u at %#llx needs a %s view (%s)\n",
+            std::printf("Image compress miss: %s %ux%u at %#llx: a %s view (%s) of a lazy backing\n",
                         vk::to_string(image.info.pixel_format).c_str(), image.info.size.width,
                         image.info.size.height, (unsigned long long)image.info.guest_address,
                         storage ? "storage" : "reinterpreting", vk::to_string(view_format).c_str());
@@ -286,21 +302,28 @@ void OnView(const VideoCore::Image& image, vk::Format view_format, bool storage)
     MaybeReportLocked();
 }
 
-bool HasStorage(const VideoCore::Image& image, const char* pass) {
-    const bool has = bool(image.usage_flags & vk::ImageUsageFlagBits::eStorage);
-    if (!Enabled()) {
-        return has;
-    }
+void OnUpgrade(const VideoCore::Image& image, bool copied) {
     std::scoped_lock lock{mutex};
-    if (has) {
-        RecordKeyLocked(image.info);
-    } else if (const auto it = images.find(image.image_uid);
-               it != images.end() && it->second.compressed && !it->second.storage) {
-        it->second.storage = true; // reported once per image
-        ++misses;
-        std::printf("Image compress miss: %s %ux%u at %#llx: %s skipped (no Storage)\n",
+    learned.insert(KeyOf(image.info));
+    ++upgrades;
+    upgrades_copied += copied;
+    upgraded_bytes += image.GetHostImageSize();
+    if (upgrades <= 20) {
+        std::printf("Image upgrade: %s %ux%u at %#llx to full usage%s\n",
                     vk::to_string(image.info.pixel_format).c_str(), image.info.size.width,
-                    image.info.size.height, (unsigned long long)image.info.guest_address, pass);
+                    image.info.size.height, (unsigned long long)image.info.guest_address,
+                    copied ? ", contents copied" : "");
+    }
+}
+
+bool EnsureStorage(VideoCore::Image& image, const char* pass) {
+    if (image.backing && image.backing->view_formats) {
+        image.runtime->UpgradeBacking(&image);
+    }
+    const bool has = bool(image.backing->image.image_ci.usage & vk::ImageUsageFlagBits::eStorage);
+    if (Enabled() && has) {
+        std::scoped_lock lock{mutex};
+        RecordKeyLocked(image.info);
     }
     return has;
 }

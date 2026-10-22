@@ -108,6 +108,9 @@ public:
                     const vk::ClearValue& clear_value);
 
     void SetBackingSamples(VideoCore::Image* image, u32 num_samples, bool copy_backing = true);
+    /// bbport t23: gives `image` a backing with its full usage in place of a lazy one
+    /// (BackingImage::view_formats), with the contents copied. No-op for a full backing.
+    void UpgradeBacking(VideoCore::Image* image);
 
     void AccessBuffer(const VideoCore::Buffer* handle, u64 offset, u64 size,
                       vk::PipelineStageFlags2 src_stage, vk::AccessFlags2 src_access);

@@ -9,6 +9,7 @@
 #include <map>
 #include <mutex>
 #include <string>
+#include "bbport_image_diag.h"
 #include "bbport_toggles.h"
 #include "video_core/buffer_cache/buffer.h"
 #include "video_core/renderer_vulkan/liverpool_to_vk.h"
@@ -783,6 +784,7 @@ void Runtime::SetBackingSamples(VideoCore::Image* image, u32 num_samples, bool c
         new_backing->num_samples = num_samples;
         new_backing->image = VideoCore::UniqueImage{instance.GetDevice(), instance.GetAllocator()};
         new_backing->image.Create(new_image_ci);
+        new_backing->view_formats = backing->view_formats; // the same usage (image_ci)
 
         Vulkan::SetObjectName(instance.GetDevice(), new_backing->image.image,
                               "Image {}x{}x{} {} {} {:#x}:{:#x} L:{} M:{} S:{} (backing)",
@@ -839,6 +841,112 @@ void Runtime::SetBackingSamples(VideoCore::Image* image, u32 num_samples, bool c
     }
 
     backing = new_backing;
+}
+
+void Runtime::UpgradeBacking(VideoCore::Image* image) {
+    BeforeImageAccess();
+    auto* const old_backing = image->backing;
+    if (!old_backing || !old_backing->view_formats) {
+        return;
+    }
+    const auto& info = image->info;
+    auto new_image_ci = old_backing->image.image_ci;
+    new_image_ci.pNext = nullptr;
+    new_image_ci.usage = image->usage_flags;
+
+    auto* const new_backing = &image->backing_images.emplace_back();
+    new_backing->num_samples = old_backing->num_samples;
+    new_backing->image = VideoCore::UniqueImage{instance.GetDevice(), instance.GetAllocator()};
+    new_backing->image.Create(new_image_ci);
+    Vulkan::SetObjectName(instance.GetDevice(), new_backing->image.image,
+                          "Image {}x{}x{} {} {} {:#x}:{:#x} L:{} M:{} S:{} (full usage)",
+                          info.size.width, info.size.height, info.size.depth,
+                          AmdGpu::NameOf(info.tile_mode), vk::to_string(info.pixel_format),
+                          info.guest_address, info.guest_size, info.resources.layers,
+                          info.resources.levels, new_backing->num_samples);
+
+    const bool undefined = old_backing->state.layout == vk::ImageLayout::eUndefined &&
+                           old_backing->subresource_states.empty();
+    const bool copy = !old_backing->clear_pending && !undefined;
+    if (old_backing->clear_pending) {
+        // A whole-image clear overwrites the contents anyway: it moves over, no copy.
+        new_backing->clear_pending = true;
+        new_backing->pending_clear = old_backing->pending_clear;
+        old_backing->clear_pending = false;
+    } else if (copy) {
+        scheduler.EndRendering();
+        const TransferMark mark{*this, "image usage upgrade", *image};
+        Transit(image, vk::ImageLayout::eTransferSrcOptimal, vk::PipelineStageFlagBits2::eCopy,
+                vk::AccessFlagBits2::eTransferRead);
+        const vk::ImageSubresourceRange whole = {
+            .aspectMask = image->aspect_mask,
+            .baseMipLevel = 0,
+            .levelCount = info.resources.levels,
+            .baseArrayLayer = 0,
+            .layerCount = info.resources.layers,
+        };
+        image_barriers.push_back(vk::ImageMemoryBarrier2{
+            .srcStageMask = vk::PipelineStageFlagBits2::eNone,
+            .srcAccessMask = vk::AccessFlagBits2::eNone,
+            .dstStageMask = vk::PipelineStageFlagBits2::eCopy,
+            .dstAccessMask = vk::AccessFlagBits2::eTransferWrite,
+            .oldLayout = vk::ImageLayout::eUndefined,
+            .newLayout = vk::ImageLayout::eTransferDstOptimal,
+            .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+            .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+            .image = new_backing->image,
+            .subresourceRange = whole,
+        });
+        FlushBarriers();
+
+        boost::container::small_vector<vk::ImageCopy, 8> regions;
+        for (u32 mip = 0; mip < info.resources.levels; ++mip) {
+            const vk::ImageSubresourceLayers layers = {
+                .aspectMask = image->aspect_mask,
+                .mipLevel = mip,
+                .baseArrayLayer = 0,
+                .layerCount = info.resources.layers,
+            };
+            regions.push_back(vk::ImageCopy{
+                .srcSubresource = layers,
+                .dstSubresource = layers,
+                .extent{
+                    .width = std::max(new_image_ci.extent.width >> mip, 1u),
+                    .height = std::max(new_image_ci.extent.height >> mip, 1u),
+                    .depth = std::max(new_image_ci.extent.depth >> mip, 1u),
+                },
+            });
+        }
+        scheduler.Record([src_image = old_backing->image.image,
+                          dst_image = new_backing->image.image, regions](vk::CommandBuffer cmdbuf) {
+            cmdbuf.copyImage(src_image, vk::ImageLayout::eTransferSrcOptimal, dst_image,
+                             vk::ImageLayout::eTransferDstOptimal, regions);
+        });
+        new_backing->state = {
+            .pl_stage = vk::PipelineStageFlagBits2::eCopy,
+            .access_mask = vk::AccessFlagBits2::eTransferWrite,
+            .layout = vk::ImageLayout::eTransferDstOptimal,
+        };
+    }
+    image->backing = new_backing;
+    BbImageDiag::OnUpgrade(*image, copy);
+
+    // The old backing is never current again: no sample count matches it (SetBackingSamples),
+    // and lookups memoized with it compare the backing. Its image and views go once the GPU
+    // has finished the work recorded so far.
+    old_backing->num_samples = 0;
+    old_backing->view_formats = nullptr;
+    old_backing->last_view = 0;
+    old_backing->image_view_infos.clear();
+    scheduler.DeferOperation([old_image = std::move(old_backing->image),
+                              view_ids = old_backing->image_view_ids,
+                              slot_image_views = image->slot_image_views]() mutable {
+        for (const auto view_id : view_ids) {
+            slot_image_views->erase(view_id);
+        }
+        old_image.Destroy();
+    });
+    old_backing->image_view_ids.clear();
 }
 
 static bool PreciseBarriers() {

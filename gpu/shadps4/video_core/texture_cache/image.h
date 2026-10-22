@@ -130,6 +130,11 @@ struct Image {
 
     ImageView& FindView(const ImageViewInfo& view_info, bool ensure_guest_samples = true);
 
+    /// bbport t23: a view `view_info` needs the full usage the current backing lacks: a storage
+    /// view, or a format outside its view format list (BackingImage::view_formats).
+    bool NeedsFullUsage(const ImageViewInfo& view_info) const;
+    bool NeedsFullUsage(vk::Format view_format, bool storage) const;
+
     using Barriers = boost::container::small_vector<vk::ImageMemoryBarrier2, 32>;
     void GetBarriers(Barriers& out_barriers, vk::ImageLayout dst_layout, vk::AccessFlags2 dst_mask,
                      vk::PipelineStageFlags2 dst_stage,
@@ -174,7 +179,7 @@ public:
     vk::ImageAspectFlags aspect_mask = vk::ImageAspectFlagBits::eColor;
     vk::SampleCountFlags supported_samples = vk::SampleCountFlagBits::e1;
 
-    vk::ImageUsageFlags usage_flags;
+    vk::ImageUsageFlags usage_flags; ///< the full usage (a lazy backing has less: view_formats)
     vk::FormatFeatureFlags2 format_features;
     struct State {
         vk::PipelineStageFlags2 pl_stage = vk::PipelineStageFlagBits2::eAllCommands;
@@ -194,6 +199,10 @@ public:
         /// it with this clear value; any other access records the clear first (Runtime::Transit).
         bool clear_pending = false;
         vk::ClearColorValue pending_clear{};
+        /// bbport t23 (BB_IMAGE_COMPRESS): created without Storage and with these view formats
+        /// only, so Metal may compress it; null for the full usage. The first view that needs
+        /// more replaces the backing (Runtime::UpgradeBacking).
+        const vk::ImageFormatListCreateInfo* view_formats = nullptr;
     };
     std::deque<BackingImage> backing_images;
     boost::container::static_vector<u64, 16> mip_hashes{};

@@ -2700,8 +2700,11 @@ bool Rasterizer::TexturesBindableOnHelper(const Shader::Info& stage,
             image_id = depth_image_id;
             image = &texture_cache.GetImage(image_id);
         }
+        // bbport t23: a view a lazy backing cannot have upgrades it, which records commands.
         if (image->binding.needs_rebind || !texture_cache.IsUpToDate(image_id) ||
             image->backing->clear_pending || scene_targets->Tracks(image->image_uid) ||
+            image->NeedsFullUsage(Vulkan::LiverpoolToVK::SurfaceFormat(data_fmt, num_fmt),
+                                  false) ||
             (upscaler->Enabled() && upscaler->RedirectsSampled(image_id))) {
             return false;
         }

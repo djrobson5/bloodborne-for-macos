@@ -21,18 +21,25 @@ namespace BbImageDiag {
 
 /// BB_IMAGE_KEYS=<file>: with BB_IMAGE_DIAG=1, the images that got a storage view or a view in
 /// another format are appended to it (guest address, format, size); with BB_IMAGE_COMPRESS=1, it
-/// lists the images that keep their full usage.
+/// lists images created with their full usage from the start.
 ///
-/// BB_IMAGE_COMPRESS=1 (t23 bound test): colour images from 1280 wide, not in the keys file, are
-/// created without Storage and with a format list of their own format and its sRGB/linear twin,
-/// so Metal may compress them. Returns the list to chain, or null for the usual image.
+/// BB_IMAGE_COMPRESS=1 (t23 lazy usages): colour images from BB_IMAGE_COMPRESS_MIN (1280) wide
+/// are created without Storage and with a format list of their own format and its sRGB/linear
+/// twin, so Metal may compress them. The first view that needs more (a storage view, another
+/// format, a host pass writing it: EnsureStorage) replaces the backing with a full one
+/// (Runtime::UpgradeBacking); later images of the same guest address, format and size are
+/// created full. Returns the list to chain, or null for the full usage.
 const vk::ImageFormatListCreateInfo* CompressList(const VideoCore::ImageInfo& info);
 
 bool Enabled();
 void OnCreate(const Vulkan::Instance& instance, const VideoCore::Image& image);
+/// A view about to be created. One a lazy backing cannot have counts as a miss (a bug: the
+/// backing should have been upgraded first).
 void OnView(const VideoCore::Image& image, vk::Format view_format, bool storage);
-/// Whether `image` has Storage usage, for a host pass (`pass`) that writes it. The diagnostic
-/// records such images like views that need storage; a compressed one counts as a miss.
-bool HasStorage(const VideoCore::Image& image, const char* pass);
+/// Runtime::UpgradeBacking replaced the lazy backing of `image` (`copied`: with its contents).
+void OnUpgrade(const VideoCore::Image& image, bool copied);
+/// For a host pass (`pass`) that writes `image` through a storage view of its own: upgrades a
+/// lazy backing, then returns whether the image has Storage usage.
+bool EnsureStorage(VideoCore::Image& image, const char* pass);
 
 } // namespace BbImageDiag

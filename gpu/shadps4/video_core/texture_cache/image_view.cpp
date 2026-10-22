@@ -93,7 +93,9 @@ ImageViewInfo::ImageViewInfo(const AmdGpu::DepthBuffer& depth_buffer, AmdGpu::De
 ImageView::ImageView(const Vulkan::Instance& instance, const ImageViewInfo& info_,
                      const Image& image)
     : info{info_} {
-    vk::ImageViewUsageCreateInfo usage_ci{.usage = image.usage_flags};
+    // bbport t23: a lazy backing (BackingImage::view_formats) has less than the image's usage.
+    vk::ImageViewUsageCreateInfo usage_ci{.usage = image.usage_flags &
+                                                   image.backing->image.image_ci.usage};
     if (!info.is_storage) {
         usage_ci.usage &= ~vk::ImageUsageFlagBits::eStorage;
     }

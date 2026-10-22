@@ -1060,7 +1060,7 @@ void TemporalUpscaler::OnSceneComposite() {
                                 : std::array<u32, 2>{color.info.size.width, color.info.size.height};
     const u32 w = reduced ? scene_targets.Size().width : scene[0];
     const u32 h = reduced ? scene_targets.Size().height : scene[1];
-    if (w != width || h != height || !BbImageDiag::HasStorage(color, "upscaler")) {
+    if (w != width || h != height || !BbImageDiag::EnsureStorage(color, "upscaler")) {
         return;
     }
     scheduler.EndRendering();
@@ -1168,7 +1168,7 @@ void TemporalUpscaler::Run() {
     const u32 h = reduced ? scene_targets.Size().height : oh;
     if (color.info.pixel_format != vk::Format::eR16G16B16A16Sfloat ||
         depth.info.size.width != ow || depth.info.size.height != oh ||
-        !BbImageDiag::HasStorage(color, "upscaler")) {
+        !BbImageDiag::EnsureStorage(color, "upscaler")) {
         return;
     }
     if (!EnsureResources(w, h, ow, oh, true)) {
