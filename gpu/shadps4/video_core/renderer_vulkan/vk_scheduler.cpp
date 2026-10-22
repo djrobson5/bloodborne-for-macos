@@ -681,6 +681,22 @@ void Scheduler::KickRecording(bool force) {
     HandOver();
 }
 
+bool Scheduler::EarlySubmitDue() const {
+    static const u32 env_segments = [] {
+        const char* env = std::getenv("BB_EARLY_SUBMIT");
+        const u32 segments = env ? u32(std::max(0, std::atoi(env))) : 0;
+        if (segments) {
+            std::printf("GPU: a submission every %u command buffer segments (BB_EARLY_SUBMIT)\n",
+                        segments);
+        }
+        return segments;
+    }();
+    const u32 segments = env_segments ? env_segments
+                         : BbToggle::Experiment(1ull << 37) ? 4u
+                                                            : 0u;
+    return segments != 0 && async_submit && !direct_segment && current_segment + 1 >= segments;
+}
+
 void Scheduler::MaybeSplit() {
     if (workers.size() < 2 || current_segment + 1 >= MaxSegments || !IsRecordingDeferred() ||
         BbToggle::Disabled(BbToggle::ParallelRecording)) {
@@ -689,6 +705,25 @@ void Scheduler::MaybeSplit() {
     // Cutting inside a render pass closes and reopens it: only after a longer stretch.
     const size_t bytes = segment_bytes + CurrentChunk().Size();
     if (bytes < (is_rendering ? 2 * split_bytes : split_bytes)) {
+        return;
+    }
+    if (EarlySubmitDue()) {
+        // bbport t20 (experiment bit 1<<37, or BB_EARLY_SUBMIT=<segments>): the cut ends the
+        // submission instead. MoltenVK encodes a submission's Metal commands inside
+        // vkQueueSubmit, on one thread (~9 ms a frame of 1400 draws under Rosetta, after the
+        // frame's last segment was recorded: the guest waited for it). Submitted every few
+        // segments, the encoding runs while the rest of the frame is recorded. A cut already
+        // closes the render pass (each segment is a command buffer of its own), so the
+        // submission costs no extra pass; it resumes without clearing again.
+        const bool resume = is_rendering;
+        if (is_rendering) {
+            Record([](vk::CommandBuffer cmdbuf) { cmdbuf.endRendering(); });
+            is_rendering = false;
+        }
+        SubmitInfo info{};
+        SubmitExecution(info);
+        resume_rendering = resume;
+        early_submits.fetch_add(1, std::memory_order_relaxed);
         return;
     }
     if (is_rendering) {

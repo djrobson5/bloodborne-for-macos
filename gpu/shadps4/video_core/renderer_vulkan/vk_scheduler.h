@@ -1065,6 +1065,8 @@ public:
     static inline std::atomic<u64> direct_recordings{0};
     /// Command buffer segments submitted (BB_FRAME_STATS: segments per submission).
     static inline std::atomic<u64> recorded_segments{0};
+    /// bbport t20: submissions ended at a segment cut (EarlySubmitDue).
+    static inline std::atomic<u64> early_submits{0};
     static inline std::atomic<u64> recorded_submissions{0};
 
     /// Returns the current command buffer tick.
@@ -1175,6 +1177,8 @@ private:
 
     /// Cuts the command stream after the current segment when it is long enough.
     void MaybeSplit();
+    /// bbport t20: whether a cut ends the submission (MaybeSplit; BB_EARLY_SUBMIT, bit 1<<37).
+    [[nodiscard]] bool EarlySubmitDue() const;
 
     /// Hands the current segment's chunks and the ordered chunks to the recording threads.
     void HandOver();

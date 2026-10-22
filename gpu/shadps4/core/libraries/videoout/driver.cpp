@@ -783,8 +783,11 @@ void VideoOutDriver::Flip(const Request& req) {
             // bbport: parallel Vulkan recording (vk_scheduler.h): command buffer segments.
             if (const u64 submits = Vulkan::Scheduler::recorded_submissions.exchange(0)) {
                 const u64 segments = Vulkan::Scheduler::recorded_segments.exchange(0);
-                std::printf("Recording: %.1f submissions/frame, %.2f command buffers each\n",
-                            frames ? double(submits) / frames : 0.0, double(segments) / submits);
+                const u64 early = Vulkan::Scheduler::early_submits.exchange(0);
+                std::printf("Recording: %.1f submissions/frame (%.1f early), %.2f command buffers "
+                            "each\n",
+                            frames ? double(submits) / frames : 0.0,
+                            frames ? double(early) / frames : 0.0, double(segments) / submits);
             }
             BbWaitTrace::Report(window);
             // Frame pacing: spread of the guest flip intervals (judder that the mean hides).
