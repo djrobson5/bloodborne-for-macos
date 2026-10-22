@@ -9,6 +9,7 @@
 #include <variant>
 #include <boost/container/static_vector.hpp>
 #include <tsl/robin_map.h>
+#include "common/hash.h"
 #include "shader_recompiler/profile.h"
 #include "shader_recompiler/recompiler.h"
 #include "shader_recompiler/specialization.h"
@@ -45,6 +46,7 @@ struct Program {
     struct Module {
         vk::ShaderModule module;
         Shader::StageSpecialization spec;
+        u64 key; ///< bbport: Key(pgm_hash, spec), its name in the pipeline cache
     };
     static constexpr size_t MaxPermutations = 8;
     using ModuleList = boost::container::small_vector<Module, MaxPermutations>;
@@ -60,14 +62,15 @@ struct Program {
     Program(Shader::HwStage stage, Shader::SwStage l_stage, Shader::ShaderParams params)
         : info{stage, l_stage, params} {}
 
-    void AddPermut(vk::ShaderModule module, Shader::StageSpecialization&& spec) {
-        modules.emplace_back(module, std::move(spec));
+    /// bbport: a permutation's cache key (shader meta, SPIR-V and the pipeline key's stage
+    /// hashes). It names the specialization itself, not its index in `modules`, which depends
+    /// on the order a run created the permutations in.
+    static u64 Key(u64 pgm_hash, const Shader::StageSpecialization& spec) {
+        return HashCombine(pgm_hash, spec.Hash());
     }
 
-    void InsertPermut(vk::ShaderModule module, Shader::StageSpecialization&& spec,
-                      size_t perm_idx) {
-        modules.resize(std::max(modules.size(), perm_idx + 1)); // <-- beware of realloc
-        modules[perm_idx] = {module, std::move(spec)};
+    void AddPermut(vk::ShaderModule module, Shader::StageSpecialization&& spec, u64 key) {
+        modules.emplace_back(module, std::move(spec), key);
     }
 };
 
@@ -211,7 +214,7 @@ private:
                                                    std::string_view ext);
     vk::ShaderModule CompileModule(Shader::Info& info, Shader::RuntimeInfo& runtime_info,
                                    const std::span<const u32>& code, size_t perm_idx,
-                                   Shader::Backend::Bindings& binding);
+                                   Shader::Backend::Bindings& binding, std::vector<u32>& spv_out);
     const Shader::RuntimeInfo& BuildRuntimeInfo(PipelineSelection& sel, Shader::HwStage stage,
                                                 Shader::SwStage l_stage);
 

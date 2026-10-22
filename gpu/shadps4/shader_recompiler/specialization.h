@@ -3,7 +3,10 @@
 
 #pragma once
 
+#include <algorithm>
+#include <bit>
 #include <bitset>
+#include <xxhash.h>
 
 #include "common/types.h"
 #include "shader_recompiler/backend/bindings.h"
@@ -244,6 +247,179 @@ struct StageSpecialization {
             }
         }
         return true;
+    }
+
+    /// bbport: identifies this permutation in the on-disk pipeline cache (with the program
+    /// hash, Vulkan::Program::Key). The creation index used to be the key, so a run that made
+    /// a program's permutations in another order rewrote a cached pipeline's stages under it.
+    /// Keep in step with operator==: it hashes what that compares and nothing else (no
+    /// inactive union members, padding, pointers or ignored fields). The bitset is hashed
+    /// too, so permutations that differ never share a key; the rare pairs operator== still
+    /// matches across different bitsets only cost a separate cache entry.
+    [[nodiscard]] u64 Hash() const {
+        boost::container::small_vector<u64, 256> words;
+        const auto put = [&](auto... values) { (words.push_back(u64(values)), ...); };
+        const auto put_swizzle = [&](const AmdGpu::CompMapping& mapping) {
+            for (const auto swizzle : mapping.array) {
+                put(swizzle);
+            }
+        };
+        const auto put_outputs = [&](const auto& output_maps) {
+            for (const auto& map : output_maps) {
+                for (const auto output : map) {
+                    put(output);
+                }
+            }
+        };
+
+        const auto& rt = runtime_info;
+        const auto& props = rt.props;
+        put(rt.sw_stage, rt.hw_stage, props.fp_denorm_mode32, props.fp_denorm_mode16_64,
+            props.fp_round_mode32, props.fp_round_mode16_64, props.num_user_data,
+            props.num_input_vgprs, props.num_allocated_vgprs);
+        switch (rt.sw_stage) { // RuntimeInfo::HasSameSwInfo
+        case SwStage::Vertex: {
+            const auto& vs = rt.sw.vs;
+            put(vs.step_rate_0, vs.step_rate_1, vs.vertex_sgpr_offset, vs.instance_sgpr_offset,
+                vs.tess_emulated_primitive);
+            break;
+        }
+        case SwStage::TessellationControl: {
+            const auto& tcs = rt.sw.tcs;
+            put(tcs.hs_output_cp_stride, tcs.num_input_control_points, tcs.num_threads,
+                tcs.tess_type, tcs.offchip_lds_enable, tcs.ls_stride, tcs.hs_output_base);
+            break;
+        }
+        case SwStage::TessellationEval: {
+            const auto& tes = rt.sw.tes;
+            put(tes.hs_output_cp_stride, tes.tess_type, tes.tess_topology, tes.tess_partitioning,
+                tes.as_vertex);
+            for (const u8 format : tes.input_formats) {
+                put(format);
+            }
+            for (const u8 output : tes.ls_out_map) {
+                put(output);
+            }
+            break;
+        }
+        default:
+            break;
+        }
+        switch (rt.hw_stage) { // RuntimeInfo::HasSameHwInfo
+        case HwStage::Local:
+            put(rt.hw.ls.ls_stride);
+            break;
+        case HwStage::Export:
+            put(rt.hw.es.vertex_data_size);
+            break;
+        case HwStage::Geometry: {
+            // Its operator== skips the data sizes and mode, and only tests num_invocations != 0.
+            const auto& gs = rt.hw.gs;
+            put(gs.num_outputs);
+            put_outputs(gs.outputs);
+            put(gs.num_invocations != 0, gs.output_vertices, gs.in_primitive, gs.vs_copy_hash);
+            for (const auto primitive : gs.out_primitive) {
+                put(primitive);
+            }
+            break;
+        }
+        case HwStage::Vertex: {
+            const auto& vs = rt.hw.vs;
+            put(vs.num_outputs);
+            put_outputs(vs.outputs);
+            put(vs.emulate_depth_negative_one_to_one, vs.clip_disable, vs.user_clip_plane_mask,
+                vs.motion_vectors, vs.codegen);
+            break;
+        }
+        case HwStage::Fragment: {
+            const auto& fs = rt.hw.fs;
+            for (const auto& cb : fs.color_buffers) {
+                put(cb.data_format, cb.num_format, cb.num_conversion, cb.export_format,
+                    cb.blend_self_scale);
+                put_swizzle(cb.swizzle);
+            }
+            // PsInput is 16 one-bit fields; the upper half of its u32 is not part of it.
+            static_assert(sizeof(AmdGpu::PsInput) == sizeof(u32));
+            put(std::bit_cast<u32>(fs.en_flags) & 0xffffu,
+                std::bit_cast<u32>(fs.addr_flags) & 0xffffu, fs.num_inputs, fs.z_export_format,
+                fs.num_samples, fs.mrtz_mask, fs.front_face_all_bits, fs.dual_source_blending,
+                fs.clip_distance_emulation, fs.motion_vectors);
+            const u32 num_inputs = std::min<u32>(fs.num_inputs, u32(fs.inputs.size()));
+            for (u32 i = 0; i < num_inputs; ++i) {
+                const auto& input = fs.inputs[i];
+                put(input.param_index, input.is_default, input.is_flat, input.default_value);
+            }
+            break;
+        }
+        case HwStage::Compute: {
+            // Its operator== skips shared_memory_size.
+            const auto& cs = rt.hw.cs;
+            for (const u32 size : cs.workgroup_size) {
+                put(size);
+            }
+            for (const bool enable : cs.tgid_enable) {
+                put(enable);
+            }
+            break;
+        }
+        default:
+            break;
+        }
+
+        put(buffers.size(), images.size(), samplers.size(), vs_attribs.size(), fmasks.size());
+        for (const auto& attrib : vs_attribs) {
+            put(attrib.divisor, attrib.num_class);
+            put_swizzle(attrib.dst_select);
+        }
+        put(fetch_shader_data.has_value());
+        if (fetch_shader_data) {
+            // FetchShaderData::operator== skips size, and VertexAttribute's skips inst_offset
+            // and the format overrides.
+            put(fetch_shader_data->attributes.size(), fetch_shader_data->vertex_offset_sgpr,
+                fetch_shader_data->instance_offset_sgpr);
+            for (const auto& attrib : fetch_shader_data->attributes) {
+                put(attrib.semantic, attrib.dest_vgpr, attrib.num_elements, attrib.sgpr_base,
+                    attrib.dword_offset, attrib.instance_data);
+            }
+        }
+        for (const auto& fmask : fmasks) {
+            put(fmask.width, fmask.height);
+        }
+
+        // As in operator==: without bound resources the start bindings and resources don't
+        // matter.
+        if (bitset.any()) {
+            static_assert(MaxStageResources == 128);
+            const std::bitset<MaxStageResources> low_mask{~0ull};
+            put((bitset >> 64).to_ullong(), (bitset & low_mask).to_ullong());
+            put(start.unified, start.buffer, start.user_data);
+            u32 binding{};
+            for (const auto& buffer : buffers) {
+                if (!bitset[binding++]) {
+                    continue;
+                }
+                put(buffer.stride, buffer.is_formatted, buffer.swizzle_enable);
+                if (buffer.is_formatted) {
+                    put(buffer.data_format, buffer.num_format, buffer.num_conversion);
+                    put_swizzle(buffer.dst_select);
+                }
+                if (buffer.swizzle_enable) {
+                    put(buffer.index_stride, buffer.element_size);
+                }
+            }
+            for (const auto& image : images) {
+                if (!bitset[binding++]) {
+                    continue;
+                }
+                put(image.type, image.is_integer, image.is_storage, image.is_cube, image.is_srgb,
+                    image.num_conversion, image.num_bindings);
+                put_swizzle(image.dst_select);
+            }
+            for (const auto& sampler : samplers) {
+                put(sampler.force_unnormalized, sampler.force_degamma);
+            }
+        }
+        return XXH3_64bits(words.data(), words.size() * sizeof(u64));
     }
 
     void Serialize(Serialization::Archive& ar) const;

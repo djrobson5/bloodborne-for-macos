@@ -18,8 +18,8 @@ namespace Serialization {
 /* You should increment versions below once corresponding serialization scheme is changed. */
 static constexpr u32 ShaderBinaryVersion = 7u; // bbport: interpolated integer fix (Pascal)
 static constexpr u32 MotionShaderBinaryVersion = 8u; // runtime address descriptor, set 1
-static constexpr u32 ShaderMetaVersion = 9u; // bbport: tessellation as vertices (Info, TES runtime)
-static constexpr u32 PipelineKeyVersion = 7u; // bbport: GraphicsPipelineKey::tess_as_vertex
+static constexpr u32 ShaderMetaVersion = 10u; // bbport: keyed by Program::Key, no perm_idx
+static constexpr u32 PipelineKeyVersion = 8u; // bbport: stage hashes are Program::Key
 } // namespace Serialization
 
 namespace Vulkan {
@@ -64,8 +64,8 @@ void RegisterPipelineData(const GraphicsPipelineKey& key, u64 hash,
 
 void RegisterShaderMeta(const Shader::Info& info,
                         const std::optional<Shader::Gcn::FetchShaderData>& fetch_shader_data,
-                        const Shader::StageSpecialization& spec, size_t perm_hash,
-                        size_t perm_idx, u32 codegen_flags) {
+                        const Shader::StageSpecialization& spec, u64 perm_hash,
+                        u32 codegen_flags) {
     if (!Storage::DataBase::Instance().IsOpened()) {
         return;
     }
@@ -81,7 +81,6 @@ void RegisterShaderMeta(const Shader::Info& info,
     meta.Write(codegen_flags);
 
     meta.Write(perm_hash);
-    meta.Write(perm_idx);
 
     spec.Serialize(ar);
     info.Serialize(ar);
@@ -90,20 +89,18 @@ void RegisterShaderMeta(const Shader::Info& info,
                                        fmt::format("{:#018x}", perm_hash), ar.TakeOff());
 }
 
-void RegisterShaderBinary(std::vector<u32>&& spv, u64 pgm_hash, size_t perm_idx) {
+void RegisterShaderBinary(std::vector<u32>&& spv, u64 perm_hash) {
     if (!Storage::DataBase::Instance().IsOpened()) {
         return;
     }
 
     Storage::DataBase::Instance().Save(Storage::BlobType::ShaderBinary,
-                                       fmt::format("{:#018x}_{}", pgm_hash, perm_idx),
-                                       std::move(spv));
+                                       fmt::format("{:#018x}", perm_hash), std::move(spv));
 }
 
 bool LoadShaderMeta(Serialization::Archive& ar, Shader::Info& info,
                     std::optional<Shader::Gcn::FetchShaderData>& fetch_shader_data,
-                    Shader::StageSpecialization& spec, size_t& perm_idx, u64 expected_hash,
-                    u32 codegen_flags) {
+                    Shader::StageSpecialization& spec, u64 expected_hash, u32 codegen_flags) {
     Serialization::Reader meta{ar};
 
     u32 meta_version{};
@@ -128,13 +125,13 @@ bool LoadShaderMeta(Serialization::Archive& ar, Shader::Info& info,
 
     u64 perm_hash_ar{};
     meta.Read(perm_hash_ar);
-    meta.Read(perm_idx);
 
     if (!spec.Deserialize(ar) || !info.Deserialize(ar)) {
         return false;
     }
-    if (perm_idx >= 4096 || perm_hash_ar != expected_hash ||
-        HashCombine(info.pgm_hash, perm_idx) != expected_hash) {
+    // bbport: the key must name this very specialization, so a pipeline only ever gets the
+    // permutation it was built with.
+    if (perm_hash_ar != expected_hash || Program::Key(info.pgm_hash, spec) != expected_hash) {
         return false;
     }
 
@@ -329,15 +326,13 @@ bool PipelineCache::LoadPipelineStage(Serialization::Archive& ar, size_t stage, 
     Shader::StageSpecialization spec{};
     spec.info = &program->info;
     std::optional<Shader::Gcn::FetchShaderData> fetch;
-    size_t perm_idx{};
-    if (!LoadShaderMeta(ar, program->info, fetch, spec, perm_idx, expected_hash,
-                        CodegenFlags())) {
+    if (!LoadShaderMeta(ar, program->info, fetch, spec, expected_hash, CodegenFlags())) {
         return false;
     }
 
     std::vector<u32> spv;
     Storage::DataBase::Instance().Load(Storage::BlobType::ShaderBinary,
-        fmt::format("{:#018x}_{}", program->info.pgm_hash, perm_idx), spv);
+                                       fmt::format("{:#018x}", expected_hash), spv);
     if (spv.size() < 5 || spv[0] != 0x07230203) {
         return false;
     }
@@ -353,13 +348,15 @@ bool PipelineCache::LoadPipelineStage(Serialization::Archive& ar, size_t stage, 
     auto it = program_cache.find(program->info.pgm_hash);
     Program* target = it == program_cache.end() ? program.get() : it->second.get();
     vk::ShaderModule module;
-    if (perm_idx < target->modules.size() && target->modules[perm_idx].module) {
-        // The persisted index is part of the pipeline key. Equal specializations at other
-        // indices are not conflicts: equality deliberately ignores some unused bindings.
-        if (!(target->modules[perm_idx].spec == spec)) {
+    const auto loaded = std::ranges::find(target->modules, expected_hash, &Program::Module::key);
+    if (loaded != target->modules.end()) {
+        // An earlier pipeline loaded this permutation. Specializations that operator==
+        // matches under another key stay separate permutations: equality deliberately
+        // ignores some unused bindings, and their pipelines name their own key.
+        if (!(loaded->spec == spec)) {
             return false;
         }
-        module = target->modules[perm_idx].module;
+        module = loaded->module;
     } else {
         const auto [result, compiled] = instance.GetDevice().createShaderModule(
             {.codeSize = spv.size() * sizeof(u32), .pCode = spv.data()});
@@ -375,7 +372,9 @@ bool PipelineCache::LoadPipelineStage(Serialization::Archive& ar, size_t stage, 
     if (fetch) {
         sel.fetch_shader = std::move(fetch);
     }
-    target->InsertPermut(module, std::move(spec), perm_idx);
+    if (loaded == target->modules.end()) {
+        target->AddPermut(module, std::move(spec), expected_hash);
+    }
     if (!target->info_template) {
         target->info_template = std::make_unique<Shader::Info>(target->info);
     }
