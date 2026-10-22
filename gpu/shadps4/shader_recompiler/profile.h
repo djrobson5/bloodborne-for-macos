@@ -57,6 +57,9 @@ struct Profile {
     bool needs_unorm_fixup{};
     bool needs_clip_distance_emulation{};
     bool supports_shader_stencil_export{};
+    /// bbport: debug (BB_SHADER_NAMES=1): entry points are named after the guest program
+    /// (EntryPointName), so Metal traces and MoltenVK MSL dumps show which shader ran.
+    bool named_entry_points{};
 
     bool operator==(const Profile&) const = default;
 };

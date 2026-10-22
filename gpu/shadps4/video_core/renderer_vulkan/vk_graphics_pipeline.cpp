@@ -282,12 +282,17 @@ GraphicsPipeline::GraphicsPipeline(
 
     boost::container::static_vector<vk::PipelineShaderStageCreateInfo, MaxShaderStages>
         shader_stages;
+    std::array<const char*, MaxShaderStages> entry_names;
+    for (u32 i = 0; i < MaxShaderStages; ++i) {
+        entry_names[i] = infos[i] ? Shader::EntryPointName(*infos[i], profile.named_entry_points)
+                                  : "main";
+    }
     auto stage = u32(Shader::SwStage::Vertex);
     if (infos[stage]) {
         shader_stages.emplace_back(vk::PipelineShaderStageCreateInfo{
             .stage = vk::ShaderStageFlagBits::eVertex,
             .module = modules[stage],
-            .pName = "main",
+            .pName = entry_names[stage],
         });
     }
     stage = u32(Shader::SwStage::Geometry);
@@ -295,7 +300,7 @@ GraphicsPipeline::GraphicsPipeline(
         shader_stages.emplace_back(vk::PipelineShaderStageCreateInfo{
             .stage = vk::ShaderStageFlagBits::eGeometry,
             .module = modules[stage],
-            .pName = "main",
+            .pName = entry_names[stage],
         });
     }
     stage = u32(Shader::SwStage::TessellationControl);
@@ -303,7 +308,7 @@ GraphicsPipeline::GraphicsPipeline(
         shader_stages.emplace_back(vk::PipelineShaderStageCreateInfo{
             .stage = vk::ShaderStageFlagBits::eTessellationControl,
             .module = modules[stage],
-            .pName = "main",
+            .pName = entry_names[stage],
         });
     } else if (is_rect_list || is_quad_list) {
         const auto type = is_quad_list ? AuxShaderType::QuadListTCS : AuxShaderType::RectListTCS;
@@ -322,7 +327,7 @@ GraphicsPipeline::GraphicsPipeline(
         shader_stages.emplace_back(vk::PipelineShaderStageCreateInfo{
             .stage = vk::ShaderStageFlagBits::eTessellationEvaluation,
             .module = modules[stage],
-            .pName = "main",
+            .pName = entry_names[stage],
         });
     } else if (is_rect_list || is_quad_list) {
         if (!preloading) {
@@ -341,7 +346,7 @@ GraphicsPipeline::GraphicsPipeline(
         shader_stages.emplace_back(vk::PipelineShaderStageCreateInfo{
             .stage = vk::ShaderStageFlagBits::eFragment,
             .module = modules[stage],
-            .pName = "main",
+            .pName = entry_names[stage],
         });
     } else if (runtime_infos[u32(Shader::SwStage::Fragment)].hw.fs.clip_distance_emulation ||
                !sdata.fragment.empty()) {

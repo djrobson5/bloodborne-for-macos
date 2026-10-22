@@ -443,7 +443,8 @@ void DefineEntryPoint(const Info& info, EmitContext& ctx, Id main) {
     default:
         UNREACHABLE_MSG("Stage {}", u32(info.hw_stage));
     }
-    ctx.AddEntryPoint(execution_model, main, "main", interfaces);
+    ctx.AddEntryPoint(execution_model, main, EntryPointName(info, ctx.profile.named_entry_points),
+                      interfaces);
 }
 
 void SetupDenormFlushMode(EmitContext& ctx, const Profile& profile, const RuntimeInfo& runtime_info,

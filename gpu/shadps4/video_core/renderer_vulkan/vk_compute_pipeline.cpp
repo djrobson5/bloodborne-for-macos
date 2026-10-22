@@ -27,11 +27,12 @@ ComputePipeline::ComputePipeline(const Instance& instance, Scheduler& scheduler,
     const vk::PipelineShaderStageRequiredSubgroupSizeCreateInfo subgroup_size_ci = {
         .requiredSubgroupSize = 64,
     };
+    const char* entry_name = Shader::EntryPointName(info_, profile.named_entry_points);
     const vk::PipelineShaderStageCreateInfo shader_ci = {
         .pNext = instance.IsSubgroupSize64Supported() ? &subgroup_size_ci : nullptr,
         .stage = vk::ShaderStageFlagBits::eCompute,
         .module = module,
-        .pName = "main",
+        .pName = entry_name,
     };
 
     u32 binding{};

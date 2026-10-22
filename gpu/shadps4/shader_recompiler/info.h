@@ -3,7 +3,11 @@
 
 #pragma once
 
+#include <cstdio>
+#include <mutex>
 #include <span>
+#include <string>
+#include <unordered_set>
 #include <vector>
 #include <boost/container/static_vector.hpp>
 #include "common/assert.h"
@@ -265,5 +269,24 @@ struct Info : InfoPersistent {
     bool Deserialize(Serialization::Archive& ar);
 };
 DECLARE_ENUM_FLAG_OPERATORS(Info::ReadConstType);
+
+/// bbport: the SPIR-V entry point name of a recompiled program: "main", or with
+/// Profile::named_entry_points "<stage>_<pgm_hash>" (e.g. fs_00c0ffee12345678). SPIRV-Cross
+/// keeps it as the MSL function name, which Instruments shows as the shader name. The string
+/// is interned: pipeline creation can run on a compile thread after its caller returned.
+inline const char* EntryPointName(const InfoPersistent& info, bool named) {
+    if (!named) {
+        return "main";
+    }
+    static constexpr const char* prefixes[] = {"fs", "hs", "ds", "vs", "gs", "cs"};
+    const u32 stage = static_cast<u32>(info.sw_stage);
+    char name[32];
+    std::snprintf(name, sizeof(name), "%s_%016llx", stage < 6 ? prefixes[stage] : "xs",
+                  static_cast<unsigned long long>(info.pgm_hash));
+    static std::mutex mutex;
+    static std::unordered_set<std::string> names;
+    std::scoped_lock lock{mutex};
+    return names.emplace(name).first->c_str();
+}
 
 } // namespace Shader
