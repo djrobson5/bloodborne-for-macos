@@ -3,6 +3,7 @@
 #pragma once
 
 #include <cstdint>
+#include <string>
 
 /// bbport macOS: untracked Metal heaps for VkDeviceMemory (vk_instance.cpp, BB_UNTRACKED_HEAPS).
 /// MoltenVK makes every heap it creates hazard-tracked, so Metal orders each render pass after
@@ -21,5 +22,9 @@ void Release(void* object);
 /// Whether a buffer created in `heap` the way MoltenVK creates them (no tracking mode in its
 /// options) comes out untracked.
 bool PlacesUntracked(void* heap);
+
+/// bbport t23 (BB_IMAGE_DIAG): storage mode, usage, GPU-optimized contents, compression and heap
+/// of `texture` (an id<MTLTexture>), one line.
+std::string DescribeTexture(void* texture);
 
 } // namespace Vulkan::MetalHeap

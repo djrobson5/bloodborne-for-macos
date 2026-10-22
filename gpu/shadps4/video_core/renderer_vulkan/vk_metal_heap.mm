@@ -37,4 +37,33 @@ bool PlacesUntracked(void* heap) {
     return untracked;
 }
 
+std::string DescribeTexture(void* texture) {
+    const id<MTLTexture> tex = (id<MTLTexture>)texture;
+    if (!tex) {
+        return "no texture";
+    }
+    static const char* const modes[] = {"Shared", "Managed", "Private", "Memoryless"};
+    const auto mode = [](MTLStorageMode m) { return m < 4 ? modes[m] : "?"; };
+    const MTLTextureUsage usage = tex.usage;
+    std::string text = std::string("storage ") + mode(tex.storageMode) + ", usage";
+    if (usage & MTLTextureUsageShaderRead) text += " Read";
+    if (usage & MTLTextureUsageShaderWrite) text += " Write";
+    if (usage & MTLTextureUsageRenderTarget) text += " RT";
+    if (usage & MTLTextureUsagePixelFormatView) text += " PFV";
+    if (usage & MTLTextureUsageShaderAtomic) text += " Atomic";
+    text += tex.allowGPUOptimizedContents ? ", GPU-optimized" : ", not GPU-optimized";
+    text += tex.compressionType == MTLTextureCompressionTypeLossy ? ", lossy" : "";
+    text += tex.isAliasable ? ", aliasable" : "";
+    if (const id<MTLHeap> heap = tex.heap) {
+        text += std::string(", heap ") + mode(heap.storageMode) +
+                (heap.hazardTrackingMode == MTLHazardTrackingModeUntracked ? " untracked"
+                                                                          : " tracked") +
+                " offset " + std::to_string(tex.heapOffset);
+    } else {
+        text += ", no heap";
+    }
+    text += tex.parentTexture ? ", a view" : "";
+    return text;
+}
+
 } // namespace Vulkan::MetalHeap

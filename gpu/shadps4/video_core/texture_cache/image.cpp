@@ -1,6 +1,7 @@
 // SPDX-FileCopyrightText: Copyright 2024 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include "bbport_image_diag.h"
 #include "bbport_toggles.h"
 #include <mutex>
 #include <ranges>
@@ -191,6 +192,11 @@ Image::Image(const Vulkan::Instance& instance, Vulkan::Runtime& runtime_,
     }
 
     usage_flags = ImageUsageFlags(instance, info);
+    // bbport t23 (BB_IMAGE_COMPRESS): no Storage and a format list, so Metal may compress it.
+    const vk::ImageFormatListCreateInfo* format_list = BbImageDiag::CompressList(info);
+    if (format_list) {
+        usage_flags &= ~vk::ImageUsageFlagBits::eStorage;
+    }
     format_features = FormatFeatureFlags(usage_flags);
     if (info.props.is_depth) {
         aspect_mask = vk::ImageAspectFlagBits::eDepth;
@@ -202,6 +208,7 @@ Image::Image(const Vulkan::Instance& instance, Vulkan::Runtime& runtime_,
     constexpr auto tiling = vk::ImageTiling::eOptimal;
     const auto supported_format = instance.GetSupportedFormat(info.pixel_format, format_features);
     const vk::PhysicalDeviceImageFormatInfo2 format_info{
+        .pNext = format_list,
         .format = supported_format,
         .type = ConvertImageType(info.type),
         .tiling = tiling,
@@ -222,6 +229,7 @@ Image::Image(const Vulkan::Instance& instance, Vulkan::Runtime& runtime_,
                             : vk::SampleCountFlagBits::e1;
 
     const vk::ImageCreateInfo image_ci = {
+        .pNext = format_list,
         .flags = flags,
         .imageType = ConvertImageType(info.type),
         .format = supported_format,
@@ -242,6 +250,7 @@ Image::Image(const Vulkan::Instance& instance, Vulkan::Runtime& runtime_,
     backing->num_samples = info.num_samples;
     backing->image = UniqueImage{instance.GetDevice(), instance.GetAllocator()};
     backing->image.Create(image_ci);
+    BbImageDiag::OnCreate(instance, *this);
 
     Vulkan::SetObjectName(instance.GetDevice(), GetImage(),
                           "Image {}x{}x{} {} {} {:#x}:{:#x} L:{} M:{} S:{}", info.size.width,

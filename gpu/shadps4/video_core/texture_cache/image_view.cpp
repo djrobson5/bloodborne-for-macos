@@ -1,6 +1,7 @@
 // SPDX-FileCopyrightText: Copyright 2024 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include "bbport_image_diag.h"
 #include "common/logging/log.h"
 #include "shader_recompiler/resource.h"
 #include "video_core/renderer_vulkan/liverpool_to_vk.h"
@@ -136,6 +137,7 @@ ImageView::ImageView(const Vulkan::Instance& instance, const ImageViewInfo& info
                   magic_enum::enum_name(info.type), magic_enum::enum_name(image.info.type));
     }
 
+    BbImageDiag::OnView(image, format, info.is_storage);
     auto [view_result, view] = instance.GetDevice().createImageViewUnique(image_view_ci);
     ASSERT_MSG(view_result == vk::Result::eSuccess, "Failed to create image view: {}",
                vk::to_string(view_result));
