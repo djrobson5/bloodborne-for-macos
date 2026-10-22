@@ -11,6 +11,7 @@
 #include <string>
 #include <unordered_set>
 
+#include "bbport_toggles.h"
 #include "common/hash.h"
 #include "common/elf_info.h"
 #include "common/io_file.h"
@@ -281,6 +282,16 @@ const Shader::RuntimeInfo& PipelineCache::BuildRuntimeInfo(PipelineSelection& se
             regs.clipper_control.clip_space == AmdGpu::ClipSpace::MinusWToW;
         info.hw.vs.clip_disable = regs.IsClipDisabled();
         info.hw.vs.motion_vectors = sel.motion;
+        // bbport: SPIRV-Cross turns NoContraction into calls of [[clang::optnone]] fma helpers
+        // (spvFMul/spvFAdd), which Metal compiles as real calls: the heavy scene's vertex
+        // shaders make 100-730 of them per vertex (42 -> 53 FPS without them). Positions instead
+        // stay consistent between shaders (depth EQUAL passes) through Invariant, which
+        // MoltenVK compiles with preserveInvariance. BB_VS_CONTRACT=0/1 overrides the default
+        // (MoltenVK only); experiment bit 26 restores NoContraction while the game runs.
+        if (vertex_contraction && !BbToggle::Experiment(1ull << 26)) {
+            info.hw.vs.codegen =
+                Shader::VertexCodegen::Contract | Shader::VertexCodegen::InvariantPosition;
+        }
         break;
     }
     case HwStage::Fragment: {
@@ -480,6 +491,12 @@ PipelineCache::PipelineCache(const Instance& instance_, Scheduler& scheduler_,
             return env && env[0] == '1';
         }(),
     };
+    vertex_contraction = [&] {
+        if (const char* env = std::getenv("BB_VS_CONTRACT")) {
+            return env[0] == '1';
+        }
+        return instance.GetDriverID() == vk::DriverId::eMoltenvk;
+    }();
     CreateNativeCache();
     WarmUp();
     std::scoped_lock lock{Registry().mutex};

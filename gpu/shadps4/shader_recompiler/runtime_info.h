@@ -98,6 +98,14 @@ struct MotionVectors {
     static constexpr u32 FlagLoad = 2;
 };
 
+/// bbport: HwVertexRuntimeInfo::codegen bits.
+struct VertexCodegen {
+    /// Float ops leave out NoContraction (PipelineCache::vertex_contraction).
+    static constexpr u8 Contract = 1;
+    /// The clip position is Invariant: Metal keeps it consistent between vertex functions.
+    static constexpr u8 InvariantPosition = 2;
+};
+
 struct HwLocalRuntimeInfo {
     u32 ls_stride;
 
@@ -118,6 +126,9 @@ struct HwVertexRuntimeInfo {
     u32 user_clip_plane_mask{};
     /// bbport: object motion vectors (G-buffer draws), see MotionVectors below.
     bool motion_vectors{};
+    /// bbport: VertexCodegen bits (vertex shader code generation options).
+    /// RuntimeInfo::Initialize zeroes it, so serialized specializations read back as 0.
+    u8 codegen{};
 
     bool operator==(const HwVertexRuntimeInfo& other) const noexcept = default;
 };

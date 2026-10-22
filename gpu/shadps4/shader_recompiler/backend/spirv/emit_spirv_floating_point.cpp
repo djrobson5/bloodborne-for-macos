@@ -12,6 +12,11 @@ Id Decorate(EmitContext& ctx, IR::Inst* inst, Id op) {
         !ctx.info.stores.GetAny(IR::Attribute::Depth)) {
         return op;
     }
+    // bbport: VertexCodegen::Contract (PipelineCache::BuildRuntimeInfo says why).
+    if (ctx.hw_stage == HwStage::Vertex && ctx.sw_stage == SwStage::Vertex &&
+        (ctx.runtime_info.hw.vs.codegen & VertexCodegen::Contract)) {
+        return op;
+    }
     ctx.Decorate(op, spv::Decoration::NoContraction);
     return op;
 }

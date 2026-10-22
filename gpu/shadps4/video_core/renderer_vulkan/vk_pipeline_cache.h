@@ -225,6 +225,8 @@ private:
     ComputePipelineKey compute_key{};
     u32 num_new_pipelines{}; // new pipelines added to the cache since the game start
     bool object_motion_enabled{};
+    /// bbport: vertex shaders without NoContraction, position Invariant (BuildRuntimeInfo).
+    bool vertex_contraction{};
 
     // Only if Config::collectShadersForDebug()
     tsl::robin_map<vk::ShaderModule,
