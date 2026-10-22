@@ -1,6 +1,8 @@
 // SPDX-FileCopyrightText: Copyright 2024 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <cstdio>
+#include <cstdlib>
 #include <numeric>
 
 #include "common/alignment.h"
@@ -71,6 +73,10 @@ UniqueBuffer::~UniqueBuffer() {
 }
 
 void UniqueBuffer::Destroy() {
+    for (const vk::Buffer window : windows) {
+        device.destroyBuffer(window);
+    }
+    windows.clear();
     if (allocation) {
         vmaDestroyBuffer(allocator, buffer, allocation);
     } else if (buffer) {
@@ -85,10 +91,16 @@ void UniqueBuffer::Create(vk::BufferCreateInfo& buffer_ci, MemoryType mem_type,
                           VmaAllocationInfo* out_alloc_info) {
     const bool with_bda = bool(buffer_ci.usage & vk::BufferUsageFlagBits::eShaderDeviceAddress);
     // bbport macOS: no sparse buffers; the arena gets its own VRAM (Metal commits it on first use).
+    bool windowed = false;
     if (mem_type == MemoryType::Sparse && DenseArenas()) {
         mem_type = MemoryType::DeviceLocal;
+        const u32 windows_mode = ArenaWindows::Mode();
+        windowed = windows_mode == 2 ||
+                   (windows_mode == 1 && buffer_ci.size > ArenaWindows::METAL_OFFSET_LIMIT);
     }
-    if (mem_type != MemoryType::Sparse) {
+    if (windowed) {
+        CreateWindowed(buffer_ci, out_alloc_info);
+    } else if (mem_type != MemoryType::Sparse) {
         const VmaAllocationCreateFlags bda_flag =
             with_bda ? VMA_ALLOCATION_CREATE_DEDICATED_MEMORY_BIT : 0;
         const VmaAllocationCreateInfo alloc_ci = {
@@ -141,6 +153,75 @@ void UniqueBuffer::Create(vk::BufferCreateInfo& buffer_ci, MemoryType mem_type,
         ASSERT_MSG(bda_result != 0, "Failed to get buffer device address");
         bda_addr = bda_result;
     }
+}
+
+namespace ArenaWindows {
+u32 Mode() {
+    static const u32 mode = [] {
+        const char* env = std::getenv("BB_ARENA_WINDOWS");
+        return env && (env[0] == '0' || env[0] == '2') ? u32(env[0] - '0') : 1u;
+    }();
+    return mode;
+}
+} // namespace ArenaWindows
+
+void UniqueBuffer::CreateWindowed(vk::BufferCreateInfo& buffer_ci,
+                                  VmaAllocationInfo* out_alloc_info) {
+    using namespace ArenaWindows;
+    // Memory of its own, as a dedicated allocation but without VkMemoryDedicatedAllocateInfo, which
+    // would forbid binding the windows to it. MoltenVK places each buffer bound to heap memory in
+    // the heap as an MTLBuffer of its own, so a window's offsets start at its own beginning.
+    buffer = Vulkan::Check(device.createBuffer(buffer_ci));
+    const VkMemoryRequirements requirements =
+        static_cast<VkMemoryRequirements>(device.getBufferMemoryRequirements(buffer));
+    const VmaAllocationCreateInfo alloc_ci = {
+        .flags = VMA_ALLOCATION_CREATE_DEDICATED_MEMORY_BIT,
+        .usage = VMA_MEMORY_USAGE_UNKNOWN,
+        .requiredFlags = VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT,
+    };
+    VkResult result =
+        vmaAllocateMemory(allocator, &requirements, &alloc_ci, &allocation, out_alloc_info);
+    ASSERT_MSG(result == VK_SUCCESS, "Failed allocating a windowed arena of {:#x} bytes: {}",
+               buffer_ci.size, vk::to_string(vk::Result{result}));
+    result = vmaBindBufferMemory(allocator, allocation, buffer);
+    ASSERT_MSG(result == VK_SUCCESS, "Binding a windowed arena failed: {}",
+               vk::to_string(vk::Result{result}));
+
+    vk::BufferCreateInfo window_ci = buffer_ci;
+    window_ci.usage = vk::BufferUsageFlagBits::eIndexBuffer | vk::BufferUsageFlagBits::eIndirectBuffer;
+    for (u64 start = FirstWindow() * WINDOW_STRIDE; start < buffer_ci.size; start += WINDOW_STRIDE) {
+        window_ci.size = std::min<u64>(WINDOW_SIZE, buffer_ci.size - start);
+        const vk::Buffer window = Vulkan::Check(device.createBuffer(window_ci));
+        result = vmaBindBufferMemory2(allocator, allocation, start, window, nullptr);
+        ASSERT_MSG(result == VK_SUCCESS, "Binding an arena window at {:#x} failed: {}", start,
+                   vk::to_string(vk::Result{result}));
+        windows.push_back(window);
+    }
+    std::printf("Guest memory: arena of %llu MiB with %zu windows for draws past %s\n",
+                (unsigned long long)(buffer_ci.size >> 20), windows.size(),
+                Mode() == 2 ? "1 GiB (BB_ARENA_WINDOWS=2)" : "4 GiB");
+}
+
+std::pair<vk::Buffer, u64> Buffer::DrawBinding(u64 offset, u64 size) const {
+    using namespace ArenaWindows;
+    const auto& windows = buffer.windows;
+    if (windows.empty() ||
+        (Mode() == 2 ? offset < WINDOW_STRIDE : offset + size <= METAL_OFFSET_LIMIT)) {
+        return {Handle(), offset};
+    }
+    const u64 window = offset / WINDOW_STRIDE;
+    const u64 within = offset % WINDOW_STRIDE;
+    if (window < FirstWindow() || window - FirstWindow() >= windows.size() ||
+        within + size > WINDOW_SIZE) {
+        static std::atomic_flag reported;
+        if (!reported.test_and_set()) {
+            std::printf("Guest memory: a draw reads %#llx bytes at arena offset %#llx, beyond its "
+                        "windows: it reads wrong data on Metal (reported once)\n",
+                        (unsigned long long)size, (unsigned long long)offset);
+        }
+        return {Handle(), offset};
+    }
+    return {windows[window - FirstWindow()], within};
 }
 
 Buffer::Buffer(const Vulkan::Instance& instance, u64 size_bytes_, vk::DeviceMemory memory,

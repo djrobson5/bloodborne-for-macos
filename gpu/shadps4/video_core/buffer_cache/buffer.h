@@ -52,6 +52,26 @@ inline bool dense_arenas = false; ///< set once by BufferCache, before the first
 inline bool DenseArenas() {
     return Detail::dense_arenas;
 }
+
+/// bbport macOS: Metal reads index data and indirect draw arguments at their buffer offset modulo
+/// 4 GiB (tools/metal_offset_probe.m, M5 Pro: indexed, indexed indirect and indirect draws read the
+/// data 4 GiB lower; dispatches, shader bindings and blits are right). A merged dense arena is one
+/// buffer of 8 GiB or more, so draws from data past 4 GiB in it read other data: stretched or
+/// missing geometry until an area load. Such an arena gets windows: buffers over the same memory
+/// starting every WINDOW_STRIDE, WINDOW_SIZE long, through which those draws bind at low offsets.
+/// BB_ARENA_WINDOWS=0: no windows; =2 (a test of the windows themselves): every dense arena has
+/// them from 1 GiB on, and every index or indirect binding past 1 GiB goes through one.
+namespace ArenaWindows {
+inline constexpr u64 METAL_OFFSET_LIMIT = u64{1} << 32;
+inline constexpr u64 WINDOW_STRIDE = u64{1} << 30;
+inline constexpr u64 WINDOW_SIZE = u64{2} << 30;
+/// 0 off, 1 arenas past 4 GiB (the default), 2 every dense arena, every binding past 1 GiB.
+u32 Mode();
+/// The first window's index (its offset / WINDOW_STRIDE).
+inline u64 FirstWindow() {
+    return Mode() == 2 ? 1 : METAL_OFFSET_LIMIT / WINDOW_STRIDE - 1;
+}
+} // namespace ArenaWindows
 /// Whether CPU writes to GPU memory are caught by page protection. Off with BB_GUEST_IN_PLACE: the
 /// GPU side learns of writes from the writers (file reads, the game's resource loaders, its own
 /// DMA and command writes); BB_WRITE_TRACKING=1 brings the protection back.
@@ -91,7 +111,8 @@ struct UniqueBuffer {
         : device{other.device}, buffer{std::exchange(other.buffer, VK_NULL_HANDLE)},
           bda_addr{std::exchange(other.bda_addr, 0)},
           allocator{std::exchange(other.allocator, VK_NULL_HANDLE)},
-          allocation{std::exchange(other.allocation, VK_NULL_HANDLE)} {}
+          allocation{std::exchange(other.allocation, VK_NULL_HANDLE)},
+          windows{std::exchange(other.windows, {})} {}
 
     UniqueBuffer& operator=(UniqueBuffer&& other) noexcept {
         if (this != &other) {
@@ -101,6 +122,7 @@ struct UniqueBuffer {
             bda_addr = std::exchange(other.bda_addr, 0);
             allocator = std::exchange(other.allocator, VK_NULL_HANDLE);
             allocation = std::exchange(other.allocation, VK_NULL_HANDLE);
+            windows = std::exchange(other.windows, {});
         }
         return *this;
     }
@@ -115,6 +137,11 @@ struct UniqueBuffer {
     vk::DeviceAddress bda_addr{};
     VmaAllocator allocator;
     VmaAllocation allocation{};
+    /// bbport macOS: window i starts at (ArenaWindows::FirstWindow() + i) * WINDOW_STRIDE.
+    std::vector<vk::Buffer> windows;
+
+private:
+    void CreateWindowed(vk::BufferCreateInfo& buffer_ci, VmaAllocationInfo* out_alloc_info);
 };
 
 struct Buffer {
@@ -155,6 +182,10 @@ struct Buffer {
         ASSERT_MSG(buffer.bda_addr != 0, "Can't get BDA from a non BDA buffer");
         return buffer.bda_addr;
     }
+
+    /// bbport macOS: the buffer and offset an index buffer or indirect draw binds for size bytes at
+    /// offset: a window when the range ends past 4 GiB (ArenaWindows), else this buffer.
+    std::pair<vk::Buffer, u64> DrawBinding(u64 offset, u64 size) const;
 
     /// Makes host writes in provided range visible to the device.
     void Flush(u64 offset, u64 size);

@@ -2260,10 +2260,11 @@ void Rasterizer::DrawIndirectRecord(const GraphicsPipeline* pipeline, bool is_in
     if (!handle) [[unlikely]] {
         handle = BindWhenCompiled(pipeline, vk::PipelineBindPoint::eGraphics);
     }
-    const vk::Buffer args = buffer->Handle();
-    const u64 args_offset = base;
-    const vk::Buffer counts = count_address != 0 ? count_buffer->Handle() : vk::Buffer{};
-    const u64 counts_offset = count_address != 0 ? count_offset : 0;
+    // bbport macOS: arguments past 4 GiB in a merged arena are read through a window (DrawBinding).
+    const auto [args, args_offset] = buffer->DrawBinding(base, stride * max_count);
+    const auto [counts, counts_offset] = count_address != 0
+                                             ? count_buffer->DrawBinding(count_offset, 4)
+                                             : std::pair<vk::Buffer, u64>{};
     const auto* vs_crumb = pipeline->GetStages()[u32(Shader::SwStage::Vertex)];
     const auto* ps_crumb = pipeline->GetStages()[u32(Shader::SwStage::Fragment)];
     const Breadcrumbs::Crumb crumb{
@@ -3100,7 +3101,9 @@ void Rasterizer::ResolveIndexBuffer(u32 index_offset) {
     needs_barrier |= runtime.IsBufferAccessed(buffer, offset, index_buffer_size);
     NoteInputRead(buffer, offset, index_buffer_size, vk::PipelineStageFlagBits2::eIndexInput,
                   vk::AccessFlagBits2::eIndexRead);
-    index_bind = {buffer->Handle(), offset, index_type};
+    // bbport macOS: indices past 4 GiB in a merged arena are read through a window (DrawBinding).
+    const auto [handle, bind_offset] = buffer->DrawBinding(offset, index_buffer_size);
+    index_bind = {handle, bind_offset, index_type};
 }
 
 void Rasterizer::ResetBindings(bool is_compute) {

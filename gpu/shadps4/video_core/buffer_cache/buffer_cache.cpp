@@ -1216,11 +1216,29 @@ const Buffer* BufferCache::GetArena(u64 first_block, u64 last_block) {
     const auto* last_arena = address_space[last_page];
     if (first_arena == last_arena) {
         if (!first_arena) {
-            const u64 base_block = Common::AlignDownPow2<u64>(first_block, blocks_per_arena_page);
-            const u64 num_pages = last_page - first_page + 1;
+            u64 base_block = Common::AlignDownPow2<u64>(first_block, blocks_per_arena_page);
+            u64 num_pages = last_page - first_page + 1;
+            // bbport macOS test (BB_ARENA_HIGH=1): the first arena also covers the page below it,
+            // so everything in the game's first page sits 4 GiB or more into one buffer, as in a
+            // merged arena (ArenaWindows; BB_ARENA_WINDOWS=0 shows what Metal draws from there).
+            static const bool high_test = [] {
+                const char* env = std::getenv("BB_ARENA_HIGH");
+                return env && env[0] == '1';
+            }();
+            const bool below = high_test && DenseArenas() && arenas.empty() && first_page > 0 &&
+                               !address_space[first_page - 1];
+            if (below) {
+                base_block -= blocks_per_arena_page;
+                ++num_pages;
+            }
             const auto* new_arena =
                 &arenas.emplace_back(instance, base_block << block_shift,
                                      num_pages << ARENA_PAGE_BITS, MemoryType::Sparse);
+            if (below) {
+                address_space[first_page - 1] = new_arena;
+                std::printf("Guest memory: BB_ARENA_HIGH=1: the first arena starts 4 GiB below the "
+                            "game's memory\n");
+            }
             address_space[first_page] = new_arena;
             address_space[last_page] = new_arena;
             if (DenseArenas()) {
@@ -1243,6 +1261,10 @@ const Buffer* BufferCache::GetArena(u64 first_block, u64 last_block) {
     const u64 end_block = (first_addr + total_size) >> block_shift;
     auto* new_arena = &arenas.emplace_back(instance, first_addr, total_size, MemoryType::Sparse);
     if (DenseArenas()) {
+        std::printf("Guest memory: arenas merged into %llu GiB at %#llx (draws past 4 GiB in it "
+                    "need windows: %s)\n",
+                    (unsigned long long)(total_size >> 30), (unsigned long long)first_addr,
+                    new_arena->buffer.windows.empty() ? "none, BB_ARENA_WINDOWS=0" : "made");
         MigrateDenseArena(first_arena, last_arena, new_arena);
     } else {
         auto* bind = BindsForArena(new_arena);
