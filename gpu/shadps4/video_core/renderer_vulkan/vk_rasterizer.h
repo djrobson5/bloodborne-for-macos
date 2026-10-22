@@ -373,6 +373,7 @@ private:
     void UpdateViewportScissorState() const;
     void UpdateDepthStencilState() const;
     void UpdatePrimitiveState(bool is_indexed) const;
+    bool SkipNoopDraw(const GraphicsPipeline* pipeline) const;
     void UpdateRasterizationState() const;
     void UpdateColorBlendingState(const GraphicsPipeline* pipeline) const;
 

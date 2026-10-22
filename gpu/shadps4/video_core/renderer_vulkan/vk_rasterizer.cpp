@@ -1820,6 +1820,51 @@ void Rasterizer::Draw(bool is_indexed, u32 index_offset, const PreparedDraw* pre
 static bool ProxyTraceOn();
 static void FlushProxyReads(bool reduced, const VideoCore::Image* target);
 
+/// bbport: a stage that writes memory (storage buffers or images, GDS, atomics).
+static bool StageWritesMemory(const Shader::Info& info) {
+    if (info.has_storage_images) {
+        return true;
+    }
+    for (const auto& buffer : info.buffers) {
+        if (buffer.is_written) {
+            return true;
+        }
+    }
+    for (const auto& image : info.images) {
+        if (image.is_written || image.is_atomic) {
+            return true;
+        }
+    }
+    return false;
+}
+
+/// bbport: a rect list with no pixel shader, no colour target and no depth or stencil test (so
+/// no depth attachment, PrepareRenderState), whose vertex shader stores nothing to memory and
+/// with streamout off, draws nothing anyone can see. The heavy scene has ~12 a frame (vertex
+/// shader 89cda9e4), each an empty render pass between others. Left out before anything is
+/// bound or a pass begins; one the game measures with an occlusion query is still drawn.
+/// BB_SKIP_NOOP_RECTS=0 draws them (no FPS change measured either way, 2026-10-21).
+bool Rasterizer::SkipNoopDraw(const GraphicsPipeline* pipeline) const {
+    static const bool enabled = [] {
+        const char* env = std::getenv("BB_SKIP_NOOP_RECTS");
+        return !env || env[0] != '0';
+    }();
+    const auto& regs = Regs();
+    if (!enabled || regs.primitive_type != AmdGpu::PrimitiveType::RectList) {
+        return false;
+    }
+    const auto& key = pipeline->GetGraphicsKey();
+    const bool depth = (regs.depth_control.depth_enable && regs.depth_buffer.DepthValid()) ||
+                       (regs.depth_control.stencil_enable && regs.depth_buffer.StencilValid());
+    if (key.mrt_mask != 0 || key.num_color_attachments != 0 || depth ||
+        pipeline->GetStages()[u32(Shader::SwStage::Fragment)] ||
+        regs.stage_enable.raw != AmdGpu::ShaderStageEnable::VgtStages::Vs ||
+        regs.vgt_strmout_config.raw != 0 || (occlusion && occlusion->Measuring())) {
+        return false;
+    }
+    return !StageWritesMemory(pipeline->GetStage(Shader::SwStage::Vertex));
+}
+
 void Rasterizer::DrawRecord(const GraphicsPipeline* pipeline, const PreparedDraw* used_prepared,
                             bool is_indexed, u32 index_offset) {
     BB_SECTION(DrawRecord);
@@ -1865,6 +1910,9 @@ void Rasterizer::DrawRecord(const GraphicsPipeline* pipeline, const PreparedDraw
         static const char* scene_debug = std::getenv("BB_SCENE_DEBUG");
         scene_debug_frame = scene_debug && std::remove(scene_debug) == 0;
         scene_targets->debug = scene_debug_frame;
+    }
+    if (SkipNoopDraw(pipeline)) {
+        return;
     }
     bind_prepared = used_prepared;
     motion_draw = pipeline->GetGraphicsKey().motion_vectors;
