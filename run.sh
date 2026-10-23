@@ -4,12 +4,17 @@ cd -- "$(dirname -- "$0")"
 # macOS (Apple Silicon): bb-probe is an x86-64 program run by Rosetta 2. Rosetta runs the game's
 # AVX, BMI1, MOVBE and LZCNT instructions but reports them in CPUID only with
 # ROSETTA_ADVERTISE_AVX=1 (probe.c checks them). A source build takes its x86-64 Vulkan driver
-# (MoltenVK) and libraries from the prefix deps/env.sh describes (BB_DEPS_ENV names another).
+# (MoltenVK) and libraries from the prefix deps/env.sh describes (scripts/macos-deps.sh writes it;
+# BB_DEPS_ENV names another). A packaged build (BB_PREBUILT=1) has them in lib/ next to bin/.
 if [[ $(uname -s) == Darwin ]]; then
     export ROSETTA_ADVERTISE_AVX=1
     if [[ -z ${BB_PREBUILT:-} ]]; then
+        deps_env=${BB_DEPS_ENV:-deps/env.sh}
+        if [[ ! -f $deps_env && -z ${BB_DEPS_ENV:-} ]]; then deps_env=../deps/env.sh; fi
         # shellcheck disable=SC1090
-        source "${BB_DEPS_ENV:-../deps/env.sh}"
+        source "$deps_env"
+    else
+        export VK_ICD_FILENAMES=${VK_ICD_FILENAMES:-$PWD/lib/vulkan/icd.d/MoltenVK_icd.json}
     fi
 fi
 if [[ ${1:-} == --software ]]; then

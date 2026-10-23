@@ -1,14 +1,15 @@
 #!/bin/bash
 # Unattended crash test: launches the game, taps Cross through the title and main menu until a
 # full scene renders (Continue loads the save), then idles until a crash or the time limit.
-# Usage: autorun.sh <log> <idle-seconds> [VAR=value ...]   (extra env for the game)
+# Usage: BB_GAME_DIR=<game> scripts/macos-autorun.sh <log> <idle-seconds> [VAR=value ...]
 set -u
-log=$1; idle=$2; shift 2
-base=~/bloodborne-for-macos/base
+log=$(cd -- "$(dirname -- "$1")" && pwd)/$(basename -- "$1"); idle=$2; shift 2
+base=$(cd -- "$(dirname -- "$0")/.." && pwd)
+game=${BB_GAME_DIR:?set BB_GAME_DIR to the game folder}
 pad=${TMPDIR:-/tmp}/bb-autorun-pad.txt
 : > "$pad"
 cd "$base"
-env "$@" BB_PAD_FILE="$pad" BB_FRAME_STATS=1 BB_GAME_DIR=../game-fixed/uroot bash run.sh > "$log" 2>&1 &
+env "$@" BB_PAD_FILE="$pad" BB_FRAME_STATS=1 BB_GAME_DIR="$game" bash run.sh > "$log" 2>&1 &
 runner=$!
 start=$(date +%s)
 ingame=0

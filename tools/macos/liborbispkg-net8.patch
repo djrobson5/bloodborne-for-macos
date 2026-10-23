@@ -1,0 +1,76 @@
+diff --git a/LibOrbisPkg.Core/LibOrbisPkg.Core.csproj b/LibOrbisPkg.Core/LibOrbisPkg.Core.csproj
+index 5f0fe49..7682ab6 100644
+--- a/LibOrbisPkg.Core/LibOrbisPkg.Core.csproj
++++ b/LibOrbisPkg.Core/LibOrbisPkg.Core.csproj
+@@ -1,7 +1,7 @@
+ ﻿<Project Sdk="Microsoft.NET.Sdk">
+ 
+   <PropertyGroup>
+-    <TargetFramework>netcoreapp3.0</TargetFramework>
++    <TargetFramework>net8.0</TargetFramework>
+     <RootNamespace>LibOrbisPkg</RootNamespace>
+     <LangVersion>7.3</LangVersion>
+     <Platforms>AnyCPU</Platforms>
+diff --git a/LibOrbisPkg/PFS/PFSCReader.cs b/LibOrbisPkg/PFS/PFSCReader.cs
+index 12c6c1b..dc4235f 100644
+--- a/LibOrbisPkg/PFS/PFSCReader.cs
++++ b/LibOrbisPkg/PFS/PFSCReader.cs
+@@ -84,7 +84,12 @@ namespace LibOrbisPkg.PFS
+         using (var bufStream = new MemoryStream(sectorBuf))
+         using (var ds = new DeflateStream(bufStream, CompressionMode.Decompress))
+         {
+-          ds.Read(output, 0, hdr.BlockSz);
++          // .NET 6+ DeflateStream.Read returns partial reads; loop until the sector is full
++          int filled = 0, n;
++          while (filled < hdr.BlockSz && (n = ds.Read(output, filled, hdr.BlockSz - filled)) > 0)
++            filled += n;
++          if (filled < hdr.BlockSz)
++            Array.Clear(output, filled, hdr.BlockSz - filled);
+         }
+       }
+     }
+diff --git a/PkgTool.Core/PkgTool.Core.csproj b/PkgTool.Core/PkgTool.Core.csproj
+index 10e4e0b..147a94f 100644
+--- a/PkgTool.Core/PkgTool.Core.csproj
++++ b/PkgTool.Core/PkgTool.Core.csproj
+@@ -2,7 +2,7 @@
+ 
+   <PropertyGroup>
+     <OutputType>Exe</OutputType>
+-    <TargetFramework>netcoreapp3.0</TargetFramework>
++    <TargetFramework>net8.0</TargetFramework>
+     <StartupObject>PkgTool.Program</StartupObject>
+     <GenerateAssemblyInfo>false</GenerateAssemblyInfo>
+     <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
+diff --git a/PkgTool/Program.cs b/PkgTool/Program.cs
+index 7068d7c..385482e 100644
+--- a/PkgTool/Program.cs
++++ b/PkgTool/Program.cs
+@@ -512,11 +512,11 @@ namespace PkgTool
+ 
+     private static void ExtractInParallel(PfsReader inner, string outPath, bool verbose)
+     {
+-      Console.WriteLine("Extracting in parallel...");
+-      Parallel.ForEach(
+-        inner.GetAllFiles(),
+-        () => new byte[0x10000],
+-        (f, _, buf) =>
++      // One file at a time. (Parallel extraction was not the cause of the corrupt output;
++      // that was PFSCReader ignoring DeflateStream's partial reads on .NET 6+.)
++      Console.WriteLine("Extracting...");
++      var buf = new byte[0x10000];
++      foreach (var f in inner.GetAllFiles())
+         {
+           var size = f.size;
+           long pos = 0;
+@@ -541,9 +541,7 @@ namespace PkgTool
+               size -= toRead;
+             }
+           }
+-          return buf;
+-        },
+-        x => { });
++        }
+     }
+     
+     private static string SafeName(string name)

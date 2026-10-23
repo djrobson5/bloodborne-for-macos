@@ -13,19 +13,23 @@ fi
 if [[ -z ${CC:-} ]]; then echo 'Install GCC/Clang or set CC.' >&2; exit 1; fi
 # macOS (Apple Silicon): everything is built for x86-64 and runs under Rosetta 2, the game's
 # code included. The x86-64 dependencies (Vulkan loader, MoltenVK, SDL3, FFmpeg, ...) come from a
-# prefix of their own, set up by deps/env.sh (BB_DEPS_ENV names another).
+# prefix of their own, described by deps/env.sh (scripts/macos-deps.sh builds it; BB_DEPS_ENV
+# names another).
 macos=
 cc=("$CC")
 cmake_platform=()
 if [[ $(uname -s) == Darwin ]]; then
     macos=1
-    deps_env=${BB_DEPS_ENV:-../deps/env.sh}
-    if [[ ! -f $deps_env ]]; then echo "macOS: x86-64 dependencies not found ($deps_env)" >&2; exit 1; fi
+    deps_env=${BB_DEPS_ENV:-deps/env.sh}
+    if [[ ! -f $deps_env && -z ${BB_DEPS_ENV:-} ]]; then deps_env=../deps/env.sh; fi
+    if [[ ! -f $deps_env ]]; then
+        echo "macOS: x86-64 dependencies not found ($deps_env); build them with scripts/macos-deps.sh" >&2; exit 1
+    fi
     # shellcheck disable=SC1090
     source "$deps_env"
     cc=("${cc[@]}" -arch x86_64 -mmacosx-version-min=14.0)
     cmake_platform=(-DCMAKE_OSX_ARCHITECTURES=x86_64 -DCMAKE_OSX_DEPLOYMENT_TARGET=14.0
-                    -DCMAKE_IGNORE_PREFIX_PATH=/opt/homebrew -DCMAKE_FIND_FRAMEWORK=LAST)
+                    "-DCMAKE_IGNORE_PREFIX_PATH=/opt/homebrew;/usr/local" -DCMAKE_FIND_FRAMEWORK=LAST)
 fi
 # Dependencies come from pkg-config (Vulkan loader/headers, SDL3). On NixOS the
 # environment is provided by shell.nix; re-enter it automatically if needed.
