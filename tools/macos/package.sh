@@ -64,6 +64,15 @@ copy_license Zycore "$src/zydis/dependencies/zycore/LICENSE"
 copy_license LibAtrac9 third_party/LibAtrac9/LICENSE
 copy_license imgui gpu/third_party/imgui/LICENSE.txt
 copy_license FSR-Vulkan gpu/third_party/fsr-vulkan/LICENSE gpu/third_party/fsr-vulkan/LICENSE.txt
+copy_license FidelityFX-SDK gpu/third_party/fsr-vulkan/upstream/ffx-1.1.4/sdk/LICENSE.txt
+copy_license sirit gpu/third_party/sirit/LICENSE.txt
+copy_license SPIRV-Headers gpu/third_party/sirit/externals/SPIRV-Headers/LICENSE
+copy_license half gpu/third_party/half/LICENSE.txt
+copy_license DejaVu gpu/third_party/fonts/LICENSE-DejaVu.txt
+# Dear ImGui ships Roboto without its license file.
+printf '%s\n' 'Roboto-Medium.ttf (from Dear ImGui misc/fonts), embedded for key captions:' \
+    'Copyright Google LLC, licensed under the Apache License, Version 2.0' \
+    '(https://www.apache.org/licenses/LICENSE-2.0; the text is also in MoltenVK-LICENSE).' > "$third/Roboto-NOTICE.txt"
 {
     echo "bloodborne-for-macos $version"
     echo "Source: https://github.com/djrobson5/bloodborne-for-macos (commit $(git rev-parse HEAD))"

@@ -108,7 +108,7 @@ Where to get it depends on what you have:
   as is.
 - **Separate game and update folders:** copy everything from the 1.09 update folder over the game
   folder, replacing files (`eboot.bin` and `sce_sys` too).
-- **A `.pkg` file:** use the included extractor. It needs the .NET 8 SDK
+- **A `.pkg` file:** use the included extractor. It needs the .NET SDK, version 8 or later
   (`brew install --cask dotnet-sdk`). The first argument is the new game folder; then come the
   game package and, if it doesn't already include 1.09, the update package:
 
@@ -118,7 +118,8 @@ Where to get it depends on what you have:
 
   It builds [LibOrbisPkg](https://github.com/maxton/LibOrbisPkg) with a fix for a .NET bug that
   otherwise silently corrupts most compressed files. Don't use an unpatched LibOrbisPkg build on
-  .NET 6 or later.
+  .NET 6 or later. Tested with a single package that already includes 1.09; its output matched a
+  known-good dump file for file. The separate game-plus-update case is untested.
 
 The game folder is checked at every start. If it is the wrong version or region, the log says
 what is wrong (for example, a missing 1.09 update).
@@ -133,10 +134,13 @@ From the port's folder (the unzipped download or your clone):
 
 The folder is remembered, so after the first time `./bloodborne.sh` alone is enough.
 
+- **Choose Play Offline** on the title screen. Online play comes from upstream and has not been
+  tested on a Mac.
 - **The first start takes longer.** The game executable is prepared once, and shaders are
   compiled the first time each one is needed. Expect stutter in the first minutes and in each new
   area; it goes away as the shader cache (`user/cache`) fills.
-- **Fullscreen:** F11 (on a Mac keyboard, fn+F11).
+- **Fullscreen:** F11 (on a Mac keyboard, fn+F11), or `fullscreen=1` in `bbport.ini`. Not yet
+  tested on a Mac.
 - **Quit:** close the window. The game saves on its own, as on the PS4.
 - **Saves** are in `user/savedata` inside the port's folder. Back that folder up before updating
   the port.
@@ -146,7 +150,7 @@ The folder is remembered, so after the first time `./bloodborne.sh` alone is eno
 
 - **Controller:** works as on the PS4. If several are connected, pick one with
   `./bloodborne.sh BB_GAMEPAD="DualSense"` (any part of its name).
-- **Keyboard and mouse** (the PC controls from bbhost): WASD moves, Left Option walks, Space
+- **Keyboard and mouse** (the PC controls from bbhost, not yet tested on a Mac): WASD moves, Left Option walks, Space
   dodges and sprints, Q locks on, E interacts, R uses a Blood Vial, F uses an item and Escape opens
   the menu. The left mouse button attacks (with Shift, a strong attack), the right button fires and
   the middle button transforms the weapon. G opens gestures and T personal effects. Key bindings
@@ -165,6 +169,12 @@ them. To change the frame rate for one start, pass it on the command line:
 
 Only the defaults (1080p output, uncapped frame rate) have been tested on a Mac. Other output
 resolutions, presets and upscalers come from bbport and may or may not work with MoltenVK.
+
+### Uninstalling
+
+Delete the port's folder, after backing up `user/savedata` if you want to keep your saves. The
+Vulkan pipeline cache is also stored in `~/Library/Application Support/shadPS4/cache/CUSA03173*`,
+the same place shadPS4 uses; delete those entries too unless you also use shadPS4.
 
 ## Known issues
 

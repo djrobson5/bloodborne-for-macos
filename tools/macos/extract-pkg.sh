@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # Extracts a Bloodborne .pkg you own into a game folder this port runs, with LibOrbisPkg
 # (maxton/LibOrbisPkg, LGPL-3.0) built from source with liborbispkg-net8.patch:
-#   - it targets .NET 8 (the project's netcoreapp3.0 is no longer installable);
+#   - it targets .NET 8 (the project's netcoreapp3.0 is no longer installable) and runs on any
+#     later .NET as well;
 #   - PFSCReader reads each compressed block fully. On .NET 6+ DeflateStream.Read returns partial
 #     reads, so unpatched, most compressed files come out silently corrupt.
 #
@@ -9,7 +10,8 @@
 #   GAME_DIR    the new game folder (must not exist yet)
 #   GAME.pkg    the game; a package that already has update 1.09 merged in is enough
 #   UPDATE.pkg  the 1.09 update, extracted over the game when the game package is older
-# Needs the .NET 8 SDK (brew install --cask dotnet-sdk) and about 30 GB free next to GAME_DIR.
+# Needs the .NET SDK 8 or later (brew install --cask dotnet-sdk) and about 30 GB free next to
+# GAME_DIR.
 set -euo pipefail
 here=$(cd -- "$(dirname -- "$0")" && pwd)
 repo=$(cd -- "$here/../.." && pwd)
@@ -18,8 +20,9 @@ die() { echo "extract-pkg: $*" >&2; exit 1; }
 out=$1; shift
 [[ ! -e $out ]] || die "$out already exists"
 for pkg in "$@"; do [[ -f $pkg ]] || die "no such file: $pkg"; done
-command -v dotnet >/dev/null || die 'the .NET 8 SDK is missing: brew install --cask dotnet-sdk'
-dotnet --list-sdks | grep -q '^8\.' || die 'the .NET 8 SDK is missing (dotnet --list-sdks): brew install --cask dotnet-sdk'
+command -v dotnet >/dev/null || die 'the .NET SDK is missing: brew install --cask dotnet-sdk'
+dotnet --list-sdks | awk -F. '$1 >= 8 { found = 1 } END { exit !found }' ||
+    die 'the .NET SDK 8 or later is missing (dotnet --list-sdks): brew install --cask dotnet-sdk'
 
 tool=${BB_LIBORBISPKG_DIR:-$here/.liborbispkg}
 commit=643477263b2644e0803e0f58b8726ea4e3f3b7d4
@@ -29,9 +32,11 @@ if [[ ! -f $dll ]]; then
     if [[ ! -d $tool/.git ]]; then git clone --quiet https://github.com/maxton/LibOrbisPkg.git "$tool"; fi
     git -C "$tool" checkout --quiet --force "$commit"
     git -C "$tool" apply --whitespace=nowarn "$here/liborbispkg-net8.patch"
-    dotnet build "$tool/PkgTool.Core/PkgTool.Core.csproj" -c Release --nologo -v quiet
+    dotnet build "$tool/PkgTool.Core/PkgTool.Core.csproj" -c Release --nologo > "$tool/build.log" 2>&1 ||
+        { tail -20 "$tool/build.log" >&2; die "the build failed (log: $tool/build.log)"; }
 fi
-pkgtool() { dotnet "$dll" "$@"; }
+# A newer .NET runtime runs it when the 8.0 one is not installed.
+pkgtool() { DOTNET_ROLL_FORWARD=${DOTNET_ROLL_FORWARD:-Major} dotnet "$dll" "$@"; }
 
 mkdir -p "$(dirname -- "$out")"
 work=$out.extracting
