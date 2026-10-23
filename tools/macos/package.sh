@@ -17,6 +17,9 @@ mkdir -p "$stage/bin" "$stage/lib/vulkan/icd.d" "$stage/licenses/third-party" "$
 cp out/bb-probe out/bb-gpu-capabilities "$stage/bin/"
 for lib in libSDL3.0.dylib libvulkan.1.dylib libMoltenVK.dylib; do cp -L "$DEPS_PREFIX/lib/$lib" "$stage/lib/"; done
 for binary in "$stage"/bin/*; do
+    # The build machine's library directories are of no use elsewhere.
+    otool -l "$binary" | awk '$1 == "cmd" && $2 == "LC_RPATH" { getline; getline; print $2 }' | grep '^/' |
+        while IFS= read -r path; do install_name_tool -delete_rpath "$path" "$binary"; done || true
     install_name_tool -add_rpath @executable_path/../lib "$binary"
     codesign --force --sign - "$binary" 2>/dev/null
 done
