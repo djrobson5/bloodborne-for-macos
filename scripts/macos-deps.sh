@@ -7,7 +7,7 @@
 # tested with; MoltenVK is the official 1.4.2 release binary (checked by SHA-256).
 #
 # Needs: Xcode Command Line Tools, Rosetta 2, and from Homebrew: cmake ninja pkgconf nasm glslang.
-# Takes 20-40 minutes and ~3 GB of disk; reruns skip what is already installed.
+# Takes 10-30 minutes and ~3 GB of disk; reruns skip what is already installed.
 # Usage: scripts/macos-deps.sh [DEPS_DIR]
 set -euo pipefail
 repo=$(cd -- "$(dirname -- "$0")/.." && pwd)
@@ -169,7 +169,8 @@ cat > "$prefix/share/vulkan/icd.d/MoltenVK_icd.json" <<'EOF'
 }
 EOF
 
-# The environment build.sh and run.sh source. Relocatable: paths are found from its own location.
+# The environment build.sh and run.sh source. The prefix must stay where it was built (its
+# pkg-config and CMake files record that path); build it again rather than moving it.
 cat > "$root/env.sh" <<'EOF'
 # Source this file (bash): . deps/env.sh   (written by scripts/macos-deps.sh)
 _DEPS_ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"

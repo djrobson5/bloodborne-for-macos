@@ -39,3 +39,4 @@ patches.json
 /logs/
 /game-dir.txt
 /tools/macos/.liborbispkg/
+/dist/
