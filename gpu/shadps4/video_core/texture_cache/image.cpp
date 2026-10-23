@@ -278,7 +278,9 @@ ImageView& Image::FindView(const ImageViewInfo& view_info, bool ensure_guest_sam
         return (*slot_image_views)[view_id];
     }
     if (NeedsFullUsage(view_info)) {
-        runtime->UpgradeBacking(this); // a new backing, without views yet
+        // A new backing, without views yet.
+        runtime->UpgradeBacking(this, view_info.is_storage ? "storage view"
+                                                           : vk::to_string(view_info.format).c_str());
     }
     const auto view_id = slot_image_views->insert(runtime->GetInstance(), view_info, *this);
     backing->image_view_infos.emplace_back(view_info);

@@ -418,6 +418,7 @@ SceneTargets::Entry& SceneTargets::Get(VideoCore::ImageId id, u32 level) {
         entry->image = VideoCore::UniqueImage(instance.GetDevice(), instance.GetAllocator());
         auto ci = original.backing->image.image_ci;
         ci.pNext = nullptr;
+        ci.usage = original.usage_flags; // bbport t23: not a lazy backing's (the upscaler stores)
         const auto proxy = ProxySize(original, level);
         ci.extent = vk::Extent3D{proxy.width, proxy.height, 1};
         ci.mipLevels = 1;

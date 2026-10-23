@@ -1884,6 +1884,7 @@ void TextureCache::ReclaimImage(ImageId image_id) {
 
 void TextureCache::FlushImageGraveyard() {
     const u64 delay = ImageFreeDelayFrames();
+    runtime.FlushRetiredBackings(gc_tick, delay);
     std::scoped_lock lk{graveyard_mutex};
     while (!image_graveyard.empty() && image_graveyard.front().gc_tick + delay <= gc_tick) {
         // Deferred again: freed once the GPU has finished everything recorded until now.

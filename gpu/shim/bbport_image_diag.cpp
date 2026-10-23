@@ -71,7 +71,7 @@ u32 CompressMinWidth() {
 bool CompressOn() {
     static const bool on = [] {
         const char* env = std::getenv("BB_IMAGE_COMPRESS");
-        return env && env[0] == '1';
+        return !env || env[0] != '0';
     }();
     return on;
 }
@@ -203,7 +203,7 @@ const vk::ImageFormatListCreateInfo* CompressList(const VideoCore::ImageInfo& in
 bool Enabled() {
     static const bool enabled = [] {
         const char* env = std::getenv("BB_IMAGE_DIAG");
-        return (env && env[0] == '1') || CompressOn();
+        return env && env[0] == '1';
     }();
     return enabled;
 }
@@ -260,6 +260,16 @@ void OnCreate(const Vulkan::Instance& instance, const VideoCore::Image& image) {
 }
 
 void OnView(const VideoCore::Image& image, vk::Format view_format, bool storage) {
+    // Tripwire: the backing should have been upgraded first (Image::FindView, EnsureStorage).
+    if (image.NeedsFullUsage(view_format, storage)) {
+        std::scoped_lock lock{mutex};
+        if (++misses <= 10) {
+            std::printf("Image compress miss: %s %ux%u at %#llx: a %s view (%s) of a lazy backing\n",
+                        vk::to_string(image.info.pixel_format).c_str(), image.info.size.width,
+                        image.info.size.height, (unsigned long long)image.info.guest_address,
+                        storage ? "storage" : "reinterpreting", vk::to_string(view_format).c_str());
+        }
+    }
     if (!Enabled() || !Tracked(image)) {
         return;
     }
@@ -276,15 +286,6 @@ void OnView(const VideoCore::Image& image, vk::Format view_format, bool storage)
     auto& entry = it->second;
     auto& stats = classes[entry.key];
     RecordKeyLocked(image.info);
-    if (image.NeedsFullUsage(view_format, storage)) {
-        ++misses;
-        if (misses <= 10) {
-            std::printf("Image compress miss: %s %ux%u at %#llx: a %s view (%s) of a lazy backing\n",
-                        vk::to_string(image.info.pixel_format).c_str(), image.info.size.width,
-                        image.info.size.height, (unsigned long long)image.info.guest_address,
-                        storage ? "storage" : "reinterpreting", vk::to_string(view_format).c_str());
-        }
-    }
     if (storage && !entry.storage) {
         entry.storage = true;
         ++stats.storage;
@@ -302,23 +303,23 @@ void OnView(const VideoCore::Image& image, vk::Format view_format, bool storage)
     MaybeReportLocked();
 }
 
-void OnUpgrade(const VideoCore::Image& image, bool copied) {
+void OnUpgrade(const VideoCore::Image& image, bool copied, const char* why) {
     std::scoped_lock lock{mutex};
     learned.insert(KeyOf(image.info));
     ++upgrades;
     upgrades_copied += copied;
     upgraded_bytes += image.GetHostImageSize();
     if (upgrades <= 20) {
-        std::printf("Image upgrade: %s %ux%u at %#llx to full usage%s\n",
+        std::printf("Image upgrade: %s %ux%u at %#llx to full usage for %s%s\n",
                     vk::to_string(image.info.pixel_format).c_str(), image.info.size.width,
-                    image.info.size.height, (unsigned long long)image.info.guest_address,
+                    image.info.size.height, (unsigned long long)image.info.guest_address, why,
                     copied ? ", contents copied" : "");
     }
 }
 
 bool EnsureStorage(VideoCore::Image& image, const char* pass) {
     if (image.backing && image.backing->view_formats) {
-        image.runtime->UpgradeBacking(&image);
+        image.runtime->UpgradeBacking(&image, pass);
     }
     const bool has = bool(image.backing->image.image_ci.usage & vk::ImageUsageFlagBits::eStorage);
     if (Enabled() && has) {

@@ -5,6 +5,8 @@
 
 #include <array>
 #include <atomic>
+#include <deque>
+#include <mutex>
 #include "common/types.h"
 #include "video_core/buffer_cache/buffer.h"
 #include "video_core/renderer_vulkan/vk_barrier_tracker.h"
@@ -110,7 +112,11 @@ public:
     void SetBackingSamples(VideoCore::Image* image, u32 num_samples, bool copy_backing = true);
     /// bbport t23: gives `image` a backing with its full usage in place of a lazy one
     /// (BackingImage::view_formats), with the contents copied. No-op for a full backing.
-    void UpgradeBacking(VideoCore::Image* image);
+    void UpgradeBacking(VideoCore::Image* image, const char* why);
+    /// bbport t23: frees the backings UpgradeBacking replaced `delay` collector passes ago, once
+    /// the GPU has finished the work recorded until now (the image graveyard's grace: a view
+    /// taken before the upgrade, e.g. earlier in the same draw, still reads a valid image).
+    void FlushRetiredBackings(u64 gc_tick, u64 delay);
 
     void AccessBuffer(const VideoCore::Buffer* handle, u64 offset, u64 size,
                       vk::PipelineStageFlags2 src_stage, vk::AccessFlags2 src_access);
@@ -151,6 +157,14 @@ private:
     Scheduler& scheduler;
     std::unique_ptr<VideoCore::BlitHelper> blit_helper;
     StagingBufferPool staging_pool;
+    struct RetiredBacking {
+        u64 gc_tick = ~0ULL; ///< the first collector pass after it was retired
+        VideoCore::UniqueImage image;
+        boost::container::small_vector<VideoCore::ImageViewId, 4> view_ids;
+        Common::SlotVector<VideoCore::ImageView>* slot_image_views;
+    };
+    std::mutex retired_mutex;
+    std::deque<RetiredBacking> retired_backings; ///< UpgradeBacking (FlushRetiredBackings)
     BarrierTracker barrier_tracker;
     VideoCore::Image::Barriers image_barriers;
     vk::MemoryBarrier2 memory_barrier{};

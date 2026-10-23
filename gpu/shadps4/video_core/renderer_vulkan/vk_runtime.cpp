@@ -843,7 +843,7 @@ void Runtime::SetBackingSamples(VideoCore::Image* image, u32 num_samples, bool c
     backing = new_backing;
 }
 
-void Runtime::UpgradeBacking(VideoCore::Image* image) {
+void Runtime::UpgradeBacking(VideoCore::Image* image, const char* why) {
     BeforeImageAccess();
     auto* const old_backing = image->backing;
     if (!old_backing || !old_backing->view_formats) {
@@ -876,6 +876,11 @@ void Runtime::UpgradeBacking(VideoCore::Image* image) {
     } else if (copy) {
         scheduler.EndRendering();
         const TransferMark mark{*this, "image usage upgrade", *image};
+        // Barriers still pending may transition the old image too: not in one batch with its
+        // transition to the copy (FlushPendingClear does the same).
+        if (!image_barriers.empty()) {
+            FlushBarriers();
+        }
         Transit(image, vk::ImageLayout::eTransferSrcOptimal, vk::PipelineStageFlagBits2::eCopy,
                 vk::AccessFlagBits2::eTransferRead);
         const vk::ImageSubresourceRange whole = {
@@ -929,24 +934,42 @@ void Runtime::UpgradeBacking(VideoCore::Image* image) {
         };
     }
     image->backing = new_backing;
-    BbImageDiag::OnUpgrade(*image, copy);
+    BbImageDiag::OnUpgrade(*image, copy, why);
 
     // The old backing is never current again: no sample count matches it (SetBackingSamples),
-    // and lookups memoized with it compare the backing. Its image and views go once the GPU
-    // has finished the work recorded so far.
+    // and lookups memoized with it compare the backing. Its image and views are freed after
+    // the image graveyard's grace (FlushRetiredBackings).
     old_backing->num_samples = 0;
     old_backing->view_formats = nullptr;
     old_backing->last_view = 0;
     old_backing->image_view_infos.clear();
-    scheduler.DeferOperation([old_image = std::move(old_backing->image),
-                              view_ids = old_backing->image_view_ids,
-                              slot_image_views = image->slot_image_views]() mutable {
-        for (const auto view_id : view_ids) {
-            slot_image_views->erase(view_id);
-        }
-        old_image.Destroy();
-    });
+    {
+        std::scoped_lock lock{retired_mutex};
+        retired_backings.push_back({.image = std::move(old_backing->image),
+                                    .view_ids = old_backing->image_view_ids,
+                                    .slot_image_views = image->slot_image_views});
+    }
     old_backing->image_view_ids.clear();
+}
+
+void Runtime::FlushRetiredBackings(u64 gc_tick, u64 delay) {
+    std::scoped_lock lock{retired_mutex};
+    for (auto& retired : retired_backings) {
+        if (retired.gc_tick == ~0ULL) {
+            retired.gc_tick = gc_tick;
+        }
+    }
+    while (!retired_backings.empty() && retired_backings.front().gc_tick + delay <= gc_tick) {
+        auto& retired = retired_backings.front();
+        scheduler.DeferOperation([image = std::move(retired.image), view_ids = retired.view_ids,
+                                  slot_image_views = retired.slot_image_views]() mutable {
+            for (const auto view_id : view_ids) {
+                slot_image_views->erase(view_id);
+            }
+            image.Destroy();
+        });
+        retired_backings.pop_front();
+    }
 }
 
 static bool PreciseBarriers() {

@@ -20,10 +20,10 @@ struct ImageInfo;
 namespace BbImageDiag {
 
 /// BB_IMAGE_KEYS=<file>: with BB_IMAGE_DIAG=1, the images that got a storage view or a view in
-/// another format are appended to it (guest address, format, size); with BB_IMAGE_COMPRESS=1, it
+/// another format are appended to it (guest address, format, size); with BB_IMAGE_COMPRESS, it
 /// lists images created with their full usage from the start.
 ///
-/// BB_IMAGE_COMPRESS=1 (t23 lazy usages): colour images from BB_IMAGE_COMPRESS_MIN (1280) wide
+/// BB_IMAGE_COMPRESS (t23 lazy usages; on unless =0; GPU 14.3 -> 12.5 ms/frame): colour images from BB_IMAGE_COMPRESS_MIN (1280) wide
 /// are created without Storage and with a format list of their own format and its sRGB/linear
 /// twin, so Metal may compress them. The first view that needs more (a storage view, another
 /// format, a host pass writing it: EnsureStorage) replaces the backing with a full one
@@ -37,7 +37,7 @@ void OnCreate(const Vulkan::Instance& instance, const VideoCore::Image& image);
 /// backing should have been upgraded first).
 void OnView(const VideoCore::Image& image, vk::Format view_format, bool storage);
 /// Runtime::UpgradeBacking replaced the lazy backing of `image` (`copied`: with its contents).
-void OnUpgrade(const VideoCore::Image& image, bool copied);
+void OnUpgrade(const VideoCore::Image& image, bool copied, const char* why);
 /// For a host pass (`pass`) that writes `image` through a storage view of its own: upgrades a
 /// lazy backing, then returns whether the image has Storage usage.
 bool EnsureStorage(VideoCore::Image& image, const char* pass);
